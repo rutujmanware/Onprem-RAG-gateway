@@ -1,0 +1,18 @@
+[
+  {
+    "id": "eval_001",
+    "query": "What are the prerequisites for the Cloud Computing course?",
+    "contexts": ["Prerequisites: Data Structures, Operating Systems, Computer Networks."],
+    "ground_truth": "Data Structures, Operating Systems, and Computer Networks.",
+    "complexity": 0.25,
+    "expected_tier": "cpu_slm"
+  },
+  {
+    "id": "eval_002",
+    "query": "Synthesize the trade-offs of PagedAttention vs standard KV caching in continuous batching.",
+    "contexts": ["PagedAttention eliminates VRAM fragmentation reducing waste from 60-80% to under 4%."],
+    "ground_truth": "PagedAttention eliminates fragmentation and increases token batching throughput.",
+    "complexity": 0.85,
+    "expected_tier": "gpu_vllm"
+  }
+]

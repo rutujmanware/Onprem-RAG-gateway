@@ -1,0 +1,70 @@
+.PHONY: help setup dev redis-up redis-down up down logs ingest ingest-pdfs query eval test clean
+
+PYTHON ?= python3
+VENV ?= .venv
+
+help:
+	@echo "Available commands:"
+	@echo "  make setup        - Create virtualenv and install dependencies"
+	@echo "  make dev          - Run Gateway service locally with live reload"
+	@echo "  make redis-up     - Start Redis Stack container (Vector DB + UI on 8001)"
+	@echo "  make redis-down   - Stop Redis Stack container"
+	@echo "  make up           - Start full docker-compose stack (Redis, SLM, vLLM, Gateway)"
+	@echo "  make down         - Stop all docker services"
+	@echo "  make logs         - Tail docker service logs"
+	@echo "  make ingest-pdfs  - Extract, clean, chunk, embed, and index all PDFs in data/raw_pdfs/"
+	@echo "  make query Q=\"...\" - Perform semantic search query against the Redis vector index"
+	@echo "  make eval         - Run offline benchmarks (alpha-sweep, ragas, load tests)"
+	@echo "  make test         - Run integration & security test suites"
+	@echo "  make clean        - Remove caches and build artifacts"
+
+setup:
+	$(PYTHON) -m venv $(VENV)
+	./$(VENV)/bin/pip install --upgrade pip
+	./$(VENV)/bin/pip install -r requirements.txt
+	@echo "Setup complete. Activate with: source $(VENV)/bin/activate"
+
+dev:
+	uvicorn gateway.main:app --host 0.0.0.0 --port 8080 --reload
+
+redis-up:
+	docker run -d --name onprem-rag-redis \
+		-p 6379:6379 -p 8001:8001 \
+		-v redis_data:/data \
+		redis/redis-stack:7.2.0-v9 || docker start onprem-rag-redis
+	@echo "Redis Stack is up! RedisInsight UI: http://localhost:8001"
+
+redis-down:
+	docker stop onprem-rag-redis || true
+
+up:
+	docker run -d --name onprem-rag-redis \
+		-p 6379:6379 -p 8001:8001 \
+		-v redis_data:/data \
+		redis/redis-stack:7.2.0-v9 || docker start onprem-rag-redis
+
+down:
+	docker stop onprem-rag-redis || true
+
+logs:
+	docker logs -f onprem-rag-redis
+
+ingest-pdfs:
+	$(PYTHON) -m pipeline.batch_ingest_pdfs --pdf-dir data/raw_pdfs
+
+query:
+	$(PYTHON) -m pipeline.query_vector_db "$(Q)"
+
+eval:
+	$(PYTHON) -m evaluation.benchmarks.alpha_sweep
+	$(PYTHON) -m evaluation.benchmarks.ragas_eval
+
+test:
+	PYTHONPATH=. $(PYTHON) tests/test_injection_fence.py
+	PYTHONPATH=. $(PYTHON) tests/test_rate_limiting.py
+	PYTHONPATH=. $(PYTHON) tests/test_cache_hits.py
+
+clean:
+	find . -type d -name "__pycache__" -exec rm -rf {} +
+	find . -type f -name "*.pyc" -delete
+	rm -rf .pytest_cache .coverage

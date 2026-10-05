@@ -1,0 +1,84 @@
+# ==========================================
+# 1. Environments & Secrets (Local Only)
+# ==========================================
+.env
+.env*
+.env.example
+.env.local
+.env.bak
+
+# Certificates & SSH Keys
+*.pem
+*.key
+*.crt
+*.cert
+*.pfx
+*.p12
+id_rsa*
+id_ed25519*
+
+# ==========================================
+# 2. Redis Databases & Persistence Files
+# ==========================================
+*.rdb
+dump.rdb
+dump_*.rdb
+dump*.rdb
+*.aof
+appendonlydir/
+redis_server_data/
+redis-stack-server-*/
+redis-stack.tar.gz
+
+# ==========================================
+# 3. Model Weights & Large Binaries (>100MB)
+# ==========================================
+models/slm_gguf/*
+models/llm_7b/*
+models/embeddings/*
+!models/**/.gitkeep
+!models/**/README.md
+
+# General model checkpoints
+*.gguf
+*.safetensors
+*.bin
+*.pt
+*.pth
+
+# ==========================================
+# 4. Scraped Datasets & Raw Documents
+# ==========================================
+data/
+*.pdf
+
+# Preserve evaluation benchmark datasets
+!evaluation/datasets/*.json
+
+# ==========================================
+# 5. Python Build, Cache & Test Artifacts
+# ==========================================
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+htmlcov/
+*.log
+
+# Virtual Environments
+.venv/
+venv/
+env/
+ENV/
+
+# ==========================================
+# 6. IDE & OS Metadata
+# ==========================================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db

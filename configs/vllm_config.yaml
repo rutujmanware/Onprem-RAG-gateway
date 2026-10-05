@@ -1,0 +1,26 @@
+model:
+  path: "models/llm_7b"
+  tokenizer: "models/llm_7b"
+  dtype: "bfloat16"
+  trust_remote_code: false
+  tensor_parallel_size: 1
+  pipeline_parallel_size: 1
+
+paged_attention:
+  block_size: 16
+  gpu_memory_utilization: 0.90
+  swap_space_gib: 4.0
+  kv_cache_dtype: "auto"
+
+continuous_batching:
+  max_num_batched_tokens: 4096
+  max_num_seqs: 64
+  max_model_len: 4096
+  scheduler_delay_factor: 0.0
+
+server:
+  host: "0.0.0.0"
+  port: 8000
+  response_role: "assistant"
+  chat_template: null
+  disable_log_requests: false
