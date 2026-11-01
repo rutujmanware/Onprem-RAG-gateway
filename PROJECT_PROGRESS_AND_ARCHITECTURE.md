@@ -168,3 +168,4 @@ Maintain this section as new features are developed:
 - [ ] **Milestone 6:** End-to-end Gateway integration test (connecting Gateway port 8080 to CPU SLM port 8082).
 - [ ] **Milestone 7:** Router classification training & threshold $\alpha$ optimization on `router_multichunk_training_dataset.jsonl`.
 - [ ] **Milestone 8:** Multi-user load testing (`evaluation/benchmarks/load_test.py`) proving GPU queue avoidance under 30+ concurrent campus users.
+
