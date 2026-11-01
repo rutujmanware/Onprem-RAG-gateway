@@ -191,3 +191,4 @@ To prevent accidental repository bloat and GitHub size rejection errors:
    git ls-files --cached
    ```
    *(Ensure only `.py`, `.yaml`, configs, and documentation appear in the list).*
+
