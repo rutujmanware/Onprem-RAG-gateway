@@ -1,0 +1,46 @@
+gateway:
+  host: "0.0.0.0"
+  port: 8080
+  workers: 4
+  timeout_seconds: 60.0
+
+routing:
+  alpha: 0.65
+  fallback_to_cpu_on_gpu_saturation: true
+  complexity_model_path: "gateway/router/models/scorer.onnx"
+  embedding_dimension: 384
+
+admission:
+  global_concurrency_limit: 30
+  per_user_concurrency_limit: 4
+  max_queue_depth: 100
+  queue_wait_timeout_seconds: 15.0
+  scheduling_policy: "fair_round_robin"
+
+rate_limiting:
+  enabled: true
+  token_bucket:
+    capacity: 20
+    refill_rate: 5.0
+    burst_limit: 10
+
+cache:
+  l0_exact:
+    enabled: true
+    ttl_seconds: 3600
+    hash_algorithm: "sha256"
+  l1_semantic:
+    enabled: true
+    similarity_threshold: 0.88
+    vector_dimension: 384
+    ttl_seconds: 7200
+    index_name: "l1_semantic_cache_idx"
+
+auth:
+  enforce_domain: "iisc.ac.in"
+  allow_subdomains: true
+  bypass_endpoints:
+    - "/healthz"
+    - "/metrics"
+    - "/docs"
+    - "/openapi.json"

@@ -1,0 +1,1 @@
+print("Load test runner ready.")

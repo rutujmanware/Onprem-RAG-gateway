@@ -1,0 +1,41 @@
+# Environments
+.env
+.venv/
+venv/
+env/
+myenv/
+
+# Python Cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+
+# Logs
+*.log
+
+# Datasets & Large Training Files (stored locally)
+*.csv
+*.jsonl
+
+# Database & Redis Server
+redis-stack-server-*/
+redis_server_data/
+*.rdb
+redis-stack.tar.gz
+dump.rdb
+dump_final.rdb
+
+# Scraped Data
+data/
+data/raw_pdfs/
+*.pdf
+*.json
+
+# Model artifacts
+*.gguf
+models/slm_gguf/*.gguf
+models/slm_gguf/qwen*
+.DS_Store
+Thumbs.db

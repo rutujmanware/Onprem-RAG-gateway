@@ -1,0 +1,266 @@
+#!/usr/bin/env python3
+"""CPU SLM Engine for Qwen 2.5 3B Instruct.
+
+Provides efficient, strictly-CPU inference for the lightweight SLM tier,
+optimized for AMD EPYC / multi-core CPU architectures using PyTorch bfloat16.
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+import time
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+# CRITICAL: Prevent CUDA driver probing and segfaults on CPU node
+os.environ["CUDA_VISIBLE_DEVICES"] = ""
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+# Ensure root directory is on sys.path
+ROOT_DIR = Path(__file__).resolve().parent.parent
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
+import torch
+
+DEFAULT_MODEL_NAME = os.getenv("SLM_MODEL_NAME", "Qwen/Qwen2.5-3B-Instruct")
+DEFAULT_NUM_THREADS = int(os.getenv("CPU_NUM_THREADS", "48"))
+
+
+class CPUSLMEngine:
+    """Singleton-style or on-demand CPU inference engine for Qwen 2.5 3B."""
+
+    _instance: Optional["CPUSLMEngine"] = None
+
+    def __init__(
+        self,
+        model_name_or_path: str = DEFAULT_MODEL_NAME,
+        num_threads: int = DEFAULT_NUM_THREADS,
+        dtype: torch.dtype = torch.bfloat16,
+    ):
+        self.model_name = model_name_or_path
+        self.num_threads = num_threads
+        self.dtype = dtype
+
+        # Apply thread settings
+        torch.set_num_threads(self.num_threads)
+        os.environ["OMP_NUM_THREADS"] = str(self.num_threads)
+
+        print(f"⚙️ Initializing CPUSLMEngine [{self.model_name}] on CPU with {self.num_threads} threads...")
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+
+        t0 = time.time()
+        self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+        self.model = AutoModelForCausalLM.from_pretrained(
+            self.model_name,
+            torch_dtype=self.dtype,
+            low_cpu_mem_usage=True,
+        )
+        self.model.eval()
+        self.load_duration = time.time() - t0
+        print(f"✅ CPUSLMEngine ready! Loaded in {self.load_duration:.2f}s")
+
+    @classmethod
+    def get_instance(cls, **kwargs) -> "CPUSLMEngine":
+        if cls._instance is None:
+            cls._instance = cls(**kwargs)
+        return cls._instance
+
+    def generate_chat(
+        self,
+        messages: List[Dict[str, str]],
+        max_new_tokens: int = 160,
+        temperature: float = 0.2,
+        top_p: float = 0.8,
+        do_sample: bool = False,
+    ) -> Dict[str, Any]:
+        """Generate response given a list of chat messages [{'role': ..., 'content': ...}]."""
+        prompt_text = self.tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        inputs = self.tokenizer([prompt_text], return_tensors="pt")
+        input_ids = inputs["input_ids"]
+
+        gen_kwargs: Dict[str, Any] = {
+            "max_new_tokens": max_new_tokens,
+            "pad_token_id": self.tokenizer.pad_token_id or self.tokenizer.eos_token_id,
+            "attention_mask": inputs.get("attention_mask"),
+        }
+
+        if do_sample and temperature > 0:
+            gen_kwargs["do_sample"] = True
+            gen_kwargs["temperature"] = float(temperature)
+            gen_kwargs["top_p"] = float(top_p)
+        else:
+            gen_kwargs["do_sample"] = False
+
+        t0 = time.time()
+        with torch.no_grad():
+            outputs = self.model.generate(**inputs, **gen_kwargs)
+
+        latency = time.time() - t0
+        new_token_ids = outputs[0][input_ids.shape[1] :]
+        generated_text = self.tokenizer.decode(new_token_ids, skip_special_tokens=True).strip()
+        num_tokens = len(new_token_ids)
+        tokens_per_sec = num_tokens / max(latency, 0.001)
+
+        return {
+            "text": generated_text,
+            "num_tokens": num_tokens,
+            "latency_seconds": round(latency, 3),
+            "tokens_per_second": round(tokens_per_sec, 2),
+            "model": self.model_name,
+        }
+
+    def generate_chat_stream(
+        self,
+        messages: List[Dict[str, str]],
+        max_new_tokens: int = 160,
+        temperature: float = 0.2,
+        top_p: float = 0.8,
+        do_sample: bool = False,
+    ):
+        """Generator yielding token text deltas in real-time as they generate on CPU."""
+        from transformers import TextIteratorStreamer
+        from threading import Thread
+
+        prompt_text = self.tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        inputs = self.tokenizer([prompt_text], return_tensors="pt")
+        streamer = TextIteratorStreamer(self.tokenizer, skip_prompt=True, skip_special_tokens=True)
+
+        gen_kwargs: Dict[str, Any] = {
+            "inputs": inputs["input_ids"],
+            "attention_mask": inputs.get("attention_mask"),
+            "max_new_tokens": max_new_tokens,
+            "pad_token_id": self.tokenizer.pad_token_id or self.tokenizer.eos_token_id,
+            "streamer": streamer,
+        }
+
+        if do_sample and temperature > 0:
+            gen_kwargs["do_sample"] = True
+            gen_kwargs["temperature"] = float(temperature)
+            gen_kwargs["top_p"] = float(top_p)
+        else:
+            gen_kwargs["do_sample"] = False
+
+        thread = Thread(target=self.model.generate, kwargs=gen_kwargs)
+        thread.start()
+
+        for chunk_text in streamer:
+            yield chunk_text
+
+        thread.join()
+
+    @staticmethod
+    def build_rag_messages(
+        question: str,
+        context_chunks: List[Dict[str, Any]],
+        system_prompt: Optional[str] = None,
+    ) -> List[Dict[str, str]]:
+        """Constructs a grounded, hallucination-resistant chat prompt for RAG."""
+        if not system_prompt:
+            system_prompt = (
+                "You are an accurate, on-premise AI assistant serving the academic/research community. "
+                "Your objective is to answer user questions truthfully using strictly the provided context chunks.\n\n"
+                "Strict Guidelines:\n"
+                "1. Answer concisely and directly in 2 to 4 factual sentences based strictly on the provided context.\n"
+                "2. Avoid unnecessary background introductions, preamble, or repetition.\n"
+                "3. If the context does not contain enough information to answer the question, state: "
+                "\"Based on the provided documents, there is insufficient information to answer this question.\" "
+                "Do not speculate or extrapolate beyond the text.\n"
+                "4. Cite your sources clearly using the document Title or Chunk ID for each key point (e.g., [Source: <Title>]).\n"
+                "5. Keep the answer clear, structured, and factual."
+            )
+
+        context_blocks = []
+        for i, chunk in enumerate(context_chunks, 1):
+            title = chunk.get("title", "Unknown Title")
+            author = chunk.get("author", "Unknown Author")
+            handle = chunk.get("handle_id", "")
+            chunk_id = chunk.get("chunk_key", f"Chunk_{i}")
+            content = chunk.get("content", "").strip()
+
+            header = f"[Document {i} | Title: {title}"
+            if author and author != "Unknown Author":
+                header += f" | Author: {author}"
+            if handle:
+                header += f" | Handle: {handle}"
+            header += f" | ID: {chunk_id}]"
+
+            context_blocks.append(f"{header}\n{content}")
+
+        context_str = "\n\n".join(context_blocks)
+        user_content = f"### Retrieved Context:\n{context_str}\n\n### User Question:\n{question}\n\n### Grounded Answer:"
+
+        return [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content},
+        ]
+
+    def answer_rag(
+        self,
+        question: str,
+        context_chunks: List[Dict[str, Any]],
+        max_new_tokens: int = 160,
+        temperature: float = 0.2,
+    ) -> Dict[str, Any]:
+        """Convenience method to generate a grounded RAG answer from context chunks."""
+        messages = self.build_rag_messages(question, context_chunks)
+        return self.generate_chat(
+            messages=messages,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            do_sample=(temperature > 0),
+        )
+
+    def answer_rag_stream(
+        self,
+        question: str,
+        context_chunks: List[Dict[str, Any]],
+        max_new_tokens: int = 160,
+        temperature: float = 0.2,
+    ):
+        """Streaming generator for grounded RAG answer from context chunks."""
+        messages = self.build_rag_messages(question, context_chunks)
+        return self.generate_chat_stream(
+            messages=messages,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            do_sample=(temperature > 0),
+        )
+
+
+def main():
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Run Qwen 2.5 3B CPU SLM CLI")
+    parser.add_argument("prompt", nargs="?", default="What are the key benefits of using small language models on CPU?", help="Prompt to test")
+    parser.add_argument("--threads", type=int, default=DEFAULT_NUM_THREADS, help="CPU threads to use")
+    parser.add_argument("--max-tokens", type=int, default=128, help="Max tokens to generate")
+    args = parser.parse_args()
+
+    engine = CPUSLMEngine(num_threads=args.threads)
+    messages = [
+        {"role": "system", "content": "You are a concise, helpful assistant."},
+        {"role": "user", "content": args.prompt},
+    ]
+
+    print(f"\nPrompt: {args.prompt}")
+    print("Generating on CPU...")
+    res = engine.generate_chat(messages, max_new_tokens=args.max_tokens, temperature=0.7)
+    print("\n--- Model Response ---")
+    print(res["text"])
+    print("----------------------")
+    print(f"Stats: {res['num_tokens']} tokens | {res['latency_seconds']}s ({res['tokens_per_second']} tok/s)\n")
+
+
+if __name__ == "__main__":
+    main()
+

@@ -1,0 +1,14 @@
+model:
+  name: "Qwen/Qwen2.5-3B-Instruct"
+  architecture: "qwen2.5"
+  dtype: "bfloat16"
+  context_window_tokens: 32768
+
+cpu_affinity:
+  num_threads: 24
+  numa_node: 0
+
+runtime:
+  engine: "cpu_pytorch"
+  host: "0.0.0.0"
+  port: 8082
