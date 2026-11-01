@@ -2,7 +2,7 @@
 
 Institutional, zero-egress RAG routing and admission gateway with dual-tier cache, CPU/GPU dynamic routing, and a Redis Stack vector database.
 
-> 📖 **Architecture & Optimization Guide:** See [OPTIMIZATION_GUIDE.md](OPTIMIZATION_GUIDE.md) for full benchmarks, AMD EPYC multi-threading performance, GGUF/RAM-disk setups, and real-time token streaming.
+> 📖 **Master Engineering & Progress Log:** See [PROJECT_PROGRESS_AND_ARCHITECTURE.md](PROJECT_PROGRESS_AND_ARCHITECTURE.md) for full project history, architecture modules, technical challenges & solutions, CPU SLM optimizations, and living roadmap.
 
 ## 📌 Current Project Status (Building Phase)
 We are currently in the **Data Ingestion and Vectorization Phase**. 
