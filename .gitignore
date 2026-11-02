@@ -29,6 +29,10 @@ appendonlydir/
 redis_server_data/
 redis-stack-server-*/
 redis-stack.tar.gz
+*.tar.gz
+*.npy
+*.pid
+
 
 # ==========================================
 # 3. Model Weights & Large Binaries (>100MB)

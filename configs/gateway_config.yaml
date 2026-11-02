@@ -4,14 +4,34 @@ gateway:
   workers: 4
   timeout_seconds: 60.0
 
+redis:
+  url: "redis://:Redis*2703!@localhost:6379/0"
+  decode_responses: false
+
+embedder:
+  model_name: "models/embeddings/all-MiniLM-L6-v2"
+  cache_folder: "models/embeddings"
+  dimension: 384
+  device: "cpu"
+
 routing:
   alpha: 0.65
-  fallback_to_cpu_on_gpu_saturation: true
+  fallback_to_cpu_on_gpu_saturation: false
   complexity_model_path: "gateway/router/models/scorer.onnx"
   embedding_dimension: 384
 
+slm:
+  model_name: "Qwen/Qwen2.5-1.5B-Instruct-GGUF"
+  base_url: "http://cpu-slm:8080/v1"
+  timeout_seconds: 30.0
+
+vllm:
+  model_name: "Qwen/Qwen2.5-7B-Instruct-AWQ"
+  base_url: "http://vllm:8000/v1"
+  timeout_seconds: 60.0
+
 admission:
-  global_concurrency_limit: 30
+  global_concurrency_limit: 12
   per_user_concurrency_limit: 4
   max_queue_depth: 100
   queue_wait_timeout_seconds: 15.0
@@ -28,13 +48,31 @@ cache:
   l0_exact:
     enabled: true
     ttl_seconds: 3600
-    hash_algorithm: "sha256"
+    prefix: "l0:exact:"
   l1_semantic:
     enabled: true
-    similarity_threshold: 0.88
+    similarity_threshold: 0.85
+    confident_threshold: 0.96
     vector_dimension: 384
     ttl_seconds: 7200
     index_name: "l1_semantic_cache_idx"
+    prefix: "l1:cache:"
+    enforce_entity_guard: true
+    enable_stage2_validation: true
+    enable_stage3_verification: true
+    enable_volatile_guard: true
+    default_doc_version: "v1"
+
+retrieval:
+  index_name: "rag_documents_idx"
+  top_k: 5
+  max_context_tokens: 16000
+  require_evidence: true
+
+security:
+  strict_auth: true
+  prompt_injection_mode: "refuse"
+  personalized_query_mode: "refuse"
 
 auth:
   enforce_domain: "iisc.ac.in"

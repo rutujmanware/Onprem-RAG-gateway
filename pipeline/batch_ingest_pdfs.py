@@ -17,6 +17,7 @@ import time
 from typing import List, Optional
 
 from pipeline.crawlers.pdf_extractor import PDFExtractor
+from pipeline.env_utils import resolve_redis_url
 from pipeline.indexer import RedisDocumentIndexer
 
 logging.basicConfig(
@@ -33,11 +34,11 @@ class BatchPDFIngester:
         self,
         pdf_dir: str = "data/raw_pdfs",
         redis_url: Optional[str] = None,
-        index_name: str = "rag_documents_idx",
+        index_name: str = "rag_documents_v2_idx",
         vector_dim: int = 384,
     ):
         self.pdf_dir = pdf_dir
-        self.redis_url = redis_url or os.getenv("REDIS_URL", "redis://localhost:6379/0")
+        self.redis_url = resolve_redis_url(redis_url)
         self.index_name = index_name
         self.vector_dim = vector_dim
         self.pdf_extractor = PDFExtractor()
@@ -143,8 +144,8 @@ class BatchPDFIngester:
 def main():
     parser = argparse.ArgumentParser(description="Batch index PDFs into Redis Stack vector search")
     parser.add_argument("--pdf-dir", default="data/raw_pdfs", help="Directory containing PDF files")
-    parser.add_argument("--redis-url", default=os.getenv("REDIS_URL", "redis://localhost:6379/0"))
-    parser.add_argument("--index-name", default="rag_documents_idx")
+    parser.add_argument("--redis-url", default=None, help="Redis connection URL (defaults to REDIS_URL in .env)")
+    parser.add_argument("--index-name", default="rag_documents_v2_idx")
     parser.add_argument("--vector-dim", type=int, default=384)
 
     args = parser.parse_args()

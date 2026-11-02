@@ -1,0 +1,1517 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>IISc Institutional Thesis RAG Gateway</title>
+  <style>
+    :root {
+      --bg-primary: #0f172a;
+      --bg-secondary: #1e293b;
+      --bg-tertiary: #334155;
+      --text-main: #f8fafc;
+      --text-muted: #94a3b8;
+      --accent: #38bdf8;
+      --accent-hover: #0284c7;
+      --accent-glow: rgba(56, 189, 248, 0.2);
+      --border: #334155;
+      --success: #10b981;
+      --success-bg: rgba(16, 185, 129, 0.15);
+      --info: #0284c7;
+      --info-bg: rgba(2, 132, 199, 0.15);
+      --warning: #f59e0b;
+      --warning-bg: rgba(245, 158, 11, 0.15);
+      --danger: #ef4444;
+      --danger-bg: rgba(239, 68, 68, 0.15);
+      --radius: 12px;
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+    }
+
+    body {
+      background-color: var(--bg-primary);
+      color: var(--text-main);
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    /* Header */
+    header {
+      background: var(--bg-secondary);
+      border-bottom: 1px solid var(--border);
+      padding: 12px 24px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      z-index: 10;
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .brand-icon {
+      background: linear-gradient(135deg, #0284c7, #38bdf8);
+      width: 36px;
+      height: 36px;
+      border-radius: 8px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-weight: bold;
+      font-size: 18px;
+      color: #fff;
+      box-shadow: 0 0 12px var(--accent-glow);
+    }
+
+    .brand-title {
+      font-size: 16px;
+      font-weight: 700;
+      letter-spacing: -0.3px;
+    }
+
+    .brand-subtitle {
+      font-size: 11px;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.8px;
+    }
+
+    .user-pill {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      background: var(--bg-primary);
+      padding: 6px 14px;
+      border-radius: 20px;
+      border: 1px solid var(--border);
+      font-size: 13px;
+    }
+
+    .role-badge {
+      background: var(--info-bg);
+      color: var(--accent);
+      padding: 2px 8px;
+      border-radius: 10px;
+      font-size: 11px;
+      font-weight: 600;
+      text-transform: uppercase;
+    }
+
+    .logout-btn {
+      background: transparent;
+      color: var(--text-muted);
+      border: none;
+      cursor: pointer;
+      font-size: 12px;
+      padding: 4px 8px;
+      border-radius: 4px;
+      transition: color 0.2s;
+    }
+
+    .logout-btn:hover {
+      color: var(--danger);
+    }
+
+    /* Main Container */
+    main {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      max-width: 1080px;
+      width: 100%;
+      margin: 0 auto;
+      height: calc(100vh - 65px);
+      position: relative;
+    }
+
+    /* Scope Bar */
+    .scope-bar {
+      background: var(--bg-secondary);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      margin: 12px 16px 0 16px;
+      padding: 10px 16px;
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      flex-wrap: wrap;
+    }
+
+    .scope-label {
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--accent);
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      white-space: nowrap;
+    }
+
+    .select-group {
+      display: flex;
+      gap: 8px;
+      flex: 1;
+      min-width: 300px;
+    }
+
+    select {
+      background: var(--bg-primary);
+      color: var(--text-main);
+      border: 1px solid var(--border);
+      padding: 6px 12px;
+      border-radius: 6px;
+      font-size: 13px;
+      outline: none;
+      cursor: pointer;
+      flex: 1;
+      transition: border-color 0.2s;
+    }
+
+    select:focus {
+      border-color: var(--accent);
+    }
+
+    .scope-tag-indicator {
+      font-size: 11px;
+      color: var(--text-muted);
+      background: rgba(255, 255, 255, 0.05);
+      padding: 4px 8px;
+      border-radius: 6px;
+      white-space: nowrap;
+    }
+
+    /* Chat Thread */
+    .chat-container {
+      flex: 1;
+      overflow-y: auto;
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+
+    .message {
+      display: flex;
+      flex-direction: column;
+      max-width: 85%;
+      animation: fadeIn 0.25s ease-out;
+    }
+
+    @keyframes fadeIn {
+      from { opacity: 0; transform: translateY(6px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+
+    .message.user {
+      align-self: flex-end;
+    }
+
+    .message.assistant {
+      align-self: flex-start;
+    }
+
+    .bubble {
+      padding: 12px 16px;
+      border-radius: var(--radius);
+      font-size: 14.5px;
+      line-height: 1.5;
+    }
+
+    .message.user .bubble {
+      background: var(--accent);
+      color: #0f172a;
+      font-weight: 500;
+      border-bottom-right-radius: 2px;
+    }
+
+    .message.assistant .bubble {
+      background: var(--bg-secondary);
+      border: 1px solid var(--border);
+      border-bottom-left-radius: 2px;
+    }
+
+    .message-meta {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 11px;
+      color: var(--text-muted);
+      margin-top: 4px;
+    }
+
+    .message.user .message-meta {
+      justify-content: flex-end;
+    }
+
+    /* Telemetry Badges */
+    .telemetry-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin-top: 8px;
+      padding-top: 8px;
+      border-top: 1px dashed var(--border);
+    }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      font-size: 11px;
+      font-weight: 600;
+      padding: 2px 8px;
+      border-radius: 6px;
+    }
+
+    .badge.l0-hit {
+      background: var(--success-bg);
+      color: var(--success);
+      border: 1px solid rgba(16, 185, 129, 0.3);
+    }
+
+    .badge.l1-hit {
+      background: var(--info-bg);
+      color: var(--accent);
+      border: 1px solid rgba(56, 189, 248, 0.3);
+    }
+
+    .badge.miss {
+      background: var(--warning-bg);
+      color: var(--warning);
+      border: 1px solid rgba(245, 158, 11, 0.3);
+    }
+
+    .badge.routing {
+      background: rgba(255, 255, 255, 0.08);
+      color: var(--text-muted);
+    }
+
+    .citations-card {
+      margin-top: 8px;
+      background: rgba(0, 0, 0, 0.2);
+      border-radius: 6px;
+      padding: 6px 10px;
+      font-size: 11.5px;
+      color: var(--text-muted);
+    }
+
+    .citations-card b {
+      color: var(--accent);
+    }
+
+    /* Quick Test Presets */
+    .presets-row {
+      display: flex;
+      gap: 8px;
+      padding: 0 16px 8px 16px;
+      overflow-x: auto;
+      white-space: nowrap;
+    }
+
+    .preset-btn {
+      background: var(--bg-secondary);
+      border: 1px solid var(--border);
+      color: var(--text-muted);
+      font-size: 12px;
+      padding: 6px 12px;
+      border-radius: 20px;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+
+    .preset-btn:hover {
+      background: var(--bg-tertiary);
+      color: var(--text-main);
+      border-color: var(--accent);
+    }
+
+    /* Input Bar */
+    .input-bar-container {
+      background: var(--bg-secondary);
+      border-top: 1px solid var(--border);
+      padding: 12px 16px;
+      display: flex;
+      gap: 12px;
+      align-items: flex-end;
+    }
+
+    textarea {
+      flex: 1;
+      background: var(--bg-primary);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px 14px;
+      color: var(--text-main);
+      font-size: 14px;
+      resize: none;
+      min-height: 44px;
+      max-height: 120px;
+      outline: none;
+      transition: border-color 0.2s;
+    }
+
+    textarea:focus {
+      border-color: var(--accent);
+    }
+
+    .send-btn {
+      background: var(--accent);
+      color: #0f172a;
+      border: none;
+      font-weight: 600;
+      border-radius: 8px;
+      padding: 0 18px;
+      height: 44px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: background 0.2s, transform 0.1s;
+    }
+
+    .send-btn:hover {
+      background: var(--accent-hover);
+    }
+
+    .send-btn:active {
+      transform: scale(0.97);
+    }
+
+    .send-btn:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+
+    /* Modal */
+    .modal-backdrop {
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      background: rgba(15, 23, 42, 0.85);
+      backdrop-filter: blur(8px);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      z-index: 1000;
+      transition: opacity 0.2s ease;
+    }
+
+    .modal-card {
+      background: var(--bg-secondary);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      width: 90%;
+      max-width: 480px;
+      padding: 28px;
+      box-shadow: 0 20px 40px rgba(0, 0, 0, 0.5);
+      max-height: 90vh;
+      overflow-y: auto;
+    }
+
+    .modal-header {
+      text-align: center;
+      margin-bottom: 20px;
+    }
+
+    .modal-header h2 {
+      font-size: 20px;
+      font-weight: 700;
+      margin-bottom: 6px;
+    }
+
+    .modal-header p {
+      font-size: 13px;
+      color: var(--text-muted);
+    }
+
+    .auth-tabs {
+      display: flex;
+      border-bottom: 1px solid var(--border);
+      margin-bottom: 20px;
+      gap: 4px;
+    }
+
+    .auth-tab {
+      flex: 1;
+      padding: 10px 14px;
+      background: transparent;
+      border: none;
+      border-bottom: 2px solid transparent;
+      color: var(--text-muted);
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      text-align: center;
+      transition: all 0.2s;
+      border-radius: 6px 6px 0 0;
+    }
+
+    .auth-tab:hover {
+      color: var(--text-main);
+      background: rgba(255, 255, 255, 0.03);
+    }
+
+    .auth-tab.active {
+      color: var(--accent);
+      border-bottom: 2px solid var(--accent);
+      background: rgba(56, 189, 248, 0.08);
+    }
+
+    .form-group {
+      margin-bottom: 16px;
+    }
+
+    .form-group label {
+      display: block;
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--text-muted);
+      margin-bottom: 6px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+
+    .form-group input, .form-group select {
+      width: 100%;
+      background: var(--bg-primary);
+      border: 1px solid var(--border);
+      padding: 10px 14px;
+      border-radius: 8px;
+      color: var(--text-main);
+      font-size: 14px;
+      outline: none;
+    }
+
+    .form-group input:focus, .form-group select:focus {
+      border-color: var(--accent);
+    }
+
+    .otp-input-row {
+      display: flex;
+      gap: 8px;
+      align-items: stretch;
+    }
+
+    .otp-btn {
+      background: var(--bg-tertiary);
+      color: var(--accent);
+      border: 1px solid var(--border);
+      font-weight: 600;
+      font-size: 12px;
+      padding: 0 16px;
+      border-radius: 8px;
+      cursor: pointer;
+      white-space: nowrap;
+      transition: all 0.2s;
+    }
+
+    .otp-btn:hover {
+      background: var(--accent);
+      color: #0f172a;
+    }
+
+    .otp-btn:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+
+    .form-row {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+    }
+
+    .auth-link {
+      display: inline-block;
+      font-size: 12px;
+      color: var(--accent);
+      text-decoration: none;
+      cursor: pointer;
+      margin-top: 4px;
+      transition: color 0.2s;
+    }
+
+    .auth-link:hover {
+      text-decoration: underline;
+    }
+
+    .demo-persona-row {
+      display: grid;
+      grid-template-columns: 1fr 1fr 1fr;
+      gap: 6px;
+      margin-bottom: 16px;
+    }
+
+    .persona-chip {
+      background: var(--bg-primary);
+      border: 1px solid var(--border);
+      padding: 8px 10px;
+      border-radius: 8px;
+      font-size: 12px;
+      cursor: pointer;
+      text-align: left;
+      transition: border-color 0.2s;
+    }
+
+    .persona-chip:hover {
+      border-color: var(--accent);
+    }
+
+    .persona-chip b {
+      display: block;
+      color: var(--text-main);
+      font-size: 12px;
+    }
+
+    .persona-chip span {
+      color: var(--text-muted);
+      font-size: 11px;
+    }
+
+    .login-submit-btn {
+      width: 100%;
+      background: var(--accent);
+      color: #0f172a;
+      border: none;
+      padding: 12px;
+      border-radius: 8px;
+      font-weight: 700;
+      font-size: 14px;
+      cursor: pointer;
+      transition: background 0.2s;
+    }
+
+    .login-submit-btn:hover {
+      background: var(--accent-hover);
+    }
+
+    .auth-error {
+      background: var(--danger-bg);
+      color: var(--danger);
+      border: 1px solid rgba(239, 68, 68, 0.3);
+      padding: 10px 12px;
+      border-radius: 6px;
+      font-size: 12px;
+      margin-bottom: 14px;
+      display: none;
+      line-height: 1.4;
+    }
+
+    .auth-success {
+      background: var(--success-bg);
+      color: var(--success);
+      border: 1px solid rgba(16, 185, 129, 0.3);
+      padding: 10px 12px;
+      border-radius: 6px;
+      font-size: 12px;
+      margin-bottom: 14px;
+      display: none;
+      line-height: 1.4;
+    }
+
+    .auth-info {
+      background: var(--info-bg);
+      color: var(--accent);
+      border: 1px solid rgba(56, 189, 248, 0.3);
+      padding: 10px 12px;
+      border-radius: 6px;
+      font-size: 12px;
+      margin-bottom: 14px;
+      display: none;
+      line-height: 1.4;
+    }
+
+    .hidden {
+      display: none !important;
+    }
+  </style>
+</head>
+<body>
+
+  <!-- Top Navigation Header -->
+  <header>
+    <div class="brand">
+      <div class="brand-icon">🏛️</div>
+      <div>
+        <div class="brand-title">IISc Institutional Thesis RAG</div>
+        <div class="brand-subtitle">On-Premises Zero-Egress Gateway • Dual Cache</div>
+      </div>
+    </div>
+
+    <div id="userProfile" class="user-pill hidden">
+      <span id="userName">Student</span>
+      <span id="userRole" class="role-badge">Student</span>
+      <button class="logout-btn" onclick="logout()">Log out</button>
+    </div>
+  </header>
+
+  <!-- Login / Register Modal -->
+  <div id="loginModal" class="modal-backdrop">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h2>Institutional Access Gateway</h2>
+        <p>IISc Thesis Retrieval &amp; Question-Answering Service</p>
+      </div>
+
+      <!-- Tab Navigation -->
+      <div class="auth-tabs">
+        <button id="tabSignIn" class="auth-tab active" onclick="switchAuthTab('signin')">🔑 Sign In</button>
+        <button id="tabRegister" class="auth-tab" onclick="switchAuthTab('register')">✉️ Register with OTP</button>
+      </div>
+
+      <!-- Alert Banners -->
+      <div id="authError" class="auth-error"></div>
+      <div id="authSuccess" class="auth-success"></div>
+      <div id="authInfo" class="auth-info"></div>
+
+      <!-- VIEW 1: SIGN IN -->
+      <div id="viewSignIn">
+        <div class="form-group">
+          <label>Email Address</label>
+          <input type="email" id="loginEmail" placeholder="user@iisc.ac.in or you@gmail.com" value="student@iisc.ac.in">
+        </div>
+
+        <div class="form-group">
+          <div style="display:flex; justify-content:space-between; align-items:center;">
+            <label>Password</label>
+            <span class="auth-link" onclick="switchAuthTab('reset')">Forgot password?</span>
+          </div>
+          <input type="password" id="loginPassword" placeholder="Enter your password" value="campus-pass">
+        </div>
+
+        <label style="font-size: 11px; color: var(--text-muted); display: block; margin-bottom: 6px; text-transform: uppercase;">Quick-Select Demo Personas</label>
+        <div class="demo-persona-row">
+          <div class="persona-chip" onclick="fillPersona('student@iisc.ac.in', 'campus-pass', 'student')">
+            🎓 <b>Student</b>
+            <span>student@iisc</span>
+          </div>
+          <div class="persona-chip" onclick="fillPersona('faculty.venkatesh@ece.iisc.ac.in', 'campus-pass', 'faculty')">
+            🧑‍🏫 <b>Examiner</b>
+            <span>faculty@ece</span>
+          </div>
+          <div class="persona-chip" onclick="fillPersona('admin@serc.iisc.ac.in', 'campus-pass', 'admin')">
+            🛡️ <b>Admin</b>
+            <span>admin@serc</span>
+          </div>
+        </div>
+
+        <button class="login-submit-btn" onclick="submitLogin()">Sign In to Gateway</button>
+      </div>
+
+      <!-- VIEW 2: REGISTER WITH IISc OTP -->
+      <div id="viewRegister" class="hidden">
+        <div class="form-group">
+          <label>Email Address</label>
+          <div class="otp-input-row">
+            <input type="email" id="regEmail" placeholder="your_name@iisc.ac.in or you@gmail.com">
+            <button id="sendOtpBtn" class="otp-btn" onclick="requestRegisterOtp()">Send OTP</button>
+          </div>
+          <small style="color:var(--text-muted); font-size:11px; margin-top:4px; display:block;">
+            Accepted: <code>@iisc.ac.in</code>, departmental subdomains, or <code>@gmail.com</code>
+          </small>
+        </div>
+
+        <div id="regStep2" class="hidden">
+          <div class="form-group">
+            <label>6-Digit Verification Code (OTP)</label>
+            <input type="text" id="regOtp" placeholder="Enter 6-digit OTP code" maxlength="6">
+          </div>
+
+          <div class="form-row">
+            <div class="form-group">
+              <label>Full Name</label>
+              <input type="text" id="regName" placeholder="Dr. / Prof. / Name">
+            </div>
+            <div class="form-group">
+              <label>Department</label>
+              <select id="regDept">
+                <option value="cds">CDS (Data Sciences)</option>
+                <option value="csa">CSA (Computer Science)</option>
+                <option value="ece">ECE (Electrical Comm)</option>
+                <option value="dese">DESE (Electronic Systems)</option>
+                <option value="serc">SERC (Supercomputing)</option>
+                <option value="rbccps">RBCCPS (Cyber-Physical)</option>
+                <option value="other">Other IISc Dept</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label>Role</label>
+            <select id="regRole">
+              <option value="student">Student / Research Scholar</option>
+              <option value="faculty">Faculty Member</option>
+              <option value="examiner">Thesis Examiner</option>
+            </select>
+          </div>
+
+          <div class="form-row">
+            <div class="form-group">
+              <label>Set Password</label>
+              <input type="password" id="regPassword" placeholder="Min. 6 characters">
+            </div>
+            <div class="form-group">
+              <label>Confirm Password</label>
+              <input type="password" id="regConfirmPassword" placeholder="Confirm password">
+            </div>
+          </div>
+
+          <button class="login-submit-btn" onclick="submitRegistration()">Verify OTP &amp; Create Account</button>
+        </div>
+      </div>
+
+      <!-- VIEW 3: RESET PASSWORD -->
+      <div id="viewReset" class="hidden">
+        <div style="margin-bottom:14px;">
+          <span class="auth-link" onclick="switchAuthTab('signin')">&larr; Back to Sign In</span>
+        </div>
+
+        <div class="form-group">
+          <label>Email Address</label>
+          <div class="otp-input-row">
+            <input type="email" id="resetEmail" placeholder="your_name@iisc.ac.in or you@gmail.com">
+            <button id="sendResetOtpBtn" class="otp-btn" onclick="requestResetOtp()">Send Code</button>
+          </div>
+        </div>
+
+        <div id="resetStep2" class="hidden">
+          <div class="form-group">
+            <label>6-Digit Reset Code (OTP)</label>
+            <input type="text" id="resetOtp" placeholder="Enter 6-digit code" maxlength="6">
+          </div>
+
+          <div class="form-group">
+            <label>New Password</label>
+            <input type="password" id="resetNewPassword" placeholder="New password (min. 6 characters)">
+          </div>
+
+          <button class="login-submit-btn" onclick="submitPasswordReset()">Update Password &amp; Sign In</button>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- Chat Workspace -->
+  <main>
+    <!-- FR-3 Scoping Control Bar -->
+    <div class="scope-bar">
+      <div class="scope-label">
+        <span>🎯</span>
+        <span>Target Scope:</span>
+      </div>
+
+      <div class="select-group" style="display: flex; gap: 8px; flex: 1; align-items: center; flex-wrap: wrap;">
+        <input 
+          type="text" 
+          id="thesisFilter" 
+          placeholder="🔍 Search 9,250+ theses..." 
+          oninput="filterThesesDebounced()"
+          style="background: var(--bg-tertiary); color: var(--text-primary); border: 1px solid var(--border); border-radius: 6px; padding: 6px 12px; font-size: 13px; min-width: 180px; max-width: 250px;"
+        />
+        <select id="thesisSelect" onchange="onThesisChange()" style="flex: 2; min-width: 260px;">
+          <option value="global">🌐 All IISc Theses &amp; Dissertations (Global Repository Search)</option>
+          <option value="thesis_2024_ece">Thesis 2024 (ECE): Dynamic Routing &amp; Continuous Batching</option>
+          <option value="thesis_2023_csa">Thesis 2023 (CSA): PagedAttention vs Virtual Memory</option>
+          <option value="thesis_2024_cds">Thesis 2024 (CDS): Spectral Graph Embeddings</option>
+        </select>
+
+        <select id="chapterSelect" onchange="updateScopeIndicator()" style="flex: 1; min-width: 140px;">
+          <option value="all">Whole Thesis (All Chapters)</option>
+        </select>
+      </div>
+
+      <div id="scopeIndicator" class="scope-tag-indicator">
+        Scope: thesis_2024_ece / ch_3
+      </div>
+    </div>
+
+    <!-- Message Thread -->
+    <div id="chatThread" class="chat-container">
+      <div class="message assistant">
+        <div class="bubble">
+          👋 Welcome to the <b>IISc Institutional RAG Gateway</b>.<br><br>
+          • <b>L0 Exact Cache</b> serves identical queries in 0ms without running inference.<br>
+          • <b>L1 Semantic Cache</b> serves paraphrased questions when cosine similarity exceeds &tau; (&ge; 0.88) <i>and</i> the <b>Entity Guard</b> verifies the query targets the same thesis and chapter scope.<br>
+          • <b>Complexity Router</b> routes cache misses dynamically between the on-prem Edge SLM and 7B GPU tiers.
+        </div>
+        <div class="message-meta">
+          <span>Gateway Ready • Intranet Serving</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Quick Presets -->
+    <div class="presets-row">
+      <button class="preset-btn" onclick="sendPreset('What estimator is proposed in Chapter 3?', 'thesis_2024_ece', 'ch_3')">
+        ⚡ 1. Populate Cache: "What estimator is proposed in Chapter 3?"
+      </button>
+      <button class="preset-btn" onclick="sendPreset('Can you explain the Chapter 3 estimator design?', 'thesis_2024_ece', 'ch_3')">
+        🔄 2. Paraphrase (FR-3 Hit): "Can you explain the Chapter 3 estimator design?"
+      </button>
+      <button class="preset-btn" onclick="sendPreset('Can you explain the Chapter 3 estimator design?', 'thesis_2023_csa', 'ch_3')">
+        ❌ 3. Cross-Thesis (FR-3 Miss): Same query on Thesis CSA
+      </button>
+      <button class="preset-btn" onclick="sendPreset('Can you explain the Chapter 5 estimator design?', 'thesis_2024_ece', 'ch_5')">
+        ❌ 4. Cross-Chapter (FR-3 Miss): Same query on Chapter 5
+      </button>
+    </div>
+
+    <!-- Input Bar -->
+    <div class="input-bar-container">
+      <textarea id="promptInput" placeholder="Ask a question about the selected thesis and chapter scope..." rows="1" onkeydown="handleKeyDown(event)"></textarea>
+      <button id="sendBtn" class="send-btn" onclick="sendQuery()">
+        Send
+      </button>
+    </div>
+  </main>
+
+  <script>
+    // State
+    let authToken = sessionStorage.getItem("access_token") || null;
+    let currentUser = null;
+    let thesisCatalog = {};
+
+    // DOM Elements
+    const loginModal = document.getElementById("loginModal");
+    const authError = document.getElementById("authError");
+    const authSuccess = document.getElementById("authSuccess");
+    const authInfo = document.getElementById("authInfo");
+    const tabSignIn = document.getElementById("tabSignIn");
+    const tabRegister = document.getElementById("tabRegister");
+    const viewSignIn = document.getElementById("viewSignIn");
+    const viewRegister = document.getElementById("viewRegister");
+    const viewReset = document.getElementById("viewReset");
+    const userProfile = document.getElementById("userProfile");
+    const userName = document.getElementById("userName");
+    const userRole = document.getElementById("userRole");
+    const chatThread = document.getElementById("chatThread");
+    const promptInput = document.getElementById("promptInput");
+    const sendBtn = document.getElementById("sendBtn");
+    const thesisSelect = document.getElementById("thesisSelect");
+    const chapterSelect = document.getElementById("chapterSelect");
+    const scopeIndicator = document.getElementById("scopeIndicator");
+
+    function resetChatThread() {
+      if (chatThread) {
+        chatThread.innerHTML = `
+      <div class="message assistant">
+        <div class="bubble">
+          👋 Welcome to the <b>IISc Institutional RAG Gateway</b>.<br><br>
+          • <b>L0 Exact Cache</b> serves identical queries in 0ms without running inference.<br>
+          • <b>L1 Semantic Cache</b> serves paraphrased questions when cosine similarity exceeds &tau; (&ge; 0.88) <i>and</i> the <b>Entity Guard</b> verifies the query targets the same thesis and chapter scope.<br>
+          • <b>Complexity Router</b> routes cache misses dynamically between the on-prem Edge SLM and 7B GPU tiers.
+        </div>
+        <div class="message-meta">
+          <span>Gateway Ready • Intranet Serving</span>
+        </div>
+      </div>`;
+      }
+      if (promptInput) promptInput.value = "";
+    }
+
+    function saveUserChat(userId) {
+      if (!userId || !chatThread) return;
+      sessionStorage.setItem("user_chat_" + userId, chatThread.innerHTML);
+    }
+
+    function restoreUserChat(userId) {
+      if (!userId || !chatThread) {
+        resetChatThread();
+        return;
+      }
+      const saved = sessionStorage.getItem("user_chat_" + userId);
+      if (saved) {
+        chatThread.innerHTML = saved;
+      } else {
+        resetChatThread();
+      }
+    }
+
+    async function init() {
+      if (authToken) {
+        const verified = await checkSession();
+        if (verified) {
+          hideLogin();
+          restoreUserChat(currentUser ? currentUser.user_id : null);
+          await loadTheses();
+          return;
+        }
+      }
+      resetChatThread();
+      showLogin();
+    }
+
+    function showLogin() {
+      loginModal.classList.remove("hidden");
+    }
+
+    function hideLogin() {
+      loginModal.classList.add("hidden");
+    }
+
+    function clearAuthAlerts() {
+      if (authError) authError.style.display = "none";
+      if (authSuccess) authSuccess.style.display = "none";
+      if (authInfo) authInfo.style.display = "none";
+    }
+
+    function showAuthError(msg) {
+      clearAuthAlerts();
+      authError.innerText = msg;
+      authError.style.display = "block";
+    }
+
+    function showAuthSuccess(msg) {
+      clearAuthAlerts();
+      authSuccess.innerText = msg;
+      authSuccess.style.display = "block";
+    }
+
+    function switchAuthTab(tab) {
+      clearAuthAlerts();
+      if (tab === "signin") {
+        tabSignIn.classList.add("active");
+        tabRegister.classList.remove("active");
+        viewSignIn.classList.remove("hidden");
+        viewRegister.classList.add("hidden");
+        viewReset.classList.add("hidden");
+      } else if (tab === "register") {
+        tabRegister.classList.add("active");
+        tabSignIn.classList.remove("active");
+        viewRegister.classList.remove("hidden");
+        viewSignIn.classList.add("hidden");
+        viewReset.classList.add("hidden");
+      } else if (tab === "reset") {
+        tabSignIn.classList.remove("active");
+        tabRegister.classList.remove("active");
+        viewReset.classList.remove("hidden");
+        viewSignIn.classList.add("hidden");
+        viewRegister.classList.add("hidden");
+      }
+    }
+
+    function fillPersona(email, password, persona) {
+      document.getElementById("loginEmail").value = email;
+      document.getElementById("loginPassword").value = password || "campus-pass";
+      loginModal.dataset.persona = persona;
+    }
+
+    function isValidEmailDomain(email) {
+      const e = (email || "").toLowerCase().trim();
+      return e.endsWith("@iisc.ac.in") || e.includes(".iisc.ac.in") || e.endsWith("@gmail.com");
+    }
+
+    async function submitLogin() {
+      clearAuthAlerts();
+      const email = document.getElementById("loginEmail").value.trim();
+      const password = document.getElementById("loginPassword").value;
+      const persona = loginModal.dataset.persona || "";
+
+      if (!isValidEmailDomain(email)) {
+        showAuthError("Access denied: Email address must belong to @iisc.ac.in or @gmail.com.");
+        return;
+      }
+
+      try {
+        const res = await fetch("/auth/login", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ email, password, persona })
+        });
+
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}));
+          showAuthError(err.detail || "Authentication failed. Check your password or register first.");
+          return;
+        }
+
+        const data = await res.json();
+        authToken = data.access_token;
+        sessionStorage.setItem("access_token", authToken);
+        currentUser = data.user;
+        updateUserUI();
+        restoreUserChat(currentUser ? currentUser.user_id : null);
+        hideLogin();
+        await loadTheses();
+      } catch (err) {
+        showAuthError("Could not reach gateway auth endpoint: " + err.message);
+      }
+    }
+
+    async function requestRegisterOtp() {
+      clearAuthAlerts();
+      const email = document.getElementById("regEmail").value.trim();
+      const btn = document.getElementById("sendOtpBtn");
+
+      if (!isValidEmailDomain(email)) {
+        showAuthError("Registration restricted: Must enter a valid @iisc.ac.in or @gmail.com email address.");
+        return;
+      }
+
+      btn.disabled = true;
+      btn.innerText = "Sending...";
+
+      try {
+        const res = await fetch("/auth/register/request-otp", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ email })
+        });
+
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          showAuthError(data.detail || "Failed to send registration OTP.");
+          btn.disabled = false;
+          btn.innerText = "Send OTP";
+          return;
+        }
+
+        showAuthSuccess(data.message || "A 6-digit verification code has been dispatched to your institutional email. Please check your inbox.");
+
+        document.getElementById("regStep2").classList.remove("hidden");
+        document.getElementById("regOtp").focus();
+        btn.innerText = "Resend OTP";
+        btn.disabled = false;
+      } catch (err) {
+        showAuthError("Network error sending OTP: " + err.message);
+        btn.disabled = false;
+        btn.innerText = "Send OTP";
+      }
+    }
+
+    async function submitRegistration() {
+      clearAuthAlerts();
+      const email = document.getElementById("regEmail").value.trim();
+      const otp = document.getElementById("regOtp").value.trim();
+      const name = document.getElementById("regName").value.trim();
+      const department = document.getElementById("regDept").value;
+      const role = document.getElementById("regRole").value;
+      const password = document.getElementById("regPassword").value;
+      const confirmPass = document.getElementById("regConfirmPassword").value;
+
+      if (!otp || otp.length !== 6) {
+        showAuthError("Please enter the complete 6-digit OTP code sent to your email.");
+        return;
+      }
+      if (!password || password.length < 6) {
+        showAuthError("Password must be at least 6 characters long.");
+        return;
+      }
+      if (password !== confirmPass) {
+        showAuthError("Passwords do not match. Please re-enter.");
+        return;
+      }
+
+      try {
+        const res = await fetch("/auth/register/verify", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            email,
+            otp,
+            password,
+            name,
+            department,
+            role
+          })
+        });
+
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          showAuthError(data.detail || "Registration failed. Invalid or expired OTP.");
+          return;
+        }
+
+        // Account registered and authenticated!
+        authToken = data.access_token;
+        sessionStorage.setItem("access_token", authToken);
+        currentUser = data.user;
+        updateUserUI();
+        restoreUserChat(currentUser ? currentUser.user_id : null);
+        hideLogin();
+        await loadTheses();
+      } catch (err) {
+        showAuthError("Registration network error: " + err.message);
+      }
+    }
+
+    async function requestResetOtp() {
+      clearAuthAlerts();
+      const email = document.getElementById("resetEmail").value.trim();
+      const btn = document.getElementById("sendResetOtpBtn");
+
+      if (!isValidEmailDomain(email)) {
+        showAuthError("Must provide a registered @iisc.ac.in or @gmail.com email.");
+        return;
+      }
+
+      btn.disabled = true;
+      btn.innerText = "Sending...";
+
+      try {
+        const res = await fetch("/auth/reset-password/request-otp", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ email })
+        });
+
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          showAuthError(data.detail || "Could not send password reset OTP.");
+          btn.disabled = false;
+          btn.innerText = "Send Code";
+          return;
+        }
+
+        showAuthSuccess(data.message || "A password reset verification code has been dispatched to your institutional email. Please check your inbox.");
+
+        document.getElementById("resetStep2").classList.remove("hidden");
+        btn.innerText = "Resend Code";
+        btn.disabled = false;
+      } catch (err) {
+        showAuthError("Network error: " + err.message);
+        btn.disabled = false;
+        btn.innerText = "Send Code";
+      }
+    }
+
+    async function submitPasswordReset() {
+      clearAuthAlerts();
+      const email = document.getElementById("resetEmail").value.trim();
+      const otp = document.getElementById("resetOtp").value.trim();
+      const new_password = document.getElementById("resetNewPassword").value;
+
+      if (!otp || otp.length !== 6) {
+        showAuthError("Please enter the 6-digit reset code.");
+        return;
+      }
+      if (!new_password || new_password.length < 6) {
+        showAuthError("New password must be at least 6 characters long.");
+        return;
+      }
+
+      try {
+        const res = await fetch("/auth/reset-password/verify", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ email, otp, new_password })
+        });
+
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          showAuthError(data.detail || "Failed to reset password.");
+          return;
+        }
+
+        switchAuthTab("signin");
+        showAuthSuccess("Password updated successfully! Please sign in with your new password.");
+        document.getElementById("loginEmail").value = email;
+        document.getElementById("loginPassword").value = new_password;
+      } catch (err) {
+        showAuthError("Network error: " + err.message);
+      }
+    }
+
+    async function checkSession() {
+      try {
+        const res = await fetch("/auth/me", {
+          headers: { "Authorization": `Bearer ${authToken}` }
+        });
+        if (res.ok) {
+          const data = await res.json();
+          currentUser = data.user;
+          updateUserUI();
+          return true;
+        }
+      } catch (e) {}
+      sessionStorage.removeItem("access_token");
+      authToken = null;
+      return false;
+    }
+
+    function updateUserUI() {
+      if (!currentUser) return;
+      userName.innerText = currentUser.name || currentUser.email.split("@")[0];
+      userRole.innerText = (currentUser.roles && currentUser.roles[0]) ? currentUser.roles[0] : "Student";
+      userProfile.classList.remove("hidden");
+    }
+
+    function logout() {
+      sessionStorage.removeItem("access_token");
+      authToken = null;
+      currentUser = null;
+      userProfile.classList.add("hidden");
+      resetChatThread();
+      showLogin();
+    }
+
+    let filterTimeout = null;
+    function filterThesesDebounced() {
+      clearTimeout(filterTimeout);
+      const val = document.getElementById("thesisFilter").value.trim();
+      filterTimeout = setTimeout(() => {
+        loadTheses(val);
+      }, 250);
+    }
+
+    async function loadTheses(filterQuery = "") {
+      try {
+        let url = "/api/theses?limit=250";
+        if (filterQuery) {
+          url += "&q=" + encodeURIComponent(filterQuery);
+        }
+        const res = await fetch(url, {
+          headers: { "Authorization": `Bearer ${authToken}` }
+        });
+        if (res.ok) {
+          const data = await res.json();
+          thesisCatalog = {};
+          const prevVal = thesisSelect.value;
+          thesisSelect.innerHTML = "";
+          if (!data.theses || data.theses.length === 0) {
+            const opt = document.createElement("option");
+            opt.value = "";
+            opt.innerText = "No matching thesis found";
+            thesisSelect.appendChild(opt);
+            return;
+          }
+          data.theses.forEach(t => {
+            thesisCatalog[t.thesis_id] = t;
+            const opt = document.createElement("option");
+            opt.value = t.thesis_id;
+            opt.innerText = `${t.title} (${t.department})`;
+            thesisSelect.appendChild(opt);
+          });
+          if (prevVal && thesisCatalog[prevVal]) {
+            thesisSelect.value = prevVal;
+          }
+          sendBtn.disabled = false;
+          onThesisChange();
+        }
+      } catch (e) {}
+    }
+
+    function onThesisChange() {
+      const selectedThesisId = thesisSelect.value;
+      const thesis = thesisCatalog[selectedThesisId];
+      chapterSelect.innerHTML = "";
+      if (thesis && thesis.chapters && thesis.chapters.length > 0) {
+        thesis.chapters.forEach(ch => {
+          const opt = document.createElement("option");
+          opt.value = ch.id;
+          opt.innerText = ch.title;
+          chapterSelect.appendChild(opt);
+        });
+      } else {
+        const optAll = document.createElement("option");
+        optAll.value = "all";
+        optAll.innerText = selectedThesisId === "global" ? "Whole Repository (Cross-Campus)" : "Whole Document (All Chapters)";
+        chapterSelect.appendChild(optAll);
+      }
+
+      if (promptInput) {
+        if (selectedThesisId === "global") {
+          promptInput.placeholder = "Ask any research question across all 9,250+ IISc theses...";
+        } else {
+          promptInput.placeholder = "Ask a question about this thesis...";
+        }
+      }
+      updateScopeIndicator();
+    }
+
+    function updateScopeIndicator() {
+      const t = thesisSelect.value;
+      const c = chapterSelect.value;
+      const thesis = thesisCatalog[t];
+      if (t === "global") {
+        scopeIndicator.innerText = "Scope: 🌐 All IISc Theses (2.26M Chunks)";
+      } else if (thesis) {
+        const shortTitle = thesis.title.length > 32 ? thesis.title.substring(0, 32) + "..." : thesis.title;
+        scopeIndicator.innerText = `Scope: ${shortTitle} [${c}]`;
+      } else {
+        scopeIndicator.innerText = `Scope: ${t} / ${c}`;
+      }
+    }
+
+    function handleKeyDown(e) {
+      if (e.key === "Enter" && !e.shiftKey) {
+        e.preventDefault();
+        sendQuery();
+      }
+    }
+
+    function sendPreset(prompt, thesisId, chapterId) {
+      thesisSelect.value = thesisId;
+      onThesisChange();
+      chapterSelect.value = chapterId;
+      updateScopeIndicator();
+      promptInput.value = prompt;
+      sendQuery();
+    }
+
+    async function sendQuery() {
+      const prompt = promptInput.value.trim();
+      if (!prompt) return;
+
+      const thesis_id = thesisSelect.value;
+      const chapter = chapterSelect.value;
+      if (!thesis_id) {
+        appendMessage("assistant", "⚠️ No authorized, indexed thesis is available. Ingest a PDF first.");
+        return;
+      }
+
+      // Append user message
+      appendMessage("user", prompt, { thesis_id, chapter });
+      promptInput.value = "";
+      sendBtn.disabled = true;
+
+      const startTime = performance.now();
+
+      try {
+        const res = await fetch("/v1/chat/completions", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": `Bearer ${authToken}`
+          },
+          body: JSON.stringify({
+            prompt: prompt,
+            scope: { thesis_id, chapter, doc_version: "v1" }
+          })
+        });
+
+        const elapsedMs = Math.round(performance.now() - startTime);
+
+        if (!res.ok) {
+          const errData = await res.json().catch(() => ({}));
+          appendMessage("assistant", `⚠️ Error [${res.status}]: ${errData.detail || "Request failed"}`);
+          sendBtn.disabled = false;
+          return;
+        }
+
+        const data = await res.json();
+        const cacheHeader = res.headers.get("X-Cache") || data.cache_status || "MISS";
+        const simHeader = res.headers.get("X-Cache-Similarity") || data.similarity;
+        const respThesis = res.headers.get("X-Scope-Thesis") || (data.scope && data.scope.thesis_id);
+        const respChapter = res.headers.get("X-Scope-Chapter") || (data.scope && data.scope.chapter);
+
+        const answerText = (data.data && data.data.answer) ? data.data.answer : (data.data ? JSON.stringify(data.data) : "No response generated.");
+        const citations = (data.data && data.data.citations) ? data.data.citations : [];
+        const routing = data.routing || { target_tier: data.target_tier, complexity_score: data.complexity_score };
+
+        appendAssistantMessage({
+          answer: answerText,
+          cacheStatus: cacheHeader,
+          similarity: simHeader,
+          scope: { thesis_id: respThesis, chapter: respChapter },
+          routing: routing,
+          citations: citations,
+          elapsedMs: elapsedMs
+        });
+      } catch (err) {
+        appendMessage("assistant", `❌ Network or serving exception: ${err.message}`);
+      } finally {
+        sendBtn.disabled = false;
+      }
+    }
+
+    function appendMessage(role, text, scope) {
+      const msgDiv = document.createElement("div");
+      msgDiv.className = `message ${role}`;
+
+      let scopeMeta = "";
+      if (scope) {
+        scopeMeta = `<span>🎯 ${scope.thesis_id} [${scope.chapter}]</span> • `;
+      }
+
+      msgDiv.innerHTML = `
+        <div class="bubble">${escapeHtml(text)}</div>
+        <div class="message-meta">
+          ${scopeMeta}
+          <span>${new Date().toLocaleTimeString()}</span>
+        </div>
+      `;
+      chatThread.appendChild(msgDiv);
+      chatThread.scrollTop = chatThread.scrollHeight;
+      saveUserChat(currentUser ? currentUser.user_id : null);
+    }
+
+    function appendAssistantMessage(info) {
+      const msgDiv = document.createElement("div");
+      msgDiv.className = "message assistant";
+
+      // Cache Status Badge
+      let badgeHtml = "";
+      if (info.cacheStatus === "HIT-L0") {
+        badgeHtml = `<span class="badge l0-hit">🟢 L0 Exact Match (0ms)</span>`;
+      } else if (info.cacheStatus === "HIT-L1") {
+        const simPercent = info.similarity ? `${Math.round(parseFloat(info.similarity) * 100)}%` : "≥ 88%";
+        badgeHtml = `<span class="badge l1-hit">🔵 L1 Semantic Hit (Cos Sim: ${simPercent}) • Entity Guard Confirmed</span>`;
+      } else {
+        const tier = info.routing.target_tier ? info.routing.target_tier.toUpperCase() : "SLM_CPU";
+        const score = info.routing.complexity_score !== undefined ? `s = ${info.routing.complexity_score}` : "";
+        badgeHtml = `<span class="badge miss">🟠 Cache Miss</span> <span class="badge routing">Routed to ${tier} (${score})</span>`;
+      }
+
+      // Citations
+      let citationsHtml = "";
+      if (info.citations && info.citations.length > 0) {
+        citationsHtml = `
+          <div class="citations-card">
+            <b>Citations:</b> ${info.citations.map(c => {
+              const id = typeof c === "string" ? c : c.id;
+              const uri = typeof c === "object" ? c.source_uri : "";
+              return `<code title="${escapeHtml(uri)}">${escapeHtml(id)}</code>`;
+            }).join(", ")}
+          </div>
+        `;
+      }
+
+      msgDiv.innerHTML = `
+        <div class="bubble">
+          ${escapeHtml(info.answer)}
+          <div class="telemetry-row">
+            ${badgeHtml}
+            <span class="badge routing">⏱️ ${info.elapsedMs}ms</span>
+          </div>
+          ${citationsHtml}
+        </div>
+        <div class="message-meta">
+          <span>Target Scope: ${info.scope.thesis_id} (${info.scope.chapter})</span> • 
+          <span>${new Date().toLocaleTimeString()}</span>
+        </div>
+      `;
+
+      chatThread.appendChild(msgDiv);
+      chatThread.scrollTop = chatThread.scrollHeight;
+      saveUserChat(currentUser ? currentUser.user_id : null);
+    }
+
+    function escapeHtml(str) {
+      return (str || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    }
+
+    // Auto-expand textarea
+    promptInput.addEventListener("input", function() {
+      this.style.height = "auto";
+      this.style.height = (this.scrollHeight) + "px";
+    });
+
+    window.onload = init;
+  </script>
+</body>
+</html>
+

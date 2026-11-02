@@ -1,46 +1,89 @@
 import hashlib
 import json
-import logging
 from typing import Any, Dict, Optional
-try:
-    import redis.asyncio as redis
-except ImportError:
-    redis = None
 
-logger = logging.getLogger(__name__)
+from gateway.cache.entity_guard import EntityGuard
+from gateway.cache.validator import VolatileQueryDetector
+
 
 class L0ExactCache:
-    def __init__(self, redis_client=None, default_ttl=3600, prefix="l0:exact:"):
+    """FR-2: Exact-match cache scoped by (thesis_id, chapter, normalized_prompt)."""
+
+    def __init__(
+        self,
+        redis_client: Any = None,
+        ttl_seconds: int = 3600,
+        prefix: str = "l0:exact:",
+        enable_volatile_guard: bool = True,
+    ):
         self.redis = redis_client
-        self.default_ttl = default_ttl
+        self.ttl_seconds = int(ttl_seconds)
         self.prefix = prefix
-        self._local_fallback: Dict[str, str] = {}
+        self.enable_volatile_guard = enable_volatile_guard
 
-    @staticmethod
-    def compute_cache_key(prompt: str, model_params: Optional[Dict[str, Any]] = None) -> str:
-        normalized = " ".join(prompt.strip().lower().split())
-        payload = {"prompt": normalized}
-        if model_params:
-            payload["params"] = {k: v for k, v in sorted(model_params.items())}
-        return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+    def _make_key(
+        self, prompt: str, thesis_id: str = "global", chapter: str = "all", doc_version: str = "v1"
+    ) -> str:
+        norm_prompt = " ".join(prompt.strip().lower().split())
+        norm_thesis = EntityGuard.normalize_thesis_id(thesis_id)
+        norm_chapter = EntityGuard.normalize_chapter(chapter)
+        digest = hashlib.sha256(
+            f"{norm_thesis}|{norm_chapter}|{doc_version}|{norm_prompt}".encode("utf-8")
+        ).hexdigest()
+        return f"{self.prefix}{norm_thesis}:{norm_chapter}:{doc_version}:{digest}"
 
-    async def get(self, prompt: str, model_params=None) -> Optional[Dict[str, Any]]:
-        key = self.prefix + self.compute_cache_key(prompt, model_params)
-        if self.redis:
-            try:
-                data = await self.redis.get(key)
-                if data: return json.loads(data)
-            except Exception: pass
-        if key in self._local_fallback:
-            return json.loads(self._local_fallback[key])
-        return None
+    async def get(
+        self,
+        prompt: str,
+        thesis_id: str = "global",
+        chapter: str = "all",
+        doc_version: str = "v1",
+        freshness_handled: bool = False,
+    ) -> Optional[Dict[str, Any]]:
+        if self.redis is None:
+            return None
+        # Avoid caching volatile/changing information (stocks, weather, live availability)
+        if self.enable_volatile_guard and not freshness_handled and VolatileQueryDetector.is_volatile(prompt):
+            return None
+        key = self._make_key(prompt, thesis_id, chapter, doc_version)
+        raw = await self.redis.get(key)
+        if not raw:
+            return None
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", errors="replace")
+        return json.loads(raw)
 
-    async def set(self, prompt: str, response: Dict[str, Any], model_params=None, ttl=None) -> None:
-        key = self.prefix + self.compute_cache_key(prompt, model_params)
-        val = json.dumps(response)
-        if self.redis:
-            try:
-                await self.redis.set(key, val, ex=ttl or self.default_ttl)
-                return
-            except Exception: pass
-        self._local_fallback[key] = val
+    async def set(
+        self,
+        prompt: str,
+        response: Dict[str, Any],
+        thesis_id: str = "global",
+        chapter: str = "all",
+        doc_version: str = "v1",
+        freshness_handled: bool = False,
+    ) -> str:
+        if self.redis is None:
+            return ""
+        # Avoid caching volatile/changing information
+        if self.enable_volatile_guard and not freshness_handled and VolatileQueryDetector.is_volatile(prompt):
+            return ""
+        key = self._make_key(prompt, thesis_id, chapter, doc_version)
+        payload = json.dumps(response, ensure_ascii=False).encode("utf-8")
+        await self.redis.setex(key, self.ttl_seconds, payload)
+        version_set = f"{self.prefix}versions:{EntityGuard.normalize_thesis_id(thesis_id)}:{doc_version}"
+        if hasattr(self.redis, "sadd"):
+            await self.redis.sadd(version_set, key)
+            if hasattr(self.redis, "expire"):
+                await self.redis.expire(version_set, self.ttl_seconds)
+        return key
+
+    async def invalidate_version(self, thesis_id: str, doc_version: str) -> int:
+        """Delete all exact entries derived from one superseded revision."""
+        if self.redis is None or not hasattr(self.redis, "smembers"):
+            return 0
+        version_set = f"{self.prefix}versions:{EntityGuard.normalize_thesis_id(thesis_id)}:{doc_version}"
+        keys = list(await self.redis.smembers(version_set))
+        if keys:
+            await self.redis.delete(*keys)
+        await self.redis.delete(version_set)
+        return len(keys)

@@ -11,7 +11,11 @@ async def run_sweep():
     print("\nAlpha Sweep Results:")
     for a in [0.2, 0.4, 0.6, 0.8]:
         d = RequestDispatcher(alpha=a)
-        cpu = sum(1 for r in records if (d.decide(await scorer.score(r['query']))).target_tier == ModelTier.CPU_SLM)
+        cpu = 0
+        for record in records:
+            score = await scorer.score(record["query"])
+            if d.decide(score).target_tier == ModelTier.CPU_SLM:
+                cpu += 1
         print(f"Alpha: {a:.2f} -> SLM: {cpu}/{len(records)} queries")
 
 if __name__ == "__main__":

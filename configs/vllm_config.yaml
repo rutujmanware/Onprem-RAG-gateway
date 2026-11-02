@@ -1,7 +1,11 @@
 model:
   path: "models/llm_7b"
   tokenizer: "models/llm_7b"
-  dtype: "bfloat16"
+  architecture: "qwen2"
+  dtype: "auto"
+  quantization: "awq"
+  hf_repo: "Qwen/Qwen2.5-7B-Instruct-AWQ"
+  description: "Official Qwen 2.5 7B Instruct in 4-bit AWQ format for GPU continuous batching"
   trust_remote_code: false
   tensor_parallel_size: 1
   pipeline_parallel_size: 1
@@ -13,9 +17,9 @@ paged_attention:
   kv_cache_dtype: "auto"
 
 continuous_batching:
-  max_num_batched_tokens: 4096
+  max_num_batched_tokens: 32768
   max_num_seqs: 64
-  max_model_len: 4096
+  max_model_len: 32768
   scheduler_delay_factor: 0.0
 
 server:

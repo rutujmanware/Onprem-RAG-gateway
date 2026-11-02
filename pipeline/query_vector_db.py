@@ -18,6 +18,7 @@ except ImportError:
     redis = None
 
 from pipeline.embeddings.embedder import LocalEmbedder
+from pipeline.env_utils import resolve_redis_url
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger("vector_query")
@@ -27,14 +28,9 @@ async def query_vector_db(
     query_text: str,
     top_k: int = 3,
     redis_url: Optional[str] = None,
-    index_name: str = "rag_documents_idx",
+    index_name: str = "rag_documents_v2_idx",
 ):
-    url = redis_url or os.getenv("REDIS_URL", "redis://localhost:6379/0")
-    embedder = LocalEmbedder(dimension=384)
-
-    print(f"\n[QUERY] Computing dense embedding for query: '{query_text}'...", flush=True)
-    query_vec = embedder.embed_query(query_text)
-    vec_bytes = np.array(query_vec, dtype=np.float32).tobytes()
+    url = resolve_redis_url(redis_url)
 
     if not redis:
         print("[ERROR] redis-py is not installed. Run 'pip install redis' to query Redis Stack.", flush=True)
@@ -42,11 +38,25 @@ async def query_vector_db(
 
     r = redis.from_url(url, encoding="utf-8", decode_responses=False)
     try:
+        try:
+            await r.ping()
+        except Exception as e:
+            print(f"\n[ERROR] Could not connect to Redis at {url}: {e}", flush=True)
+            print("Please ensure Redis Stack is running (e.g. 'make redis-up') and authentication credentials are valid.\n", flush=True)
+            return
+
+        embedder = LocalEmbedder(dimension=384)
+        print(f"\n[QUERY] Computing dense embedding for query: '{query_text}'...", flush=True)
+        query_vec = embedder.embed_query(query_text)
+        vec_bytes = np.array(query_vec, dtype=np.float32).tobytes()
+
         search_query = f"*=>[KNN {top_k} @vector $vec AS score]"
+        target_index = index_name
+
         try:
             results = await r.execute_command(
                 "FT.SEARCH",
-                index_name,
+                target_index,
                 search_query,
                 "PARAMS",
                 "2",
@@ -59,18 +69,59 @@ async def query_vector_db(
                 "2",
             )
         except Exception as se:
-            if "no such index" in str(se).lower() or "unknown index" in str(se).lower():
-                print(f"\n[INFO] The index '{index_name}' does not exist yet.", flush=True)
-                print("Run the crawler to download and index your first thesis!\n", flush=True)
-                return
-            raise se
+            err_msg = str(se).lower()
+            if "no such index" in err_msg or "unknown index" in err_msg:
+                available_indices: List[str] = []
+                try:
+                    raw_indices = await r.execute_command("FT._LIST")
+                    available_indices = [
+                        idx.decode("utf-8") if isinstance(idx, bytes) else str(idx)
+                        for idx in raw_indices
+                    ]
+                except Exception:
+                    pass
+
+                # If the requested index doesn't exist, check for alternative version
+                fallback_index = None
+                if target_index == "rag_documents_v2_idx" and "rag_documents_idx" in available_indices:
+                    fallback_index = "rag_documents_idx"
+                elif target_index == "rag_documents_idx" and "rag_documents_v2_idx" in available_indices:
+                    fallback_index = "rag_documents_v2_idx"
+
+                if fallback_index:
+                    print(f"\n[INFO] Index '{target_index}' not found. Falling back to existing index '{fallback_index}'...", flush=True)
+                    results = await r.execute_command(
+                        "FT.SEARCH",
+                        fallback_index,
+                        search_query,
+                        "PARAMS",
+                        "2",
+                        "vec",
+                        vec_bytes,
+                        "SORTBY",
+                        "score",
+                        "ASC",
+                        "DIALECT",
+                        "2",
+                    )
+                    target_index = fallback_index
+                else:
+                    print(f"\n[INFO] The index '{target_index}' does not exist yet.", flush=True)
+                    if available_indices:
+                        print(f"Available indices in Redis: {', '.join(available_indices)}", flush=True)
+                        print(f"To query a specific index, use: make query Q=\"{query_text}\" (or --index <name>)\n", flush=True)
+                    else:
+                        print("Run 'make ingest-pdfs' or your crawler pipeline to index documents first!\n", flush=True)
+                    return
+            else:
+                raise se
 
         total_matches = results[0]
         if total_matches == 0:
-            print(f"\n[INFO] Index '{index_name}' exists but contains 0 matching documents.\n", flush=True)
+            print(f"\n[INFO] Index '{target_index}' exists but contains 0 matching documents.\n", flush=True)
             return
         print("\n" + "=" * 65, flush=True)
-        print(f"Top {top_k} Results from '{index_name}' (Total hits: {total_matches}):", flush=True)
+        print(f"Top {top_k} Results from '{target_index}' (Total hits: {total_matches}):", flush=True)
         print("=" * 65, flush=True)
 
         for i in range(1, len(results), 2):
@@ -110,8 +161,8 @@ def main():
     parser = argparse.ArgumentParser(description="Query the Redis Stack vector database")
     parser.add_argument("query", help="Text search query")
     parser.add_argument("--top-k", type=int, default=3, help="Number of nearest neighbors to retrieve")
-    parser.add_argument("--index", default="rag_documents_idx", help="RediSearch index name")
-    parser.add_argument("--redis-url", default=os.getenv("REDIS_URL", "redis://localhost:6379/0"))
+    parser.add_argument("--index", default="rag_documents_v2_idx", help="RediSearch index name")
+    parser.add_argument("--redis-url", default=None, help="Redis connection URL (defaults to REDIS_URL in .env)")
 
     args = parser.parse_args()
     asyncio.run(query_vector_db(args.query, args.top_k, args.redis_url, args.index))

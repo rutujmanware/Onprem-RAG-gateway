@@ -21,7 +21,7 @@ class RouteDecision(BaseModel):
     fallback_applied: bool = False
 
 class RequestDispatcher:
-    def __init__(self, alpha=0.65, slm_model_name="Qwen2.5-1.5B-Instruct-Q4_K_M", vllm_model_name="meta-llama/Llama-2-7b-chat-hf", fallback_enabled=True):
+    def __init__(self, alpha=0.65, slm_model_name="Qwen2.5-1.5B-Instruct-Q4_K_M", vllm_model_name="Qwen/Qwen2.5-7B-Instruct-AWQ", fallback_enabled=True):
         self.alpha = alpha
         self.slm_model_name = slm_model_name
         self.vllm_model_name = vllm_model_name
@@ -30,8 +30,8 @@ class RequestDispatcher:
     def decide(self, score: float, gpu_saturated: bool = False, force_tier=None) -> RouteDecision:
         if force_tier:
             return RouteDecision(target_tier=force_tier, score=score, alpha=self.alpha, target_model=self.slm_model_name if force_tier == ModelTier.CPU_SLM else self.vllm_model_name, reason=f"Manual: {force_tier}")
-        if score <= self.alpha:
-            return RouteDecision(target_tier=ModelTier.CPU_SLM, score=score, alpha=self.alpha, target_model=self.slm_model_name, reason="Score <= Alpha")
+        if score < self.alpha:
+            return RouteDecision(target_tier=ModelTier.CPU_SLM, score=score, alpha=self.alpha, target_model=self.slm_model_name, reason="Score < Alpha")
         else:
             if gpu_saturated and self.fallback_enabled:
                 return RouteDecision(target_tier=ModelTier.CPU_SLM, score=score, alpha=self.alpha, target_model=self.slm_model_name, reason="GPU saturated", fallback_applied=True)
