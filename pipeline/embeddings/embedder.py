@@ -28,9 +28,13 @@ class LocalEmbedder:
         self._torch = None
         self._F = None
 
-        hf_name = model_name_or_path
-        if not ("/" in hf_name or os.path.exists(hf_name)):
-            hf_name = f"sentence-transformers/{hf_name}"
+        local_dir = os.path.abspath("models/embeddings/all-MiniLM-L6-v2")
+        if os.path.exists(local_dir):
+            hf_name = local_dir
+        else:
+            hf_name = model_name_or_path
+            if not ("/" in hf_name or os.path.exists(hf_name)):
+                hf_name = f"sentence-transformers/{hf_name}"
         self.hf_name = hf_name
 
         # Priority 1: Direct HuggingFace transformers (AutoTokenizer + AutoModel)

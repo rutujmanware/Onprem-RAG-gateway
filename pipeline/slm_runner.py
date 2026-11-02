@@ -85,9 +85,10 @@ class CPUSLMEngine:
         input_ids = inputs["input_ids"]
 
         gen_kwargs: Dict[str, Any] = {
+            "input_ids": inputs["input_ids"],
+            "attention_mask": inputs.get("attention_mask"),
             "max_new_tokens": max_new_tokens,
             "pad_token_id": self.tokenizer.pad_token_id or self.tokenizer.eos_token_id,
-            "attention_mask": inputs.get("attention_mask"),
         }
 
         if do_sample and temperature > 0:
@@ -99,7 +100,7 @@ class CPUSLMEngine:
 
         t0 = time.time()
         with torch.no_grad():
-            outputs = self.model.generate(**inputs, **gen_kwargs)
+            outputs = self.model.generate(**gen_kwargs)
 
         latency = time.time() - t0
         new_token_ids = outputs[0][input_ids.shape[1] :]

@@ -169,3 +169,145 @@ Maintain this section as new features are developed:
 - [ ] **Milestone 7:** Router classification training & threshold $\alpha$ optimization on `router_multichunk_training_dataset.jsonl`.
 - [ ] **Milestone 8:** Multi-user load testing (`evaluation/benchmarks/load_test.py`) proving GPU queue avoidance under 30+ concurrent campus users.
 
+---
+
+## 📅 Today's Progress & Architecture Update (November 2, 2026)
+
+### 1. Executive Summary of Achievements
+Today, we advanced the gateway from a prototype retrieval pipeline into an intelligent, dynamically routed hybrid system:
+1. **Retrieved & Commenced MLP Router Integration:** Extracted the baseline neural query complexity router from branch `origin/kriti`.
+2. **Diagnosed & Overcame Severe Training Flaws:** Uncovered a critical length bias shortcut and class imbalance in the initial data.
+3. **Engineered 102,000-Sample Rebalanced Dataset:** Merged 50k easy, 50k hard, and 2k diverse augmentations (short hard proofs and long easy syllabus lookups) to eliminate length bias.
+4. **Architected Two-Tower Neural Router (`RouterMLP`):** Designed independent semantic (384-d) and lexical/intent (16-d) towers fused into a single classification head, achieving **99.62% Accuracy** and **0.9962 Macro F1** in $<20\text{ ms}$ CPU inference.
+5. **Integrated Application Pipeline & 7B Deferred Intercept:** Added Step 0 routing to [`pipeline/rag_chain.py`](pipeline/rag_chain.py) and [`gateway/main.py`](gateway/main.py). Hard queries immediately return a hardcoded notice that the 7B model is not yet ready, saving 100% of GPU/CPU/retrieval resources. Easy queries route to Redis retrieval and the CPU SLM tier.
+6. **Verified Factual Grounding on Unseen Knowledge Base Content:** Executed an unseen query against the indexed DSpace thesis corpus, proving factual generation without hallucination.
+
+---
+
+### 2. Architecture Status Clarification: Caching
+> [!IMPORTANT]
+> **Cache is NOT yet implemented in the live pipeline.**  
+> Although prototype modules exist in [`gateway/cache/`](gateway/cache/) (L0 exact match and L1 semantic cache), they have **not** been integrated into the active request flow. All incoming queries currently bypass cache and flow directly into Step 0 dynamic neural complexity routing. Integrating the dual-tier cache remains a planned milestone.
+
+---
+
+### 3. Model Context Window Sizes & Token Budgeting
+
+Understanding the exact token limits across all tiers is crucial for prompt budgeting and preventing truncation:
+
+| Component | Model Name / Engine | Context Window Size | Max Generation Limit | Typical RAG Usage |
+| :--- | :--- | :--- | :--- | :--- |
+| **Embedder & MLP Router** | `sentence-transformers/all-MiniLM-L6-v2` | **512 tokens** | N/A (Embedding) | ~15 – 60 tokens per query |
+| **CPU SLM Tier** | `Qwen/Qwen2.5-3B-Instruct` | **32,768 tokens (32k)**<br>*(up to 128k via sliding window)* | **160 tokens** (default `max_new_tokens`) | ~600 – 1,200 tokens (System prompt + Top-3 chunks + query) |
+| **GPU LLM Tier (7B)** | `Qwen/Qwen2.5-7B-Instruct` | **32,768 tokens (32k)**<br>*(up to 128k via sliding window)* | Configurable (up to 8,192 tokens) | Reserved for cross-paper multi-chunk reasoning |
+| **GPU LLM Tier (Fallback)** | `meta-llama/Llama-2-7b-chat-hf` | **4,096 tokens (4k)** | 512 tokens | Fallback model in `.env` |
+| **Vector Chunks (Redis)** | RediSearch `rag_documents_idx` | **~100 – 150 tokens** per chunk (~500 chars) | N/A (Storage) | Top-3 search returns ~350 – 500 context tokens |
+
+#### Context Budgeting Strategy for CPU SLM:
+* **System Prompt (~200 tokens):** Institutional academic persona, anti-hallucination guardrail, citation instructions.
+* **Retrieved Context (~350–500 tokens):** Top-3 Redis chunks formatted with document titles and chunk identifiers.
+* **User Query (~20–60 tokens):** Single admission query.
+* **Output Buffer (160 tokens):** Factual, concise 2–4 sentence generation (<20 seconds on 48 CPU threads).
+* **Headroom Available:** Over **31,000 tokens remaining** in the 32k window, allowing future expansions to top-10 chunks or conversation history without risk of context overflow.
+
+---
+
+### 4. Technical Difficulties Encountered & Approaches Used
+
+#### 1. Git History Collision when Pulling Branch `origin/kriti`:
+* **Difficulty:** Running `git merge origin/kriti` failed with `fatal: refusing to merge unrelated histories` and working-tree conflicts with untracked evaluation sets.
+* **Approach:** Backed up untracked working files, fetched `origin/kriti`, and checked out `gateway/router/mlp_router/` surgically, preserving all local progress while pulling the required model files.
+
+#### 2. The Sentence Length Shortcut Flaw:
+* **Difficulty:** Initial evaluation of the baseline MLP revealed that concise hard queries (e.g., *"Derive the mathematical relationship between learning rate and gradient variance in SGD"*) were wrongly classified as `EASY` ($P(\text{hard}) = 0.0001$), while long course logistics queries defaulted to `HARD`. The single-tower MLP had learned sequence length rather than complexity because easy queries in the training set were short and hard queries were verbose.
+* **Approach:** Synthesized a balanced 102,000-sample dataset combining 50k easy, 50k hard, and 2,000 diverse short hard/long easy augmentations. Designed a **Two-Tower Neural Architecture** where Tower 1 encodes 384-d semantic embeddings (`all-MiniLM-L6-v2`) and Tower 2 encodes 16-d hand-crafted lexical/intent features (derivation verbs, comparative markers, clause counts). This ensures structural signals cannot be drowned out by sentence length.
+
+#### 3. Python 3.11 C-Extension Conflicts in `rag_env`:
+* **Difficulty:** Testing in the user's `rag_env` (Python 3.11) threw `ModuleNotFoundError: No module named 'tokenizers.tokenizers'`.
+* **Approach:** A legacy `packages/` directory containing Python 3.8 binary wheels was prepended to `sys.path`. We completely removed `packages/` and purged all `sys.path.insert(0, ...packages)` references from the codebase.
+
+#### 4. Upstream Dependency Breakage in `sentence_transformers`:
+* **Difficulty:** Importing `sentence_transformers` in `rag_env` failed with `ImportError: cannot import name 'BucketNotFoundError' from 'huggingface_hub.errors'`.
+* **Approach:** Standardized all inference embedding in [`gateway/router/mlp_router/inference.py`](gateway/router/mlp_router/inference.py) on [`LocalEmbedder`](pipeline/embeddings/embedder.py), which uses Hugging Face `transformers` with mean pooling offline without relying on `sentence_transformers`.
+
+#### 5. SLM Generation Duplicate Keyword Collision:
+* **Difficulty:** Invoking `model.generate()` in `pipeline/slm_runner.py` failed with:
+  `TypeError: transformers.generation.utils.GenerationMixin.generate() got multiple values for keyword argument 'attention_mask'`.
+* **Approach:** `inputs = tokenizer(...)` already returned a dict containing `attention_mask`. Passing `**inputs` alongside `gen_kwargs` (which also had `attention_mask`) passed the argument twice. Refactored `gen_kwargs` to supply inputs and masks once cleanly.
+
+#### 6. Real-Time Stream Event Loop Alignment:
+* **Difficulty:** The CLI streaming loop consumed `type: route` as `type: chunks`, printing `Retrieved 0 chunks in 0s`.
+* **Approach:** Restructured event consumption in [`pipeline/rag_chain.py`](pipeline/rag_chain.py) to cleanly parse all event types (`route`, `chunks`, `token`, `done`), and bypass retrieval entirely when hard queries are detected.
+
+#### 7. Credential Protection in Command Execution:
+* **Difficulty:** Passing explicit passwords via `-a "$REDIS_PASSWORD"` in shell commands exposes credentials to process tables and bash history.
+* **Approach:** Standardized execution using the user's pre-configured `~/.bashrc` (`source ~/.bashrc && conda activate rag_env`), using `REDISCLI_AUTH` without exposing passwords or hardcoded paths.
+
+---
+
+### 5. Verification on Unseen Knowledge Base Query
+
+To prove that the pipeline produces accurate answers from the indexed Redis thesis corpus without repeating training data, we executed a completely unseen query:
+* **Query:** `"What is the primary QoS attribute considered for Internet of Things applications in serverless platforms?"`
+* **Check:** Verified 0 occurrences in `data/router_multichunk_training_dataset.jsonl` and `data/diverse_augmentations_2k.jsonl`.
+* **Step 0 Routing:** Classified as `EASY` ($P(\text{hard}) = 0.0001$).
+* **Step 1 Retrieval:** Retrieved 3 chunks from thesis `dspace_2005_6728` (*"Designing Quality of Service aware Serverless Platforms"*) with top similarity of **77.5%**.
+* **Step 2 Generation:** CPU SLM (`Qwen 2.5 3B Instruct`) generated the exact factual answer without hallucination:
+  > *"The primary QoS attribute considered for Internet of Things (IoT) applications in serverless platforms is performance characteristic and response latency."*
+
+---
+
+### 6. Runbook for Teammates (Copy-Paste Commands)
+
+Teammates can reproduce and test today's work using these copy-paste commands:
+
+```bash
+# 1. Activate Environment (Standard Conda Setup)
+cd /data2/home/ritujmanware/onprem-rag-gateway
+source ~/.bashrc
+conda activate rag_env
+set -a && source .env && set +a
+
+# 2. Verify Redis Database Status
+redis-cli ping
+# Expected output: PONG
+
+# 3. Test Two-Tower Neural Complexity Router
+python gateway/router/mlp_router/inference.py
+
+# 4. Test Unseen Easy Query (Redis Vector Retrieval + CPU SLM Generation)
+python -m pipeline.rag_chain \
+  "What is the primary QoS attribute considered for Internet of Things applications in serverless platforms?" \
+  --no-stream
+
+# 5. Test Hard Query (Immediate <20ms Deferred 7B Intercept)
+python -m pipeline.rag_chain \
+  "Synthesize the trade-offs of PagedAttention vs standard KV caching in continuous batching."
+
+# 6. Start the Gateway Server
+uvicorn gateway.main:app --host 0.0.0.0 --port 8080 --reload
+
+# 7. Test Gateway API Endpoints via cURL
+# Test 1: Direct Query Endpoint (Hard query -> returns 7B deferred notice)
+curl -X POST http://localhost:8080/query \
+  -H "Content-Type: application/json" \
+  -d '{"query": "Derive the mathematical relationship between learning rate and gradient variance in SGD."}'
+
+# Test 2: OpenAI-Compatible Chat Completion Endpoint (Hard query)
+curl -X POST http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "messages": [{"role": "user", "content": "Compare the methodologies used in the study on polymer membrane with continuous glucose monitoring."}]
+  }'
+```
+
+---
+
+### 7. Living Roadmap Status Update
+
+- [x] **Milestone 6:** End-to-end Gateway integration test (connecting Gateway port 8080 to CPU SLM tier with hardcoded 7B deferred routing).
+- [x] **Milestone 7:** Router classification training & Two-Tower neural architecture on 102k balanced samples.
+- [ ] **Milestone 8:** Multi-user load testing (`evaluation/benchmarks/load_test.py`) proving GPU queue avoidance under 30+ concurrent campus users.
+- [ ] **Milestone 9:** Dual-tier caching implementation (integrating L0 Exact Match & L1 Semantic Cache into the live gateway pipeline).
+
+

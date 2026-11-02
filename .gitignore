@@ -37,5 +37,9 @@ data/raw_pdfs/
 *.gguf
 models/slm_gguf/*.gguf
 models/slm_gguf/qwen*
+models/embeddings/
+packages/
+*.pt
+*.bak
 .DS_Store
 Thumbs.db

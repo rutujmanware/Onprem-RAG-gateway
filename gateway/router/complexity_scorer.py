@@ -2,6 +2,7 @@ import logging
 import math
 import os
 from typing import List, Optional
+
 try:
     import numpy as np
 except ImportError:
@@ -10,21 +11,51 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 class ComplexityScorer:
+    """
+    Gateway Complexity Scorer:
+    Evaluates incoming user query text (single-query input) and produces
+    a normalized routing score between 0.01 and 0.99.
+    
+    Priority 1: Learned Two-Tower Hybrid Neural RouterMLP (< 10ms on GPU/CPU)
+    Priority 2: Fast rule-based lexical & embedding heuristic fallback (< 0.1ms)
+    """
     def __init__(self, model_path=None):
-        self.model_path = model_path or os.getenv("COMPLEXITY_SCORER_PATH", "gateway/router/models/scorer.onnx")
+        self.router = None
+        try:
+            from gateway.router.mlp_router.inference import QueryRouter
+            self.router = QueryRouter(model_path=model_path)
+            logger.info("ComplexityScorer: Loaded neural Two-Tower QueryRouter.")
+        except Exception as e:
+            logger.warning(f"ComplexityScorer: Neural router not loaded ({e}), falling back to heuristic scorer.")
 
     async def score(self, query: str, embedding=None) -> float:
+        # Priority 1: Neural MLP Router
+        if self.router is not None:
+            try:
+                res = self.router.predict(query)
+                return max(0.01, min(0.99, float(res["probability_hard"])))
+            except Exception as e:
+                logger.error(f"Error during neural router scoring: {e}. Using fallback.")
+
+        # Priority 2: Heuristic Scorer Fallback
         lower = query.lower()
         score = 0.25
         words = query.strip().split()
-        if len(words) > 30: score += 0.25
-        elif len(words) > 15: score += 0.15
+        if len(words) > 30:
+            score += 0.25
+        elif len(words) > 15:
+            score += 0.15
+
         hard_kw = ["compare", "contrast", "derive", "proof", "architecture", "tradeoff", "algorithm", "implement", "distributed", "optimize"]
         score += min(sum(0.12 for kw in hard_kw if kw in lower), 0.40)
+
         simple_kw = ["what is", "where is", "when was", "who is", "define", "contact"]
-        if any(lower.startswith(skw) for skw in simple_kw): score -= 0.15
+        if any(lower.startswith(skw) for skw in simple_kw):
+            score -= 0.15
+
         if embedding:
             mean = sum(embedding) / max(1, len(embedding))
             std = math.sqrt(sum((x - mean) ** 2 for x in embedding) / max(1, len(embedding)))
             score += min(std * 1.5, 0.15)
+
         return max(0.01, min(0.99, score))

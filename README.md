@@ -1,6 +1,6 @@
 # On-Premise Institutional RAG Gateway
 
-Institutional, zero-egress RAG routing and admission gateway with dual-tier cache, CPU/GPU dynamic routing, and a Redis Stack vector database.
+Institutional, zero-egress RAG routing and admission gateway with neural complexity routing, CPU/GPU dynamic dispatch, admission control, and a Redis Stack vector database.
 
 > 📖 **Master Engineering & Progress Log:** See [PROJECT_PROGRESS_AND_ARCHITECTURE.md](PROJECT_PROGRESS_AND_ARCHITECTURE.md) for full project history, architecture modules, technical challenges & solutions, CPU SLM optimizations, and living roadmap.
 
