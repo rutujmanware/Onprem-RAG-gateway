@@ -142,3 +142,31 @@ onprem-rag-gateway/
 
 For advanced performance tuning and CPU SLM benchmarks, see [docs/OPTIMIZATION_GUIDE.md](docs/OPTIMIZATION_GUIDE.md).
 For microservice port topologies and routing matrices, see [PROJECT_PROGRESS_AND_ARCHITECTURE.md](PROJECT_PROGRESS_AND_ARCHITECTURE.md).
+
+---
+
+## 💬 6. Querying the Gateway
+
+Once the stack is running, you can query the system using any of the following methods:
+
+### Method A: One-Liner CLI Query (Formatted Output)
+```bash
+make ask Q="What is vermiculite and what are its primary uses?"
+```
+*(Or via python directly)*:
+```bash
+python scripts/query.py "Compare stability of fluid flows with magnetic field interactions."
+```
+
+### Method B: Interactive Terminal Chat Loop
+Launch an interactive Q&A session:
+```bash
+python scripts/query.py
+```
+
+### Method C: Standard HTTP `curl`
+```bash
+curl -s -X POST http://127.0.0.1:8080/query \
+  -H "Content-Type: application/json" \
+  -d '{"query": "What is vermiculite and what are its primary uses?"}' | jq -r .answer
+```

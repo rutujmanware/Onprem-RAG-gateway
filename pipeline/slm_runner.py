@@ -22,12 +22,16 @@ if str(ROOT_DIR) not in sys.path:
 
 import torch
 
-DEFAULT_MODEL_NAME = os.getenv("SLM_MODEL_NAME", "Qwen/Qwen2.5-3B-Instruct")
-DEFAULT_NUM_THREADS = int(os.getenv("CPU_NUM_THREADS", "48"))
+LOCAL_0_5B_MODEL = os.path.join(ROOT_DIR, "models", "slm_cpu", "qwen2.5-0.5b")
+DEFAULT_MODEL_NAME = os.getenv(
+    "SLM_MODEL_NAME",
+    LOCAL_0_5B_MODEL if os.path.exists(LOCAL_0_5B_MODEL) else "Qwen/Qwen2.5-0.5B"
+)
+DEFAULT_NUM_THREADS = int(os.getenv("CPU_NUM_THREADS", "8"))
 
 
 class CPUSLMEngine:
-    """Singleton-style or on-demand CPU inference engine for Qwen 2.5 3B."""
+    """Singleton-style or on-demand CPU inference engine for fast lightweight SLM grounding."""
 
     _instance: Optional["CPUSLMEngine"] = None
 
@@ -42,9 +46,11 @@ class CPUSLMEngine:
         self.dtype = dtype
         self.device = torch.device("cpu")
 
-        # Apply thread settings
+        # Apply thread settings to prevent core thrashing across NUMA nodes
         torch.set_num_threads(self.num_threads)
         os.environ["OMP_NUM_THREADS"] = str(self.num_threads)
+        os.environ["OMP_WAIT_POLICY"] = "PASSIVE"
+        os.environ["MKL_NUM_THREADS"] = str(self.num_threads)
 
         print(f"⚙️ Initializing CPUSLMEngine [{self.model_name}] on CPU with {self.num_threads} threads...")
         from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -218,7 +224,7 @@ class CPUSLMEngine:
         self,
         question: str,
         context_chunks: List[Dict[str, Any]],
-        max_new_tokens: int = 160,
+        max_new_tokens: int = 70,
         temperature: float = 0.2,
     ) -> Dict[str, Any]:
         """Convenience method to generate a grounded RAG answer from context chunks."""
@@ -234,7 +240,7 @@ class CPUSLMEngine:
         self,
         question: str,
         context_chunks: List[Dict[str, Any]],
-        max_new_tokens: int = 160,
+        max_new_tokens: int = 70,
         temperature: float = 0.2,
     ):
         """Streaming generator for grounded RAG answer from context chunks."""

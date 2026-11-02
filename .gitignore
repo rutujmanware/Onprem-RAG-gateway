@@ -40,6 +40,8 @@ data/raw_pdfs/
 *.gguf
 models/slm_gguf/*.gguf
 models/slm_gguf/qwen*
+models/slm_cpu/*
+!models/slm_cpu/.gitkeep
 models/llm_7b/*
 models/embeddings/
 packages/

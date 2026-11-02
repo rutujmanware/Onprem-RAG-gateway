@@ -27,22 +27,26 @@ import json
 from pydantic import BaseModel, Field
 import uvicorn
 
+from contextlib import asynccontextmanager
 from pipeline.slm_runner import CPUSLMEngine, DEFAULT_MODEL_NAME, DEFAULT_NUM_THREADS
-
-app = FastAPI(
-    title="CPU Small Language Model (SLM) Server",
-    description="OpenAI-compatible CPU inference server for Qwen 2.5 3B Instruct",
-    version="1.0.0",
-)
 
 # Global engine handle (lazy or startup initialized)
 engine: Optional[CPUSLMEngine] = None
 
 
-@app.on_event("startup")
-def startup_event():
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     global engine
     engine = CPUSLMEngine.get_instance()
+    yield
+
+
+app = FastAPI(
+    title="CPU Small Language Model (SLM) Server",
+    description="OpenAI-compatible CPU inference server for Qwen 2.5 3B Instruct",
+    version="1.0.0",
+    lifespan=lifespan,
+)
 
 
 class ChatMessage(BaseModel):

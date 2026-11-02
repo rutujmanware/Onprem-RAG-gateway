@@ -196,10 +196,11 @@ class RAGQAPipeline:
 
         easy_prob = prob
 
-        # Step 1: Retrieve context chunks
+        # Step 1: Retrieve context chunks (optimized top_k=2 for fast CPU prefill)
+        easy_k = min(k, 2)
         t0_retrieval = time.time()
         try:
-            chunks = self.retriever.search(query, top_k=k, filter_dict=filter_dict)
+            chunks = self.retriever.search(query, top_k=easy_k, filter_dict=filter_dict)
         except Exception as e:
             hint = " Please ensure Redis is running." if ("connection" in str(e).lower() or "loading" in str(e).lower()) else ""
             return {
@@ -228,10 +229,11 @@ class RAGQAPipeline:
 
         # Step 2: Generate grounded answer via CPU SLM
         t0_gen = time.time()
+        tokens_to_gen = max_new_tokens if max_new_tokens < 160 else 70
         gen_result = self.slm_engine.answer_rag(
             question=query,
             context_chunks=chunks,
-            max_new_tokens=max_new_tokens,
+            max_new_tokens=tokens_to_gen,
             temperature=temperature,
         )
         gen_duration = time.time() - t0_gen

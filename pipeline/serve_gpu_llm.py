@@ -21,6 +21,7 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
+from contextlib import asynccontextmanager
 import torch
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
@@ -32,21 +33,24 @@ from pipeline.gpu_llm_runner import GPULLMEngine, DEFAULT_GPU_MODEL, DEFAULT_GPU
 
 MODEL_NAME = "Qwen/Qwen2.5-7B-Instruct"
 
-app = FastAPI(
-    title="GPU Large Language Model (LLM) Server",
-    description="OpenAI-compatible GPU inference server for Qwen 2.5 7B Instruct on NVIDIA A100",
-    version="1.0.0",
-)
-
 # Global engine handle (lazy or startup initialized)
 engine: Optional[GPULLMEngine] = None
 
 
-@app.on_event("startup")
-def startup_event():
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     global engine
     device = os.getenv("GPU_DEVICE", DEFAULT_GPU_DEVICE)
     engine = GPULLMEngine.get_instance(device=device)
+    yield
+
+
+app = FastAPI(
+    title="GPU Large Language Model (LLM) Server",
+    description="OpenAI-compatible GPU inference server for Qwen 2.5 7B Instruct on NVIDIA A100",
+    version="1.0.0",
+    lifespan=lifespan,
+)
 
 
 class ChatMessage(BaseModel):

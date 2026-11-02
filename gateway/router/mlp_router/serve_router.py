@@ -27,25 +27,30 @@ import uvicorn
 from gateway.router.mlp_router.inference import QueryRouter
 
 DEFAULT_PORT = int(os.getenv("ROUTER_PORT", "8090"))
+from contextlib import asynccontextmanager
+
 DEFAULT_HOST = os.getenv("ROUTER_HOST", "127.0.0.1")
 DEFAULT_THRESHOLD = float(os.getenv("ROUTING_ALPHA", "0.65"))
 DEFAULT_DEVICE = os.getenv("ROUTER_DEVICE", "cpu")
+
+router_instance: Optional[QueryRouter] = None
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global router_instance
+    print(f"🚀 Initializing QueryRouter on device: {DEFAULT_DEVICE} (Threshold: {DEFAULT_THRESHOLD})...")
+    router_instance = QueryRouter(threshold=DEFAULT_THRESHOLD, device=DEFAULT_DEVICE)
+    print("✅ QueryRouter microservice ready!")
+    yield
+
 
 app = FastAPI(
     title="Neural Complexity Router Microservice",
     description="Standalone two-tower neural routing microservice for query complexity classification",
     version="1.0.0",
+    lifespan=lifespan,
 )
-
-router_instance: Optional[QueryRouter] = None
-
-
-@app.on_event("startup")
-def startup_event():
-    global router_instance
-    print(f"🚀 Initializing QueryRouter on device: {DEFAULT_DEVICE} (Threshold: {DEFAULT_THRESHOLD})...")
-    router_instance = QueryRouter(threshold=DEFAULT_THRESHOLD, device=DEFAULT_DEVICE)
-    print("✅ QueryRouter microservice ready!")
 
 
 class RouteRequest(BaseModel):

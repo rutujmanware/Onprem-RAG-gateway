@@ -1,4 +1,4 @@
-.PHONY: help setup dev redis-up redis-down redis-status up down logs ingest-pdfs query rag-answer serve-slm serve-gpu serve-router generate-dataset eval test clean
+.PHONY: help setup dev redis-up redis-down redis-status up down logs ingest-pdfs query ask rag-answer serve-slm serve-gpu serve-router generate-dataset eval test clean
 
 PYTHON ?= python3
 VENV ?= .venv
@@ -15,6 +15,7 @@ help:
 	@echo "  make logs           - Tail docker service logs"
 	@echo "  make ingest-pdfs    - Extract, clean, chunk, embed, and index all PDFs in data/raw_pdfs/"
 	@echo "  make query Q=\"...\"  - Perform semantic search query against the Redis vector index"
+	@echo "  make ask Q=\"...\"    - Query the running Gateway with clean formatted answer output"
 	@echo "  make rag-answer Q=\"...\" - Answer query using retrieved context + dual-tier routing"
 	@echo "  make serve-slm      - Start Qwen 2.5 3B CPU SLM server on port 8082"
 	@echo "  make serve-gpu      - Start Qwen 2.5 7B GPU LLM server on port 8000"
@@ -61,6 +62,9 @@ ingest-pdfs:
 
 query:
 	$(PYTHON) -m pipeline.retriever "$(Q)"
+
+ask:
+	$(PYTHON) scripts/query.py "$(Q)"
 
 rag-answer:
 	$(PYTHON) -m pipeline.rag_chain "$(Q)"

@@ -4,6 +4,7 @@ import time
 import uuid
 from typing import Any, Dict, List, Optional
 from fastapi import Depends, FastAPI, HTTPException
+from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 
 # Ensure project root is in sys.path
@@ -241,12 +242,13 @@ async def query_endpoint(
         res["routing_time_seconds"] = round(time.time() - t0, 4)
         return res
 
-    # Route: Easy -> CPU SLM
+    # Route: Easy -> CPU SLM (executed in threadpool so FastAPI event loop never blocks)
     rag = RAGQAPipeline(top_k=req.top_k)
-    res = rag.answer_query(
+    res = await run_in_threadpool(
+        rag.answer_query,
         query,
         top_k=req.top_k,
-        max_new_tokens=req.max_tokens or 160,
+        max_new_tokens=req.max_tokens or 70,
         temperature=req.temperature or 0.2,
     )
     res["route"] = "easy"
