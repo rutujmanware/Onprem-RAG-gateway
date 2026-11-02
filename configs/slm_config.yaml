@@ -1,21 +1,14 @@
 model:
-  path: "models/slm_gguf/model.gguf"
-  architecture: "qwen2"
-  quantization_type: "Q4_K_M"
-  context_window_tokens: 4096
+  name: "Qwen/Qwen2.5-3B-Instruct"
+  architecture: "qwen2.5"
+  dtype: "bfloat16"
+  context_window_tokens: 32768
 
 cpu_affinity:
-  num_threads: 4
-  num_threads_batch: 4
-  pin_cores: [0, 1, 2, 3]
+  num_threads: 24
   numa_node: 0
-  use_mmap: true
-  use_mlock: true
 
 runtime:
-  engine: "llama.cpp"
+  engine: "cpu_pytorch"
   host: "0.0.0.0"
   port: 8082
-  batch_size: 512
-  ubatch_size: 128
-  flash_attention: true

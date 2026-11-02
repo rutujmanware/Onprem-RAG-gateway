@@ -21,7 +21,7 @@ class RouteDecision(BaseModel):
     fallback_applied: bool = False
 
 class RequestDispatcher:
-    def __init__(self, alpha=0.65, slm_model_name="Qwen2.5-1.5B-Instruct-Q4_K_M", vllm_model_name="meta-llama/Llama-2-7b-chat-hf", fallback_enabled=True):
+    def __init__(self, alpha=0.65, slm_model_name="Qwen/Qwen2.5-3B-Instruct", vllm_model_name="meta-llama/Llama-2-7b-chat-hf", fallback_enabled=True):
         self.alpha = alpha
         self.slm_model_name = slm_model_name
         self.vllm_model_name = vllm_model_name

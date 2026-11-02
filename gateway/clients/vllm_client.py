@@ -6,3 +6,4 @@ class VLLMClient:
     async def generate_chat(self, messages, **kwargs):
         return {"choices": [{"message": {"role": "assistant", "content": "GPU vLLM generated answer."}}]}
     async def close(self): pass
+

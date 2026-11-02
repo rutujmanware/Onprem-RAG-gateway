@@ -2,6 +2,8 @@
 
 Institutional, zero-egress RAG routing and admission gateway with dual-tier cache, CPU/GPU dynamic routing, and a Redis Stack vector database.
 
+> 📖 **Master Engineering & Progress Log:** See [PROJECT_PROGRESS_AND_ARCHITECTURE.md](PROJECT_PROGRESS_AND_ARCHITECTURE.md) for full project history, architecture modules, technical challenges & solutions, CPU SLM optimizations, and living roadmap.
+
 ## 📌 Current Project Status (Building Phase)
 We are currently in the **Data Ingestion and Vectorization Phase**. 
 - Over **12,900+ research papers** have been successfully scraped from DSpace.
@@ -56,7 +58,7 @@ Because the database is massive (~43 GB in RAM), we keep it shut down when not i
 
 2. **Start the Redis Server in the background:**
    ```bash
-   redis-server \
+   ./redis-stack-server-7.2.0-v9/bin/redis-stack-server \
        --dir ./redis-stack-server-7.2.0-v9/var/db/redis-stack \
        --requirepass "<YOUR_REDIS_PASSWORD>" \
        --daemonize yes

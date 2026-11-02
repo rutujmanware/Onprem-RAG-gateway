@@ -34,11 +34,17 @@ class RedisDocumentIndexer:
                 "doc_id", "TEXT",
                 "title", "TEXT",
                 "author", "TEXT",
-                "department", "TEXT",
+                "department", "TAG", "SEPARATOR", ",",
                 "advisor", "TEXT",
                 "date", "TEXT",
-                "degree", "TEXT",
-                "handle_id", "TEXT",
+                "degree", "TAG", "SEPARATOR", ",",
+                "handle_id", "TAG",
+                "topic", "TEXT",
+                "abstract", "TEXT",
+                "branch", "TAG", "SEPARATOR", ",",
+                "keywords", "TEXT",
+                "publisher", "TEXT",
+                "language", "TAG",
                 "content", "TEXT",
                 "chunk_index", "NUMERIC",
                 "metadata", "TEXT",
@@ -67,14 +73,23 @@ class RedisDocumentIndexer:
 
         meta = metadata or {}
         title_val = str(meta.get("title", ""))
-        authors = meta.get("authors", [])
+        authors = meta.get("authors", meta.get("author", []))
         author_val = ", ".join(authors) if isinstance(authors, list) else str(authors)
-        advisors = meta.get("advisors", [])
+        advisors = meta.get("advisors", meta.get("guide", meta.get("advisor", [])))
         advisor_val = ", ".join(advisors) if isinstance(advisors, list) else str(advisors)
         dept_val = str(meta.get("department", ""))
         date_val = str(meta.get("date", ""))
         degree_val = str(meta.get("degree", ""))
         handle_val = str(meta.get("handle_id", doc_id))
+        topic_val = str(meta.get("topic", meta.get("subject", "")))
+        abstract_val = str(meta.get("abstract", ""))
+        branch_val = str(meta.get("branch", ""))
+        
+        # New comprehensive fields
+        keywords_val = meta.get("keywords", meta.get("keyword", []))
+        keywords_val = ", ".join(keywords_val) if isinstance(keywords_val, list) else str(keywords_val)
+        publisher_val = str(meta.get("publisher", ""))
+        lang_val = str(meta.get("language", ""))
 
         r = redis.from_url(self.redis_url, encoding="utf-8", decode_responses=False)
         try:
@@ -91,6 +106,12 @@ class RedisDocumentIndexer:
                     "date": date_val,
                     "degree": degree_val,
                     "handle_id": handle_val,
+                    "topic": topic_val,
+                    "abstract": abstract_val,
+                    "branch": branch_val,
+                    "keywords": keywords_val,
+                    "publisher": publisher_val,
+                    "language": lang_val,
                     "content": chunk.content,
                     "chunk_index": chunk.chunk_index,
                     "metadata": json.dumps(chunk.metadata),
