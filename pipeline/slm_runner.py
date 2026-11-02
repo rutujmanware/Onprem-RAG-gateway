@@ -22,12 +22,28 @@ if str(ROOT_DIR) not in sys.path:
 
 import torch
 
+LOCAL_GGUF_MODEL = os.path.join(ROOT_DIR, "models", "slm_gguf", "qwen2.5-3b-instruct-q4_k_m.gguf")
+SHM_GGUF_MODEL = "/dev/shm/models/qwen2.5-3b-instruct-q4_k_m.gguf"
+LOCAL_3B_HF_MODEL = os.path.expanduser("~/.cache/huggingface/hub/models--Qwen--Qwen2.5-3B-Instruct")
 LOCAL_0_5B_MODEL = os.path.join(ROOT_DIR, "models", "slm_cpu", "qwen2.5-0.5b")
-DEFAULT_MODEL_NAME = os.getenv(
-    "SLM_MODEL_NAME",
-    LOCAL_0_5B_MODEL if os.path.exists(LOCAL_0_5B_MODEL) else "Qwen/Qwen2.5-0.5B"
-)
+
+def resolve_default_model() -> str:
+    env_model = os.getenv("SLM_MODEL_NAME")
+    if env_model:
+        return env_model
+    if os.path.exists(LOCAL_GGUF_MODEL):
+        return LOCAL_GGUF_MODEL
+    if os.path.exists(SHM_GGUF_MODEL):
+        return SHM_GGUF_MODEL
+    if os.path.exists(LOCAL_3B_HF_MODEL):
+        return "Qwen/Qwen2.5-3B-Instruct"
+    if os.path.exists(LOCAL_0_5B_MODEL):
+        return LOCAL_0_5B_MODEL
+    return "Qwen/Qwen2.5-3B-Instruct"
+
+DEFAULT_MODEL_NAME = resolve_default_model()
 DEFAULT_NUM_THREADS = int(os.getenv("CPU_NUM_THREADS", "8"))
+DEFAULT_BATCH_THREADS = int(os.getenv("CPU_BATCH_THREADS", "32"))
 
 
 class CPUSLMEngine:
@@ -39,12 +55,15 @@ class CPUSLMEngine:
         self,
         model_name_or_path: str = DEFAULT_MODEL_NAME,
         num_threads: int = DEFAULT_NUM_THREADS,
+        num_threads_batch: int = DEFAULT_BATCH_THREADS,
         dtype: torch.dtype = torch.float32,
     ):
         self.model_name = model_name_or_path
         self.num_threads = num_threads
+        self.num_threads_batch = num_threads_batch
         self.dtype = dtype
         self.device = torch.device("cpu")
+        self.is_gguf = str(self.model_name).endswith(".gguf") or os.getenv("SLM_ENGINE") == "gguf"
 
         # Apply thread settings to prevent core thrashing across NUMA nodes
         torch.set_num_threads(self.num_threads)
@@ -52,17 +71,35 @@ class CPUSLMEngine:
         os.environ["OMP_WAIT_POLICY"] = "PASSIVE"
         os.environ["MKL_NUM_THREADS"] = str(self.num_threads)
 
-        print(f"⚙️ Initializing CPUSLMEngine [{self.model_name}] on CPU with {self.num_threads} threads...")
-        from transformers import AutoModelForCausalLM, AutoTokenizer
-
         t0 = time.time()
-        self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
-        self.model = AutoModelForCausalLM.from_pretrained(
-            self.model_name,
-            torch_dtype=self.dtype,
-            low_cpu_mem_usage=True,
-        )
-        self.model.eval()
+        if self.is_gguf:
+            print(f"⚙️ Initializing GGUF CPUSLMEngine [{self.model_name}] on CPU with {self.num_threads} decode threads, {self.num_threads_batch} batch threads...")
+            try:
+                from llama_cpp import Llama
+            except ImportError as err:
+                raise ImportError("llama-cpp-python is required to load GGUF models. Install via pip install llama-cpp-python") from err
+
+            self.model = Llama(
+                model_path=self.model_name,
+                n_threads=self.num_threads,
+                n_threads_batch=self.num_threads_batch,
+                n_batch=512,
+                n_ctx=int(os.getenv("SLM_CONTEXT_WINDOW", "2048")),
+                verbose=False,
+            )
+            self.tokenizer = None
+        else:
+            print(f"⚙️ Initializing PyTorch CPUSLMEngine [{self.model_name}] on CPU with {self.num_threads} threads...")
+            from transformers import AutoModelForCausalLM, AutoTokenizer
+
+            self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+            self.model = AutoModelForCausalLM.from_pretrained(
+                self.model_name,
+                torch_dtype=self.dtype,
+                low_cpu_mem_usage=True,
+            )
+            self.model.eval()
+
         self.load_duration = time.time() - t0
         print(f"✅ CPUSLMEngine ready! Loaded in {self.load_duration:.2f}s")
 
@@ -81,6 +118,30 @@ class CPUSLMEngine:
         do_sample: bool = False,
     ) -> Dict[str, Any]:
         """Generate response given a list of chat messages [{'role': ..., 'content': ...}]."""
+        if self.is_gguf:
+            t0 = time.time()
+            response = self.model.create_chat_completion(
+                messages=messages,
+                max_tokens=max_new_tokens,
+                temperature=float(temperature) if do_sample else 0.0,
+                top_p=float(top_p) if do_sample else 1.0,
+                stream=False,
+            )
+            latency = time.time() - t0
+            choice = response["choices"][0]
+            generated_text = choice["message"].get("content", "").strip()
+            usage = response.get("usage", {})
+            num_tokens = usage.get("completion_tokens", len(generated_text.split()))
+            tokens_per_sec = num_tokens / max(latency, 0.001)
+
+            return {
+                "text": generated_text,
+                "num_tokens": num_tokens,
+                "latency_seconds": round(latency, 3),
+                "tokens_per_second": round(tokens_per_sec, 2),
+                "model": os.path.basename(self.model_name),
+            }
+
         prompt_text = self.tokenizer.apply_chat_template(
             messages,
             tokenize=False,
@@ -133,6 +194,20 @@ class CPUSLMEngine:
         do_sample: bool = False,
     ):
         """Generator yielding token text deltas in real-time as they generate on CPU."""
+        if self.is_gguf:
+            stream_resp = self.model.create_chat_completion(
+                messages=messages,
+                max_tokens=max_new_tokens,
+                temperature=float(temperature) if do_sample else 0.0,
+                top_p=float(top_p) if do_sample else 1.0,
+                stream=True,
+            )
+            for chunk in stream_resp:
+                delta = chunk["choices"][0]["delta"].get("content", "")
+                if delta:
+                    yield delta
+            return
+
         from transformers import TextIteratorStreamer
         from threading import Thread
 
@@ -224,7 +299,7 @@ class CPUSLMEngine:
         self,
         question: str,
         context_chunks: List[Dict[str, Any]],
-        max_new_tokens: int = 70,
+        max_new_tokens: int = 160,
         temperature: float = 0.2,
     ) -> Dict[str, Any]:
         """Convenience method to generate a grounded RAG answer from context chunks."""
@@ -240,7 +315,7 @@ class CPUSLMEngine:
         self,
         question: str,
         context_chunks: List[Dict[str, Any]],
-        max_new_tokens: int = 70,
+        max_new_tokens: int = 160,
         temperature: float = 0.2,
     ):
         """Streaming generator for grounded RAG answer from context chunks."""

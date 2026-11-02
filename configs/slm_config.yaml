@@ -1,18 +1,19 @@
 model:
-  name: "models/slm_cpu/qwen2.5-0.5b"
+  name: "models/slm_gguf/qwen2.5-3b-instruct-q4_k_m.gguf"
   fallback_name: "Qwen/Qwen2.5-3B-Instruct"
   architecture: "qwen2.5"
-  dtype: "float32"
-  context_window_tokens: 4096
-  max_new_tokens: 70
+  dtype: "q4_k_m"
+  context_window_tokens: 2048
+  max_new_tokens: 160
   top_k_chunks: 2
 
 cpu_affinity:
   num_threads: 8
+  num_threads_batch: 32
   omp_wait_policy: "PASSIVE"
   numa_node: 0
 
 runtime:
-  engine: "cpu_pytorch"
+  engine: "gguf"
   host: "127.0.0.1"
   port: 8082

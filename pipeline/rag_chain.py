@@ -229,7 +229,7 @@ class RAGQAPipeline:
 
         # Step 2: Generate grounded answer via CPU SLM
         t0_gen = time.time()
-        tokens_to_gen = max_new_tokens if max_new_tokens < 160 else 70
+        tokens_to_gen = max_new_tokens or 160
         gen_result = self.slm_engine.answer_rag(
             question=query,
             context_chunks=chunks,
@@ -409,7 +409,8 @@ class RAGQAPipeline:
         }
 
         t0_retrieval = time.time()
-        chunks = self.retriever.search(query, top_k=k, filter_dict=filter_dict)
+        easy_k = min(k, 2)
+        chunks = self.retriever.search(query, top_k=easy_k, filter_dict=filter_dict)
         retrieval_duration = time.time() - t0_retrieval
 
         yield {

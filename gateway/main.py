@@ -1,9 +1,11 @@
+import json
 import os
 import sys
 import time
 import uuid
 from typing import Any, Dict, List, Optional
 from fastapi import Depends, FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
 from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 
@@ -37,12 +39,14 @@ class ChatCompletionRequest(BaseModel):
     messages: List[ChatMessage]
     temperature: Optional[float] = 0.2
     max_tokens: Optional[int] = 160
+    stream: Optional[bool] = False
 
 class DirectQueryRequest(BaseModel):
     query: str
     top_k: Optional[int] = 3
     temperature: Optional[float] = 0.2
     max_tokens: Optional[int] = 160
+    stream: Optional[bool] = False
 
 @app.get("/healthz")
 async def healthz():
@@ -70,6 +74,56 @@ async def chat_completions(
     # Step 1: Neural Complexity Routing (MLP Router)
     score = await scorer.score(query)
     decision = dispatcher.decide(score)
+
+    if req.stream:
+        rag = RAGQAPipeline()
+        cmpl_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+        created_ts = int(time.time())
+
+        def sse_chat_generator():
+            for event in rag.answer_query_stream(
+                query,
+                max_new_tokens=req.max_tokens or 160,
+                temperature=req.temperature or 0.2,
+            ):
+                if event.get("type") == "token":
+                    delta_text = event.get("delta", "")
+                    chunk = {
+                        "id": cmpl_id,
+                        "object": "chat.completion.chunk",
+                        "created": created_ts,
+                        "model": "qwen2.5-3b-instruct-cpu" if decision.target_tier != ModelTier.GPU_LLM else "qwen2.5-7b-instruct-gpu",
+                        "choices": [{
+                            "index": 0,
+                            "delta": {"content": delta_text},
+                            "finish_reason": None,
+                        }],
+                    }
+                    yield f"data: {json.dumps(chunk)}\n\n"
+                elif event.get("type") == "done":
+                    final_chunk = {
+                        "id": cmpl_id,
+                        "object": "chat.completion.chunk",
+                        "created": created_ts,
+                        "model": "qwen2.5-3b-instruct-cpu" if decision.target_tier != ModelTier.GPU_LLM else "qwen2.5-7b-instruct-gpu",
+                        "choices": [{
+                            "index": 0,
+                            "delta": {},
+                            "finish_reason": "stop",
+                        }],
+                    }
+                    yield f"data: {json.dumps(final_chunk)}\n\n"
+            yield "data: [DONE]\n\n"
+
+        return StreamingResponse(
+            sse_chat_generator(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
 
     # Step 2: Route Enforcement for Hard Queries -> GPU LLM Tier (Qwen 2.5 7B)
     if decision.target_tier == ModelTier.GPU_LLM:
@@ -189,6 +243,30 @@ async def query_endpoint(
 ):
     query = req.query
     t0 = time.time()
+
+    if req.stream:
+        rag = RAGQAPipeline(top_k=req.top_k)
+
+        def event_stream():
+            for event in rag.answer_query_stream(
+                query,
+                top_k=req.top_k,
+                max_new_tokens=req.max_tokens or 160,
+                temperature=req.temperature or 0.2,
+            ):
+                yield f"data: {json.dumps(event)}\n\n"
+            yield "data: [DONE]\n\n"
+
+        return StreamingResponse(
+            event_stream(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
     score = await scorer.score(query)
     decision = dispatcher.decide(score)
 
@@ -248,7 +326,7 @@ async def query_endpoint(
         rag.answer_query,
         query,
         top_k=req.top_k,
-        max_new_tokens=req.max_tokens or 70,
+        max_new_tokens=req.max_tokens or 160,
         temperature=req.temperature or 0.2,
     )
     res["route"] = "easy"
