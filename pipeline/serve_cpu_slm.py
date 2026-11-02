@@ -188,7 +188,7 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser(description="Start CPU SLM API Server")
-    parser.add_argument("--host", default="0.0.0.0", help="Host to bind (default: 0.0.0.0)")
+    parser.add_argument("--host", default=os.getenv("SLM_SERVER_HOST", "127.0.0.1"), help="Host to bind (default: 127.0.0.1 - localhost only for security)")
     parser.add_argument("--port", type=int, default=8082, help="Port to listen (default: 8082)")
     parser.add_argument("--threads", type=int, default=DEFAULT_NUM_THREADS, help="CPU threads")
     args = parser.parse_args()

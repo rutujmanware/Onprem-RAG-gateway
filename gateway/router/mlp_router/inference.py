@@ -30,7 +30,8 @@ class QueryRouter:
     """
     def __init__(self, model_path=None, threshold=0.5, device=None):
         if device is None:
-            self.device = torch.device('cuda:5' if torch.cuda.is_available() and torch.cuda.device_count() > 5 else ('cuda:0' if torch.cuda.is_available() else 'cpu'))
+            env_dev = os.getenv("ROUTER_DEVICE", "cpu")
+            self.device = torch.device(env_dev)
         else:
             self.device = torch.device(device)
             
@@ -61,7 +62,7 @@ class QueryRouter:
             raise FileNotFoundError(f"Model checkpoint not found. Looked in: {candidates}")
 
         self.model = RouterMLP(input_dim=400)
-        state_dict = torch.load(model_path, map_location=self.device)
+        state_dict = torch.load(model_path, map_location=self.device, weights_only=True)
         self.model.load_state_dict(state_dict)
         self.model.to(self.device)
         self.model.eval()

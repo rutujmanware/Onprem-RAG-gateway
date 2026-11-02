@@ -118,3 +118,27 @@ Make sure others on the shared server cannot read your `.env` password or databa
 ```bash
 chmod 700 /home/user
 ```
+
+---
+
+## 📂 5. Project Directory Structure
+
+```
+onprem-rag-gateway/
+├── configs/            # YAML configuration files (gateway, SLM, vLLM)
+├── data/               # Vector features, augmentations, and historical archives
+├── docs/               # Technical specs & CPU SLM optimization guides
+├── evaluation/         # Benchmark suites, golden datasets, and evaluation judges
+├── gateway/            # FastAPI gateway, auth, cache, rate limits, and MLP router
+├── logs/               # Application, cluster, and dataset generation logs
+├── models/             # Local embedding models, 7B GPU weights, and 3B SLM GGUFs
+├── pipeline/           # Hybrid retriever, CPU SLM, GPU LLM, and RAG chain
+├── scripts/            # Synthetic dataset generator and Slurm cluster batch scripts
+├── tests/              # Automated unit, cache, rate limit, and security tests
+├── Makefile            # Central operational commands and service runbooks
+├── PROJECT_PROGRESS_AND_ARCHITECTURE.md  # Master engineering changelog
+└── README.md           # Quickstart and overview documentation
+```
+
+For advanced performance tuning and CPU SLM benchmarks, see [docs/OPTIMIZATION_GUIDE.md](docs/OPTIMIZATION_GUIDE.md).
+For microservice port topologies and routing matrices, see [PROJECT_PROGRESS_AND_ARCHITECTURE.md](PROJECT_PROGRESS_AND_ARCHITECTURE.md).

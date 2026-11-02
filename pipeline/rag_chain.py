@@ -38,11 +38,13 @@ class RAGQAPipeline:
         self,
         retriever: Optional[RedisChunkRetriever] = None,
         slm_engine: Optional[CPUSLMEngine] = None,
+        gpu_engine: Optional[Any] = None,
         router: Optional[Any] = None,
         top_k: int = 3,
     ):
         self._retriever = retriever
         self._slm_engine = slm_engine
+        self._gpu_engine = gpu_engine
         self.top_k = top_k
         self.router = router
         if self.router is None and QueryRouter is not None:
@@ -62,6 +64,13 @@ class RAGQAPipeline:
         if self._slm_engine is None:
             self._slm_engine = CPUSLMEngine.get_instance()
         return self._slm_engine
+
+    @property
+    def gpu_engine(self) -> Any:
+        if self._gpu_engine is None:
+            from pipeline.gpu_llm_runner import GPULLMEngine
+            self._gpu_engine = GPULLMEngine.get_instance()
+        return self._gpu_engine
 
     def route_query(self, query: str) -> Dict[str, Any]:
         """Classify query using the Two-Tower MLP router."""
@@ -86,22 +95,106 @@ class RAGQAPipeline:
 
         # Step 0: Neural Complexity Routing
         route_decision = self.route_query(query)
-        if route_decision.get("route") == "hard":
-            prob = route_decision.get("probability_hard", 1.0)
+        is_hard = route_decision.get("route") == "hard"
+        prob = route_decision.get("probability_hard", 1.0 if is_hard else 0.0)
+
+        if is_hard:
+            hard_k = top_k or max(self.top_k, 5)
+            t0_retrieval = time.time()
+            try:
+                chunks = self.retriever.search(query, top_k=hard_k, filter_dict=filter_dict)
+            except Exception as e:
+                hint = " Please ensure Redis is running." if ("connection" in str(e).lower() or "loading" in str(e).lower()) else ""
+                return {
+                    "query": query,
+                    "answer": f"Retrieval failed: {type(e).__name__} ({str(e)}).{hint}",
+                    "route": "hard",
+                    "target_tier": "gpu_vllm",
+                    "probability_hard": prob,
+                    "chunks": [],
+                    "error": str(e),
+                    "total_time_seconds": round(time.time() - t_start, 2),
+                }
+            retrieval_duration = time.time() - t0_retrieval
+
+            from pipeline.gpu_llm_runner import GPULLMEngine
+            messages = GPULLMEngine.build_rag_messages(query, chunks)
+            tokens_to_gen = max_new_tokens if max_new_tokens > 160 else 512
+
+            # Option A: Fast HTTP path if GPU LLM server daemon is running on port 8000
+            gpu_server_url = os.getenv("VLLM_BASE_URL", "http://localhost:8000/v1").rstrip("/")
+            server_root = gpu_server_url.rsplit("/v1", 1)[0]
+            try:
+                import httpx
+                h_check = httpx.get(f"{server_root}/healthz", timeout=1.0)
+                if h_check.status_code == 200:
+                    t0_gen = time.time()
+                    resp = httpx.post(
+                        f"{gpu_server_url}/chat/completions",
+                        json={
+                            "model": "Qwen/Qwen2.5-7B-Instruct",
+                            "messages": messages,
+                            "max_tokens": tokens_to_gen,
+                            "temperature": temperature,
+                        },
+                        timeout=90.0,
+                    )
+                    resp.raise_for_status()
+                    data = resp.json()
+                    gen_duration = time.time() - t0_gen
+                    total_duration = time.time() - t_start
+                    ans_text = data["choices"][0]["message"]["content"]
+                    tok_count = data.get("usage", {}).get("completion_tokens", len(ans_text.split()))
+                    tok_s = round(tok_count / max(gen_duration, 0.001), 2)
+                    return {
+                        "query": query,
+                        "answer": ans_text,
+                        "route": "hard",
+                        "target_tier": "gpu_vllm",
+                        "probability_hard": prob,
+                        "chunks": chunks,
+                        "stats": {
+                            "retrieval_seconds": round(retrieval_duration, 3),
+                            "generation_seconds": round(gen_duration, 3),
+                            "total_seconds": round(total_duration, 3),
+                            "num_tokens": tok_count,
+                            "tokens_per_second": tok_s,
+                            "model": data.get("model", "Qwen/Qwen2.5-7B-Instruct"),
+                            "server": "gpu-daemon-port-8000",
+                        },
+                    }
+            except Exception:
+                pass
+
+            # Option B: Fallback to in-process GPU engine
+            t0_gen = time.time()
+            gen_result = self.gpu_engine.answer_rag(
+                question=query,
+                context_chunks=chunks,
+                max_new_tokens=tokens_to_gen,
+                temperature=temperature,
+            )
+            gen_duration = time.time() - t0_gen
+            total_duration = time.time() - t_start
+
             return {
                 "query": query,
-                "answer": f"The 7B model is not yet ready. Your query has been classified as 'hard' (Complexity Score: {prob:.4f}) requiring the GPU LLM tier.",
+                "answer": gen_result["text"],
                 "route": "hard",
                 "target_tier": "gpu_vllm",
                 "probability_hard": prob,
-                "chunks": [],
+                "chunks": chunks,
                 "stats": {
-                    "routing_seconds": round(time.time() - t_start, 4),
-                    "total_seconds": round(time.time() - t_start, 4),
+                    "retrieval_seconds": round(retrieval_duration, 3),
+                    "generation_seconds": round(gen_duration, 3),
+                    "total_seconds": round(total_duration, 3),
+                    "num_tokens": gen_result.get("num_tokens", 0),
+                    "tokens_per_second": gen_result.get("tokens_per_second", 0),
+                    "model": gen_result.get("model", "Qwen/Qwen2.5-7B-Instruct"),
                 },
             }
 
-        easy_prob = route_decision.get("probability_hard", 0.0)
+        easy_prob = prob
 
         # Step 1: Retrieve context chunks
         t0_retrieval = time.time()
@@ -176,32 +269,132 @@ class RAGQAPipeline:
 
         # Step 0: Neural Complexity Routing
         route_decision = self.route_query(query)
-        if route_decision.get("route") == "hard":
-            prob = route_decision.get("probability_hard", 1.0)
-            hard_msg = f"The 7B model is not yet ready. Your query has been classified as 'hard' (Complexity Score: {prob:.4f}) requiring the GPU LLM tier."
+        is_hard = route_decision.get("route") == "hard"
+        prob = route_decision.get("probability_hard", 1.0 if is_hard else 0.0)
+
+        if is_hard:
             yield {
                 "type": "route",
                 "route": "hard",
                 "target_tier": "gpu_vllm",
                 "probability_hard": prob,
             }
+            hard_k = top_k or max(self.top_k, 5)
+            t0_retrieval = time.time()
+            chunks = self.retriever.search(query, top_k=hard_k, filter_dict=filter_dict)
+            retrieval_duration = time.time() - t0_retrieval
+
             yield {
                 "type": "chunks",
-                "chunks": [],
-                "retrieval_seconds": 0.0,
+                "chunks": chunks,
+                "retrieval_seconds": round(retrieval_duration, 3),
             }
-            yield {
-                "type": "token",
-                "delta": hard_msg,
-            }
+
+            from pipeline.gpu_llm_runner import GPULLMEngine
+            messages = GPULLMEngine.build_rag_messages(query, chunks)
+            tokens_to_gen = max_new_tokens if max_new_tokens > 160 else 512
+
+            # Option A: Fast HTTP streaming from GPU daemon
+            gpu_server_url = os.getenv("VLLM_BASE_URL", "http://localhost:8000/v1").rstrip("/")
+            server_root = gpu_server_url.rsplit("/v1", 1)[0]
+            stream_via_http = False
+            try:
+                import httpx
+                h_check = httpx.get(f"{server_root}/healthz", timeout=1.0)
+                if h_check.status_code == 200:
+                    stream_via_http = True
+            except Exception:
+                stream_via_http = False
+
+            if stream_via_http:
+                t0_gen = time.time()
+                token_count = 0
+                full_response = []
+                ttft = None
+                with httpx.stream(
+                    "POST",
+                    f"{gpu_server_url}/chat/completions",
+                    json={
+                        "model": "Qwen/Qwen2.5-7B-Instruct",
+                        "messages": messages,
+                        "max_tokens": tokens_to_gen,
+                        "temperature": temperature,
+                        "stream": True,
+                    },
+                    timeout=90.0,
+                ) as response:
+                    for line in response.iter_lines():
+                        if not line or not line.startswith("data: "):
+                            continue
+                        data_str = line[6:].strip()
+                        if data_str == "[DONE]":
+                            break
+                        try:
+                            d = json.loads(data_str)
+                            delta = d["choices"][0]["delta"].get("content", "")
+                            if delta:
+                                if ttft is None:
+                                    ttft = round(time.time() - t0_gen, 3)
+                                token_count += 1
+                                full_response.append(delta)
+                                yield {"type": "token", "delta": delta}
+                        except Exception:
+                            continue
+
+                gen_duration = time.time() - t0_gen
+                total_duration = time.time() - t_start
+                tok_per_sec = round(token_count / max(gen_duration, 0.001), 2)
+                yield {
+                    "type": "done",
+                    "full_answer": "".join(full_response),
+                    "stats": {
+                        "retrieval_seconds": round(retrieval_duration, 3),
+                        "generation_seconds": round(gen_duration, 3),
+                        "total_seconds": round(total_duration, 3),
+                        "ttft_seconds": ttft or 0.0,
+                        "num_tokens": token_count,
+                        "tokens_per_second": tok_per_sec,
+                        "model": "Qwen/Qwen2.5-7B-Instruct",
+                        "server": "gpu-daemon-port-8000",
+                    },
+                }
+                return
+
+            # Option B: Fallback to in-process streaming
+            t0_gen = time.time()
+            token_count = 0
+            full_response = []
+            ttft = None
+
+            for delta in self.gpu_engine.generate_chat_stream(
+                messages,
+                max_new_tokens=tokens_to_gen,
+                temperature=temperature,
+            ):
+                if ttft is None:
+                    ttft = round(time.time() - t0_gen, 3)
+                token_count += 1
+                full_response.append(delta)
+                yield {
+                    "type": "token",
+                    "delta": delta,
+                }
+
+            gen_duration = time.time() - t0_gen
+            total_duration = time.time() - t_start
+            tok_per_sec = round(token_count / max(gen_duration, 0.001), 2)
+
             yield {
                 "type": "done",
-                "full_answer": hard_msg,
+                "full_answer": "".join(full_response),
                 "stats": {
-                    "total_seconds": round(time.time() - t_start, 3),
-                    "route": "hard",
-                    "target_tier": "gpu_vllm",
-                    "complexity_score": prob,
+                    "retrieval_seconds": round(retrieval_duration, 3),
+                    "generation_seconds": round(gen_duration, 3),
+                    "total_seconds": round(total_duration, 3),
+                    "ttft_seconds": ttft or 0.0,
+                    "num_tokens": token_count,
+                    "tokens_per_second": tok_per_sec,
+                    "model": "Qwen/Qwen2.5-7B-Instruct",
                 },
             }
             return
@@ -300,26 +493,15 @@ def main():
     print(f"🚦 Step 0: Dynamic Query Complexity Routing...")
     if is_hard:
         print(f"   → Route: HARD (gpu_vllm) | Prob(Hard): {score:.4f}")
-        print(f"   ⚠️  The 7B model is not yet ready. Returning stubbed response.")
-        result = pipeline.answer_query(args.query, top_k=args.top_k, max_new_tokens=args.max_tokens, temperature=args.temp)
-        if args.json:
-            print(json.dumps(result, indent=2))
-            return
-        print(f"\n💡 Step 1: Deferred Response (GPU LLM 7B Tier):")
-        print("-" * 70)
-        print(result.get("answer"))
-        print("-" * 70)
-        stats = result.get("stats", {})
-        if stats:
-            print(f"📊 Stats: Total: {stats.get('total_seconds')}s (MLP router deferred)")
-        print("=" * 70)
-        return
+        print(f"   🚀 Routing to GPU LLM Tier (Qwen 2.5 7B on NVIDIA A100)...")
+    else:
+        print(f"   → Route: EASY (cpu_slm) | Prob(Hard): {score:.4f}")
+        print(f"   ✓ Routing to local CPU SLM (Qwen 2.5 3B)...")
 
-    print(f"   → Route: EASY (cpu_slm) | Prob(Hard): {score:.4f}")
-    print(f"   ✓ Routing to local CPU SLM (Qwen 2.5 3B)...")
+    model_label = "Qwen 2.5 7B (GPU A100)" if is_hard else "Qwen 2.5 3B (CPU)"
 
     if args.json or args.no_stream:
-        print("\n🔍 Step 1: Retrieving relevant chunks from Redis...")
+        print(f"\n🔍 Step 1: Retrieving relevant chunks from Redis...")
         result = pipeline.answer_query(args.query, top_k=args.top_k, max_new_tokens=args.max_tokens, temperature=args.temp)
 
         if args.json:
@@ -332,7 +514,7 @@ def main():
             sim = c.get("similarity", 0) * 100
             print(f"   [{i}] {c.get('chunk_key')} (Similarity: {sim:.1f}%) | Title: {c.get('title', 'N/A')[:60]}")
 
-        print(f"\n💡 Step 2: Answer generated by Qwen 2.5 3B (CPU):")
+        print(f"\n💡 Step 2: Answer generated by {model_label}:")
         print("-" * 70)
         print(result.get("answer"))
         print("-" * 70)
@@ -359,12 +541,12 @@ def main():
             for i, c in enumerate(chunks, 1):
                 sim = c.get("similarity", 0) * 100
                 print(f"   [{i}] {c.get('chunk_key')} (Similarity: {sim:.1f}%) | Title: {c.get('title', 'N/A')[:60]}")
-            print("\n💡 Step 2: Answer streaming from Qwen 2.5 3B (CPU):")
+            print(f"\n💡 Step 2: Answer streaming from {model_label}:")
             print("-" * 70)
             header_printed = True
         elif ev_type == "token":
             if not header_printed:
-                print("\n💡 Step 2: Answer streaming from Qwen 2.5 3B (CPU):")
+                print(f"\n💡 Step 2: Answer streaming from {model_label}:")
                 print("-" * 70)
                 header_printed = True
             sys.stdout.write(ev["delta"])

@@ -5,9 +5,10 @@
 #SBATCH --exclusive
 #SBATCH --time=24:00:00
 #SBATCH --job-name=llm_dataset
-#SBATCH --output=llm_dataset.log
+#SBATCH --output=logs/llm_dataset.log
 
 echo "Starting job on 4 GPUs..."
+mkdir -p logs
 
 # Activate conda environment for Python 3.10
 source /data2/home/ritujmanware/miniconda3/etc/profile.d/conda.sh
@@ -61,7 +62,7 @@ echo "Current GPU status before starting:"
 nvidia-smi
 
 echo "Downloading model to RAM Disk and starting generation..."
-python3 dataset_generator.py
+python3 scripts/dataset_generator.py
 
 echo "Job complete! Deleting the 150GB model from RAM Disk to clean up..."
 rm -rf /dev/shm/huggingface_cache

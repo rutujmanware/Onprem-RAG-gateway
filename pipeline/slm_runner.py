@@ -13,8 +13,6 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-# CRITICAL: Prevent CUDA driver probing and segfaults on CPU node
-os.environ["CUDA_VISIBLE_DEVICES"] = ""
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 # Ensure root directory is on sys.path
@@ -37,11 +35,12 @@ class CPUSLMEngine:
         self,
         model_name_or_path: str = DEFAULT_MODEL_NAME,
         num_threads: int = DEFAULT_NUM_THREADS,
-        dtype: torch.dtype = torch.bfloat16,
+        dtype: torch.dtype = torch.float32,
     ):
         self.model_name = model_name_or_path
         self.num_threads = num_threads
         self.dtype = dtype
+        self.device = torch.device("cpu")
 
         # Apply thread settings
         torch.set_num_threads(self.num_threads)
@@ -97,6 +96,9 @@ class CPUSLMEngine:
             gen_kwargs["top_p"] = float(top_p)
         else:
             gen_kwargs["do_sample"] = False
+            gen_kwargs["temperature"] = None
+            gen_kwargs["top_p"] = None
+            gen_kwargs["top_k"] = None
 
         t0 = time.time()
         with torch.no_grad():
@@ -133,11 +135,11 @@ class CPUSLMEngine:
             tokenize=False,
             add_generation_prompt=True,
         )
-        inputs = self.tokenizer([prompt_text], return_tensors="pt")
+        inputs = self.tokenizer([prompt_text], return_tensors="pt").to(self.device)
         streamer = TextIteratorStreamer(self.tokenizer, skip_prompt=True, skip_special_tokens=True)
 
         gen_kwargs: Dict[str, Any] = {
-            "inputs": inputs["input_ids"],
+            "input_ids": inputs["input_ids"],
             "attention_mask": inputs.get("attention_mask"),
             "max_new_tokens": max_new_tokens,
             "pad_token_id": self.tokenizer.pad_token_id or self.tokenizer.eos_token_id,
@@ -150,8 +152,15 @@ class CPUSLMEngine:
             gen_kwargs["top_p"] = float(top_p)
         else:
             gen_kwargs["do_sample"] = False
+            gen_kwargs["temperature"] = None
+            gen_kwargs["top_p"] = None
+            gen_kwargs["top_k"] = None
 
-        thread = Thread(target=self.model.generate, kwargs=gen_kwargs)
+        def generate_fn():
+            with torch.no_grad():
+                self.model.generate(**gen_kwargs)
+
+        thread = Thread(target=generate_fn)
         thread.start()
 
         for chunk_text in streamer:

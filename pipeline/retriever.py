@@ -13,9 +13,8 @@ from __future__ import annotations
 import os
 import sys
 
-# CRITICAL: Prevent OpenMP / C++ threading conflicts and CUDA driver segfaults
+# CRITICAL: Prevent OpenMP / C++ threading conflicts
 # These must be set before numpy, torch, or sentence_transformers are imported.
-os.environ["CUDA_VISIBLE_DEVICES"] = ""
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["OPENBLAS_NUM_THREADS"] = "1"

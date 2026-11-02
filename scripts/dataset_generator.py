@@ -8,7 +8,18 @@ import redis
 
 def generate():
     print("🚀 Connecting to Redis database...")
-    # Read the REDIS_URL from environment (needs to be sourced from .env)
+    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    env_file = os.path.join(base_dir, ".env")
+    if os.path.exists(env_file):
+        with open(env_file, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    k, v = k.strip(), v.strip().strip("'\"")
+                    if k not in os.environ:
+                        os.environ[k] = v
+
     redis_url = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
     r = redis.from_url(redis_url, decode_responses=True)
 
@@ -212,8 +223,11 @@ Output ONLY valid JSON in this exact format, with no markdown formatting:
         except Exception:
             pass
 
-    output_csv = "router_multichunk_training_dataset.csv"
-    output_jsonl = "router_multichunk_training_dataset.jsonl"
+    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    output_dir = os.path.join(base_dir, "data")
+    os.makedirs(output_dir, exist_ok=True)
+    output_csv = os.path.join(output_dir, "router_multichunk_training_dataset.csv")
+    output_jsonl = os.path.join(output_dir, "router_multichunk_training_dataset.jsonl")
     df = pd.DataFrame(dataset)
     df.to_csv(output_csv, index=False, escapechar="\\")
     df.to_json(output_jsonl, orient="records", lines=True)

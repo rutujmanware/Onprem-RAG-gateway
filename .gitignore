@@ -13,7 +13,10 @@ __pycache__/
 .coverage
 
 # Logs
+logs/
 *.log
+!logs/.gitkeep
+free_gpus.txt
 
 # Datasets & Large Training Files (stored locally)
 *.csv
@@ -37,6 +40,7 @@ data/raw_pdfs/
 *.gguf
 models/slm_gguf/*.gguf
 models/slm_gguf/qwen*
+models/llm_7b/*
 models/embeddings/
 packages/
 *.pt
