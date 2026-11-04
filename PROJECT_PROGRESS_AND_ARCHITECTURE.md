@@ -57,9 +57,10 @@ To train and validate the complexity router, we generated a comprehensive datase
 ### Phase 3: Gateway, Caching & Admission Control
 Implemented an enterprise-grade async gateway in FastAPI ([`gateway/`](gateway/)):
 * **Zero-Trust Security & OIDC Auth ([`gateway/auth/`](gateway/auth/)):** JWT validation, domain whitelisting (`iisc.ac.in`), and prompt injection fencing.
-* **Dual-Tier Cache ([`gateway/cache/`](gateway/cache/)):**
-  - **L0 Exact Match:** Sub-millisecond SHA-256 hash lookup in Redis.
-  - **L1 Semantic Cache:** Dense cosine similarity lookup against prior query vectors (threshold: 0.92) to prevent redundant LLM calls.
+* **Redis Semantic Vector Cache ([`gateway/cache/`](gateway/cache/)):**
+  - **HNSW Vector Search (`semantic_cache_idx`):** Standardized exclusively on RediSearch 384-dimensional dense cosine indexing over `semcache:*` keys. Exact matches return in $< 4\text{ ms}$ (similarity $1.0000$), while semantic paraphrases hit at $\ge 0.90$.
+  - **Numerical & Polarity Entity Guard:** Deterministically prevents false cache hits on temporal shifts (e.g. 2023 vs 2024, scoring $0.9947$) and negation polarity reversals.
+  - **Retirement of L0 Exact Match:** Dropped fragile string hashing in favor of consolidated vector caching.
 * **Admission Control & Fair Queuing ([`gateway/queue/`](gateway/queue/)):** Token-bucket rate limiting and Deficit Round Robin (DRR) queuing to prevent any single user from monopolizing capacity.
 * **Dynamic Complexity Router ([`gateway/router/`](gateway/router/)):**
   - `complexity_scorer.py`: Evaluates lexical complexity, question structure, comparative keywords, and embedding dispersion.
@@ -84,6 +85,7 @@ Implemented an enterprise-grade async gateway in FastAPI ([`gateway/`](gateway/)
 | **4** | **Host CUDA Driver Mismatch** | PyTorch in the CPU environment had `cu130` while host driver was `CUDA 12.2`, causing driver probing crashes. | Hard-isolated the CPU tier in `pipeline/slm_runner.py` with `os.environ["CUDA_VISIBLE_DEVICES"] = ""` to completely prevent driver initialization attempts. |
 | **5** | **SLM CPU Latency & Rambling** | Testing the SLM on CPU took **63.14 seconds** (~4.5 tok/s for 283 tokens), creating a perception of system freeze. | 1. Implemented **real-time token streaming** via `TextIteratorStreamer` and SSE.<br>2. Scaled thread pool to **48 threads** on AMD EPYC, cutting prefill by **>50%**.<br>3. Enforced concise grounding (2–4 sentences, max 160 tokens). Total time dropped to **21 seconds (3x speedup)**. |
 | **6** | **Git Accidental Staging** | `git add .` mistakenly staged the 12 GB vector database, 6 MB logs, and 190 MB datasets, risking GitHub push rejection. | Formulated comprehensive [`.gitignore`](.gitignore) rules for `*.rdb`, `*.tar.gz`, `myenv/`, `*.log`, and `*.jsonl`. Cleaned git index, ensuring only source code moves to remote. |
+| **7** | **Semantic Cache Year/Number Blindness (2023 vs 2024)** | Queries asking for 2024 data scored **0.9947** cosine similarity against cached 2023 answers in dense embedding space, risking false cache hits. | Implemented a deterministic **Numerical & Polarity Entity Guard** in `RedisSemanticCache`. Rejects matches with conflicting numeric/temporal entities or negation polarity, ensuring 100% factual isolation while preserving genuine paraphrasing. |
 
 ---
 
@@ -1054,6 +1056,572 @@ User Terminal (scripts/query.py / curl -N)
 | **`llama.cpp` GGUF (Unoptimized)** | 3.4B (Q4_K_M quantized) | 8 threads (batch=8) | 23.30s | 16.80 tok/s | ~26.0s | ✅ High (complete factual) | 0 MiB |
 | **`llama.cpp` GGUF (Optimized)** | 3.4B (Q4_K_M quantized) | 32 batch / 8 decode threads | **2.22s (12.5x speedup)** | **29.75 tok/s** | **3.56s** | **✅ High (complete factual)** | **0 MiB** |
 | **GPU LLM Tier (Qwen 2.5 7B)** | 7.6B (Bfloat16 via vLLM) | NVIDIA A100-SXM4-40GB | **0.14s** | **43.90 tok/s** | **2.30s** | **✅ High (deep synthesis)** | 14.58 GiB |
+
+---
+
+## 13. Redis Semantic Vector Cache: Architectural Design, Implementation Process & Validation
+
+### 13.1 Architectural Motivation & Paradigm Shift
+In earlier designs, a two-level caching scheme was considered:
+- **L0 Exact Match Cache:** MD5 / SHA-256 hash lookup over raw query strings.
+- **L1 Semantic Cache:** Vector similarity search for paraphrased queries.
+
+**Why L0 Exact Cache Was Retired in Favor of Unified Redis Semantic Cache:**
+1. **Redundancy & Latency Parity:** RediSearch HNSW vector search on 384-dimensional dense vectors naturally returns a cosine similarity of $1.0000$ for exact string matches in $< 4\text{ ms}$. Maintaining an in-memory or Redis string hash table duplicates memory without providing any measurable latency benefit.
+2. **Extreme Brittleness of Hash Lookups:** Exact hash lookups fail on trivial variations such as trailing punctuation (`"what is vermiculite?"` vs `"what is vermiculite"`), casing (`"Vermiculite"` vs `"vermiculite"`), whitespace, or minor wording changes.
+3. **Cluster Safety & Zero In-Memory Drift:** Pure in-memory caching (e.g., Python `dict` or LRU) creates state desynchronization across multiple uvicorn worker processes or gateway replicas. Centralizing caching directly inside **Redis Stack** ensures 100% data consistency, cluster scalability, and snapshot persistence (`make redis-status`).
+
+---
+
+### 13.2 RediSearch HNSW Vector Index Architecture
+
+The cache utilizes Redis Stack's native vector similarity search (`FT.SEARCH`) backed by an Hierarchical Navigable Small World (HNSW) index:
+
+```
+Incoming User Query
+         │
+         ▼
+[ LocalEmbedder (all-MiniLM-L6-v2) ] ──▶ 384-dim Float32 Embedding Vector ($vec)
+         │
+         ▼
+[ Redis HNSW KNN Search ] ─────────────▶ FT.SEARCH semantic_cache_idx
+                                         "*=>[KNN 1 @vector $vec AS score]"
+                                         SORTBY score ASC RETURN 3 prompt response score
+         │
+         ├───────────────────────────────┬───────────────────────────────┐
+         ▼                               ▼                               ▼
+  Cosine Distance d              Cosine Similarity s             Threshold Check
+(score in range [0, 2])               s = 1.0 - d                    s ≥ 0.90 ?
+                                                                         │
+                                                 ┌───────────────────────┴───────────────────────┐
+                                                 ▼ (YES)                                         ▼ (NO)
+                                    Deterministic Entity Guard                         ⚡ CACHE MISS
+                              (check_entity_conflict: numbers/polarity)            Route to SLM / GPU LLM
+                                                 │                                 Store Result in Redis
+                                 ┌───────────────┴───────────────┐
+                                 ▼ (Pass)                        ▼ (Conflict)
+                       ⚡ CACHE HIT (<10 ms)             ⚡ CACHE MISS (Guarded)
+                     Instant Response Delivery           (e.g., 2023 vs 2024 blocked)
+                      Zero GPU / CPU Compute
+```
+
+#### Index Specification:
+```redis
+FT.CREATE semantic_cache_idx ON HASH PREFIX 1 "semcache:" SCHEMA
+    prompt TEXT NOSTEM
+    response TEXT NOSTEM
+    vector VECTOR HNSW 6 TYPE FLOAT32 DIM 384 DISTANCE_METRIC COSINE
+    created_at NUMERIC
+```
+- **Distance Metric:** `COSINE`. RediSearch yields cosine distance $d \in [0, 2]$.
+- **Cosine Similarity Formula:** $\text{Similarity } s = 1.0 - d$.
+- **Hit Threshold:** Configurable via `SEMANTIC_CACHE_THRESHOLD` (default: **`0.90`**).
+- **TTL Expiration:** Configurable via `SEMANTIC_CACHE_TTL` (default: 7 days / $604,800\text{ seconds}$).
+
+---
+
+### 13.3 The Cache Implementation Process in Our Project (Step-by-Step)
+
+The end-to-end implementation was engineered across five structured phases:
+
+#### Step 1: Redis Schema & HNSW Vector Index Definition
+1. Configured Redis Stack to host an isolated index named `semantic_cache_idx` over keys prefixed with `semcache:`.
+2. Stored records as Redis **Hashes** containing:
+   - `prompt` (`TEXT`): The raw text of the incoming question.
+   - `response` (`TEXT`): Serialized JSON containing the answer text, referenced chunks, route info, and tokens.
+   - `vector` (`VECTOR`): Raw 384-element Float32 byte buffer (`numpy.ndarray.tobytes()`).
+   - `created_at` (`NUMERIC`): Unix epoch timestamp for TTL calculation and cache auditing.
+3. Automated dynamic index creation on startup: if `semantic_cache_idx` does not exist or Redis is restarted afresh, the Gateway creates the index gracefully without manual DB administration.
+
+#### Step 2: Implementation of the Dual-Engine Core ([`gateway/cache/redis_semantic_cache.py`](gateway/cache/redis_semantic_cache.py))
+To support both modern asynchronous ASGI endpoints (FastAPI) and synchronous background/streaming threads, the core engine was built with a dual interface:
+1. **Asynchronous Interface (`alookup`, `astore`, `aclear`, `acount`):**
+   - Uses `redis.asyncio.Redis` connected to `REDIS_URL`.
+   - Never blocks the asyncio event loop during vector searches or vector serialization.
+2. **Synchronous Interface (`lookup`, `store`, `clear`, `count`):**
+   - Uses standard `redis.Redis` for worker threads and offline benchmarking scripts.
+3. **Query Vector Search Execution:**
+   - Constructs the RediSearch query:
+     ```python
+     q = (
+         Query(f"*=>[KNN 1 @vector $query_vec AS vector_distance]")
+         .sort_by("vector_distance", asc=True)
+         .return_fields("prompt", "response", "vector_distance")
+         .paging(0, 1)
+         .dialect(2)
+     )
+     ```
+   - Normalizes and converts RediSearch's cosine distance to cosine similarity: `similarity = 1.0 - float(doc.vector_distance)`.
+
+#### Step 3: Engineering the Deterministic Entity & Polarity Guard
+Standard dense vector models (`all-MiniLM-L6-v2`) embed numbers and dates closely together (e.g. `2023` and `2024` share $>0.99$ cosine similarity). To eliminate catastrophic false hits while preserving true paraphrasing:
+1. Developed `check_entity_conflict(query_a, query_b)`:
+   - **Numeric/Year Conflict:** Regex pattern `r'\b\d+(?:\.\d+)?%?\b'` extracts all numbers, years, and measurements. If numbers exist in either query and their token multisets do not match (`numbers_a != numbers_b`), the match is **immediately rejected as a Cache Miss**.
+   - **Polarity Inversion:** Extracts negative terms (`{"not", "no", "never", "without", "neither", "nor"}`). If one query negates the proposition while the other does not, it is rejected.
+2. The guard runs in `<0.1 ms` in Python before returning any cached response.
+
+#### Step 4: Lifespan Hooks & Gateway Integration ([`gateway/main.py`](gateway/main.py))
+1. **Async Lifespan Management:** Registered in `lifespan(app)` so that `container.initialize()` initializes the Redis semantic cache index before accepting HTTP traffic.
+2. **Dependency Injection:** Exposed via FastAPI's `get_semantic_cache` dependency provider:
+   ```python
+   async def chat_completions(req: ChatCompletionRequest, cache: RedisSemanticCache = Depends(get_semantic_cache)):
+       hit = await cache.alookup(query)
+   ```
+3. **Write-Through Caching:** Once fresh inference completes (from either CPU SLM or GPU vLLM), the Gateway executes `await cache.astore(query, res)` asynchronously in the background.
+
+#### Step 5: Instant Streaming Fast-Path (SSE Token Emulation)
+When a user requests streaming (`"stream": true`), querying an LLM/SLM adds latency. For cached responses:
+1. The Gateway generates a synthetic Server-Sent Events (SSE) generator.
+2. Emits an immediate cache event: `{"type": "cache", "status": "HIT", "similarity": 1.0, "matched_prompt": "..."}`.
+3. Rapidly yields the cached answer word-by-word with zero CPU/GPU overhead.
+4. Delivers the entire response in $< 80\text{ ms}$ with a Time-to-First-Token (TTFT) of **$0.03\text{s}$**.
+
+#### Step 6: Transparent Model Attribution in Gateway & CLI ([`scripts/query.py`](scripts/query.py))
+Every response returns transparent provenance badges:
+1. **Cache Status:**
+   - `⚡ SEMANTIC CACHE: [HIT] (Cosine Similarity: 0.9966 | Matched: "...")`
+   - `⚡ SEMANTIC CACHE: [MISS] (Fresh Inference Triggered)`
+2. **Producing Model:**
+   - Cache Hit: `🤖 PRODUCING MODEL: Redis Semantic Vector Cache (Zero-Compute Retrieval)`
+   - Cache Miss (Hard Query): `🤖 PRODUCING MODEL: Qwen/Qwen2.5-7B-Instruct (GPU vLLM Tier)`
+   - Cache Miss (Easy Query): `🤖 PRODUCING MODEL: Qwen/Qwen2.5-3B-Instruct (CPU SLM Tier)`
+
+#### Step 7: Cache Administration & Observability
+1. **`GET /cache/stats`:** Returns real-time health, index name, threshold ($0.90$), vector dimensions ($384$), and the count of cached entries.
+2. **`POST /cache/clear`:** Drops all `semcache:*` keys and safely recreates the vector index.
+
+---
+
+### 13.4 Verified Production Benchmarks
+
+The following live benchmarks were recorded against the running Gateway, Redis Stack Server, and A100 GPU:
+
+| Query Type | Query Text | Cosine Similarity | Cache Status | End-to-End Latency | TTFT | Compute Resources |
+| :--- | :--- | :---: | :---: | :---: | :---: | :--- |
+| **Cold Query 1 (Miss)** | *"What is vermiculite and what are its primary uses?"* | N/A | **MISS** | **7.63s** | 2.22s | CPU SLM (48 threads) |
+| **Exact Match Query** | *"What is vermiculite and what are its primary uses?"* | **1.0000** | **HIT** | **0.03s (30 ms)** | 0.03s | **0 Compute (Redis HNSW)** |
+| **Paraphrased Query 1** | *"Can you explain what vermiculite is and what it is mainly used for?"* | **0.9606** | **HIT** | **0.05s (50 ms)** | 0.04s | **0 Compute (Redis HNSW)** |
+| **Paraphrased Query 2** | *"Tell me about vermiculite and its applications"* | **0.9193** | **HIT (SSE)** | **0.04s (40 ms)** | **0.03s** | **0 Compute (Redis HNSW)** |
+| **Unrelated Query (Miss)** | *"How does Rayleigh-Taylor instability develop in magnetohydrodynamics?"* | $<0.25$ | **MISS** | **5.13s** | 2.18s | CPU SLM (Grounded Retrieval) |
+| **OpenAI API (/v1/chat)** | *"What is vermiculite and what are its primary uses?"* | **1.0000** | **HIT** | **0.026s (26 ms)** | N/A | **0 Compute (Redis HNSW)** |
+
+---
+
+### 13.5 Management & Testing Runbook
+
+```bash
+# 1. Inspect Cache Statistics
+curl -s http://127.0.0.1:8080/cache/stats
+# Response: {"status":"active","cache_type":"RedisSemanticCache","index_name":"semantic_cache_idx","key_prefix":"semcache:","similarity_threshold":0.9,"vector_dim":384,"cached_queries_count":2}
+
+# 2. Run Query via CLI (Demonstrates instant cache hit & streaming)
+python scripts/query.py "Can you explain what vermiculite is and what it is mainly used for?"
+
+# 3. Test OpenAI-Compatible Endpoint Cache Hit
+curl -s -X POST http://127.0.0.1:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "X-User-Email: rituj@iisc.ac.in" \
+  -d '{"messages": [{"role": "user", "content": "What is vermiculite and what are its primary uses?"}]}'
+
+# 4. Clear Semantic Cache
+curl -s -X POST http://127.0.0.1:8080/cache/clear
+# Response: {"status":"cleared"}
+```
+
+---
+
+### 13.6 Resolving the "2023 vs 2024" Numerical & Temporal Blindness in Semantic Vector Caching
+
+#### The Problem: Deceptive High Cosine Similarity in Dense Embeddings
+In standard sentence transformer embedding models (`sentence-transformers/all-MiniLM-L6-v2`), temporal numbers (`2023`, `2024`) and quantitative metrics occupy nearly identical geometric positions in latent space. When a query is 95% identical in wording except for the year (e.g., *"IISc thesis guidelines in 2023"* vs *"in 2024"*), the cosine similarity reaches **0.9947**.
+
+In a naive vector semantic cache with a threshold of $0.90$ or $0.95$, this produces a catastrophic **False Positive Cache Hit**—returning outdated 2023 facts to a user asking about 2024!
+
+#### The Engineering Solution: Deterministic Numerical & Polarity Entity Guard
+To eliminate false cache hits while preserving genuine paraphrasing, [`gateway/cache/redis_semantic_cache.py`](gateway/cache/redis_semantic_cache.py) implements `check_entity_conflict(query, matched_prompt)`:
+1. **Numerical & Year Consistency:** Extracts all numeric and temporal tokens (integers, years, floats, percentages). If numbers are present in either query and `numbers(incoming) != numbers(cached)`, the match is rejected immediately regardless of how high the vector similarity is.
+2. **Polarity & Negation Guard:** Extracts negation terms (`{"not", "no", "never", "without", ...}`). Prevents answering inverse questions (e.g., *"Why does fluid stabilize?"* vs *"Why does fluid NOT stabilize?"* which score $0.9880$ cosine similarity).
+
+#### Pure Dense Vector Similarity Benchmark Results (`all-MiniLM-L6-v2`)
+
+| Test Category | Query A | Query B | Cosine Sim | Naive Cache Result | With Entity Guard |
+| :--- | :--- | :--- | :---: | :---: | :--- |
+| **Exact Match** | *"What is vermiculite and what are its primary uses?"* | Identical | **1.0000** | ✅ Safe Hit | ✅ **Safe Cache Hit** |
+| **True Paraphrase (Vocab)** | *"What is vermiculite and what are its primary uses?"* | *"Can you explain what vermiculite is and its main applications?"* | **0.9373** | ✅ Safe Hit | ✅ **Safe Cache Hit** |
+| **True Paraphrase (Syntax)** | *"Explain onset of Rayleigh Taylor instability in magnetized fluids."* | *"In magnetized fluids, how does Rayleigh Taylor instability begin?"* | **0.9682** | ✅ Safe Hit | ✅ **Safe Cache Hit** |
+| **Year Shift (Guidelines)** | *"What are the IISc thesis guidelines in 2023?"* | *"What are the IISc thesis guidelines in 2024?"* | **0.9947** | ❌ **False Hit** | 🛡️ **REJECTED (Year Mismatch: '2023' vs '2024')** |
+| **Year Shift (Cutoffs)** | *"What were admissions cutoffs for M.Tech CSE in 2023?"* | *"What were admissions cutoffs for M.Tech CSE in 2024?"* | **0.9929** | ❌ **False Hit** | 🛡️ **REJECTED (Year Mismatch: '2023' vs '2024')** |
+| **Year Shift (Surveys)** | *"Clean energy research published at IISc in 2021"* | *"Clean energy research published at IISc in 2024"* | **0.9858** | ❌ **False Hit** | 🛡️ **REJECTED (Year Mismatch: '2021' vs '2024')** |
+| **Frequency Shift** | *"Resonance frequency at 100 MHz"* | *"Resonance frequency at 500 MHz"* | **0.9348** | ❌ **False Hit** | 🛡️ **REJECTED (Value Mismatch: 100 vs 500)** |
+| **Polarity Reversal** | *"Why does MHD flow stabilize under magnetic shear?"* | *"Why does MHD flow NOT stabilize under magnetic shear?"* | **0.9880** | ❌ **False Hit** | 🛡️ **REJECTED (Polarity Conflict: 'NOT')** |
+| **Cross-Domain** | *"How does Rayleigh-Taylor instability develop?"* | *"What is vermiculite and what are its uses?"* | **-0.0571** | ✅ Safe Miss | ✅ **Safe Cache Miss** |
+| **Cross-Domain** | *"Feynman diagrams in quantum electrodynamics"* | *"Stability criteria for stratified fluid flows"* | **0.0197** | ✅ Safe Miss | ✅ **Safe Cache Miss** |
+
+---
+
+### 13.7 Dual-Tier End-to-End Validation: CPU SLM vs GPU LLM (A100)
+
+Comprehensive end-to-end evaluation was executed using [`tests/benchmark_cache_extensive.py`](tests/benchmark_cache_extensive.py) targeting both compute tiers of the running Gateway:
+
+#### Tier 1: CPU SLM (Easy Queries)
+
+| Step | Query & Variation | Route / Target Tier | Cache Status | Similarity | Client Latency | Speedup |
+| :---: | :--- | :---: | :---: | :---: | :---: | :---: |
+| **1.1** | Cold Query (2023): *"What are thesis guidelines for vermiculite beneficiation in 2023?"* | Easy (`cpu_slm`) | **MISS** | N/A | **6.08s** | Baseline |
+| **1.2** | Exact Repeat (2023): Identical | `semantic_cache` | **HIT** | **1.0000** | **0.024s (24 ms)** | **255.4x** |
+| **1.3** | True Paraphrase (2023): *"Can you describe vermiculite beneficiation guidelines in 2023?"* | `semantic_cache` | **HIT** | **0.9230** | **0.023s (23 ms)** | **264.3x** |
+| **1.4** | **Year Shift (2024 vs 2023):** *"What are thesis guidelines for vermiculite beneficiation in 2024?"* | Easy (`cpu_slm`) | **MISS (Guarded)** | 0.994 (Blocked) | **2.08s** | Fresh Execution |
+| **1.5** | Exact Repeat (2024): Identical to 2024 | `semantic_cache` | **HIT** | **1.0000** | **0.029s (29 ms)** | **71.7x** |
+
+#### Tier 2: GPU LLM (Hard Queries - Qwen 2.5 7B on NVIDIA A100)
+
+| Step | Query & Variation | Route / Target Tier | Cache Status | Similarity | Client Latency | Compute Resource Saved |
+| :---: | :--- | :---: | :---: | :---: | :---: | :---: |
+| **2.1** | Cold Query (2023): *"Synthesize & compare mathematical stability proofs of magnetic shear vs Coriolis in 2023"* | Hard (`gpu_vllm`) | **MISS** | N/A | **10.72s** | NVIDIA A100 (14.6 GB VRAM) |
+| **2.2** | True Paraphrase (2023): *"Compare mathematical derivations for accretion disk stability between Coriolis and shear in 2023"* | `semantic_cache` | **HIT** | **0.9187** | **0.068s (68 ms)** | **100% GPU VRAM & Compute Saved** |
+| **2.3** | **Year Shift (2024 vs 2023):** *Same comparative prompt, shifted to 2024* | Hard (`gpu_vllm`) | **MISS (Guarded)** | 0.995 (Blocked) | **4.32s** | Fresh A100 GPU Synthesis |
+| **2.4** | Exact Repeat (2024): Identical to 2024 GPU query | `semantic_cache` | **HIT** | **1.0000** | **0.034s (34 ms)** | **100% GPU VRAM & Compute Saved** |
+
+#### Summary of Results
+- **CPU Offload Efficiency:** Cached easy queries accelerate response delivery from **~6.08s down to 0.024s (255x faster)**.
+- **GPU Conservation Efficiency:** Cached hard queries accelerate response delivery from **~10.72s down to 0.068s (157x faster)**, entirely freeing the 40GB NVIDIA A100 GPU for other campus researchers.
+- **Temporal & Numerical Integrity:** 2023 and 2024 queries maintain **100% factual isolation** despite having $>0.99$ embedding similarity.
+
+---
+
+### 13.8 vLLM GPU Server Migration & Transparent Query Attribution
+
+#### A. Migration to Official vLLM Engine (Port 8000)
+The GPU tier (`Qwen/Qwen2.5-7B-Instruct`) was migrated from custom server scripts to the official high-throughput **vLLM OpenAI API Server** (`vllm==0.6.3`) hosted directly inside `rag_env`:
+- **Engine Command (`make serve-gpu`):**
+  ```bash
+  CUDA_VISIBLE_DEVICES=0 python -m vllm.entrypoints.openai.api_server \
+    --model /data2/home/ritujmanware/.cache/huggingface/hub/models--Qwen--Qwen2.5-7B-Instruct/snapshots/a09a35458c702b33eeacc393d103063234e8bc28 \
+    --served-model-name "Qwen/Qwen2.5-7B-Instruct" \
+    --host 127.0.0.1 \
+    --port 8000 \
+    --gpu-memory-utilization 0.45 \
+    --max-model-len 8192 \
+    --dtype bfloat16
+  ```
+- **Throughput & Latency:** Delivers **73.4+ tokens/sec** with PagedAttention and continuous batching on the NVIDIA A100.
+
+#### B. Cache Hit vs. Miss Similarity Policy
+The system determines whether an incoming query results in a cache hit or miss based on a two-stage evaluation:
+
+$$\text{Cache Decision} = \begin{cases} \mathbf{HIT}, & \text{if } s \ge 0.90 \text{ AND } \neg\text{EntityConflict}(Q_{\text{in}}, Q_{\text{cached}}) \\ \mathbf{MISS}, & \text{otherwise} \end{cases}$$
+
+1. **Cosine Similarity ($s \ge 0.90$):**
+   - Embeddings are generated using `sentence-transformers/all-MiniLM-L6-v2` ($d=384$).
+   - Redis Stack performs approximate nearest neighbor search via `HNSW` vector index with `FLAT` fallback:
+     $$\text{similarity} = 1.0 - \text{cosine\_distance}$$
+   - Queries with $s < 0.90$ are classified as **Cache Miss** and trigger fresh neural routing.
+2. **Deterministic Entity & Polarity Conflict Guard:**
+   - Even if $s \ge 0.90$ (e.g. $s = 0.9947$ for 2023 vs 2024), if numeric tokens differ or polarities invert (`not`, `no`, `never`), the match is **rejected as a Cache Miss**.
+
+#### C. End-to-End Transparency & Model Attribution
+Every response generated by the gateway (streaming SSE and non-streaming JSON) explicitly prints:
+1. **Cache Status:** `⚡ SEMANTIC CACHE: [HIT]` or `[MISS]` with exact cosine similarity and matched prompt.
+2. **Producing Model:**
+   - On Cache Hit: `🤖 PRODUCING MODEL: Redis Semantic Vector Cache (Zero-Compute Retrieval)`
+   - On Cache Miss (Hard Query): `🤖 PRODUCING MODEL: Qwen/Qwen2.5-7B-Instruct (GPU vLLM Tier)`
+   - On Cache Miss (Easy Query): `🤖 PRODUCING MODEL: Qwen/Qwen2.5-3B-Instruct (CPU SLM Tier)`
+
+---
+
+### 13.9 Prevention of Cache Poisoning: Filtering Insufficient Data & Refusals
+
+#### A. The Problem of Caching Unanswerable Queries
+When a user asks a question about topics not present in the institutional document corpus (or asking about a future year before documents are ingested), the pipeline returns grounded refusal statements such as:
+> *"Based on the provided documents, there is insufficient information to answer this question."*
+
+If this failure/refusal is stored in the Redis semantic vector cache:
+1. **Permanent Denial-of-Service for New Data:** Once new documents or PDFs covering that topic are ingested, future user queries with $\ge 0.90$ similarity would instantly hit the cached refusal, blocking users from seeing newly ingested factual answers.
+2. **Cache Poisoning & Resource Waste:** Caching refusals clutters the HNSW index with non-answers and degrades the utility of the cache.
+
+#### B. The Solution: Dual-Stage Cacheability Guard (`is_cacheable_response`)
+Implemented in [`gateway/cache/redis_semantic_cache.py`](gateway/cache/redis_semantic_cache.py):
+1. **Phrase Inspection:** Scans generated text for known refusal and insufficiency markers:
+   - `"insufficient information"`, `"insufficient data"`, `"insufficient context"`
+   - `"not enough information"`, `"does not contain enough information"`
+   - `"no relevant documents"`, `"no documents were found"`
+   - `"retrieval failed"`, `"cannot answer based on"`
+2. **Quality & Error Checks:** Rejects empty or truncated strings ($< 15$ characters) and responses containing system errors.
+3. **Write-Time Enforcement (`store` & `astore`):**
+   If `is_cacheable_response(response)` returns `False`, the response is immediately bypassed and logged:
+   ```
+   INFO: Semantic cache STORE bypassed for query '...': Response indicates insufficient data / refusal
+   ```
+4. **Read-Time Enforcement (`lookup` & `alookup`):**
+   If an existing candidate in Redis contains uncacheable content, it is rejected at lookup time, ensuring no stale refusals are ever served to clients.
+5. **Database Sanitization & Management:**
+   - Gateway `lifespan(app)` automatically purges any legacy uncacheable entries on startup.
+   - Endpoint: `POST /cache/purge-invalid` allows administrators to sanitize the cache on demand.
+   - Unit Test Suite: [`tests/test_cache_insufficient_data.py`](tests/test_cache_insufficient_data.py) verifies zero leakage of unanswerable queries.
+
+---
+
+## 14. Production Orchestration, Deployment Topology & Unified Lifecycle Management
+
+### 14.1 Production Architecture & Security Boundary
+In production on-premise institutional hosting, services are decoupled into 4 dedicated tiers with strict network isolation:
+
+```
+[ CAMPUS RESEARCHERS / WEB APPS / FRONTENDS ]
+                      │
+                      │ HTTPS / HTTP (Port 8080 ONLY)
+                      ▼
+┌────────────────────────────────────────────────────────┐
+│  PUBLIC BOUNDARY: Institutional Gateway (Port 8080)    │
+│  - Host: 0.0.0.0 (Publicly accessible)                 │
+│  - Engine: Multi-worker uvicorn (no --reload)          │
+│  - Security: OIDC token auth, Token-bucket rate limit  │
+│  - Intelligence: Two-Tower MLP routing & Semantic Cache│
+└───────────────────────────┬────────────────────────────┘
+                            │ (Local Loopback 127.0.0.1 ONLY)
+                            │ (Zero Public Internet Exposure)
+           ┌────────────────┼────────────────┐
+           ▼                ▼                ▼
+┌───────────────────────┐ ┌──────────────────┐ ┌─────────────────────┐
+│ Port 6379: Redis DB   │ │ Port 8000: vLLM  │ │ Port 8082: CPU SLM  │
+│ - HNSW Vector Index   │ │ - Qwen 2.5 7B    │ │ - Qwen 2.5 3B GGUF  │
+│ - Semantic Cache      │ │ - NVIDIA A100    │ │ - 8-thread AVX-512  │
+│ - RDB Persistence     │ │ - PagedAttention │ │ - Fast C++ SIMD     │
+└───────────────────────┘ └──────────────────┘ └─────────────────────┘
+```
+
+1. **Security Isolation:** Only Port `8080` binds to `0.0.0.0`. Backend inference engines (vLLM on `8000`, SLM on `8082`, and Redis on `6379`) bind strictly to `127.0.0.1` (localhost), ensuring no external client can bypass authentication, rate limiting, or the prompt injection fence.
+2. **Multi-Worker Scaling:** The Gateway runs with multiple worker processes (`--workers 2+`), multiplexing requests across the shared vLLM and Redis instances without VRAM duplication.
+
+### 14.2 Production Lifecycle Management Commands
+
+The production stack is managed via [`scripts/prod_stack.py`](scripts/prod_stack.py) and integrated into the `Makefile`:
+
+```bash
+# 1. Start all 4 services in production mode (daemonized, logging to logs/*.log)
+make prod-up
+
+# 2. View real-time production health dashboard & PIDs
+make prod-status
+
+# 3. Gracefully stop all services and free GPU VRAM
+make prod-down
+
+# 4. Restart entire production stack
+make prod-restart
+```
+
+#### Production Status Dashboard Output:
+```text
+======================================================================
+📊 PRODUCTION STACK HEALTH & RUNTIME DASHBOARD
+======================================================================
+  🟢 READY     | Redis Vector & Cache      | Port 6379 | PID: N/A     | Redis Ready (PONG)
+  🟢 READY     | vLLM GPU Engine (7B)      | Port 8000 | PID: 1056365 | HTTP 200 OK
+  🟢 READY     | CPU SLM Engine (3B)       | Port 8082 | PID: 1056366 | HTTP 200 OK
+  🟢 READY     | Institutional Gateway     | Port 8080 | PID: 1056367 | HTTP 200 OK
+  ⚡ IN-PROCESS| Two-Tower MLP Router      | Port 8080 | In-Process   | Embedded in Gateway (< 3ms)
+======================================================================
+🎉 ALL SYSTEMS ONLINE & OPERATIONAL: Ready for high-concurrency campus traffic.
+🌐 Public API Endpoint: http://0.0.0.0:8080/query
+📄 API Documentation:   http://0.0.0.0:8080/docs
+======================================================================
+```
+
+---
+
+### 14.3 Large-Scale Memory Loading & Three-State Service Health
+
+#### A. The Redis Loading Bottleneck & Three-State Detection
+When restoring a multi-gigabyte corpus vector index (e.g. 12+ GB RDB file with 384-dimensional HNSW graph indices), Redis accepts socket connections immediately but responds with:
+```text
+redis.exceptions.BusyLoadingError: Redis is loading the dataset in memory
+```
+A binary port health check (`connect() == True`) causes orchestration tools to prematurely declare the system healthy while queries would fail.
+
+To resolve this, the production orchestrator [`scripts/prod_stack.py`](scripts/prod_stack.py) implements **Three-State Health Telemetry**:
+1. `🔴 DOWN`: Process is not running or the TCP port refuses connections.
+2. `🟡 LOADING`: Port is open, but the engine is initializing weights (e.g. vLLM loading GPU tensors) or parsing dataset snapshots (`info("Persistence")['loading'] == 1`).
+3. `🟢 READY`: Service passes deep health inspection (e.g. Redis responds with `PONG`, HTTP health endpoints return `200 OK`).
+
+```
+                ┌───────────────────────────────────┐
+                │        Health Verification        │
+                └─────────────────┬─────────────────┘
+                                  │
+                   Is TCP Port listening?
+                     ├─── NO  ───► 🔴 DOWN
+                     └─── YES ───► Query Service Health
+                                    ├─── BusyLoadingError ───► 🟡 LOADING
+                                    ├─── Tensor Loading   ───► 🟡 LOADING
+                                    └─── 200 OK / PONG   ───► 🟢 READY
+```
+
+#### B. Live RDB Loading Monitor (`make redis-watch`)
+To observe the 12 GB memory loading process in real time without polling blind logs, an interactive terminal monitor was created at [`scripts/track_redis.py`](scripts/track_redis.py):
+- Connects directly to Redis Persistence Info telemetry (`rdb_last_bgsave_status`, `loading_loaded_perc`, `loading_eta_seconds`).
+- Renders an ASCII live progress bar with exact megabyte counter, percentage completion, and countdown ETA.
+- Command:
+  ```bash
+  make redis-watch
+  ```
+  ```text
+  ⏳ Redis is loading dataset into RAM:
+  [████████████████████████████████████████] 100.0% (12.4 GB / 12.4 GB) | ETA: 0s
+  ✅ Redis dataset is 100% loaded and ready for queries!
+  ```
+
+---
+
+### 14.4 Two-Tower MLP Router: Deployment Topology & Network Inversion Analysis
+
+A crucial production architecture decision addressed whether the **Two-Tower MLP Router** should run as a separate microservice (Port 8090) or in-process inside the Gateway (Port 8080).
+
+#### A. The Network Inversion Penalty
+- **Model Characteristics:** The trained PyTorch/ONNX MLP router has a footprint of only **~450 KB** (128-dimensional hidden layers).
+- **In-Process Inference Latency:** Running via ONNX Runtime inside the FastAPI process takes **1.2 to 2.8 milliseconds**.
+- **Microservice Penalty:** Hosting on Port 8090 introduces TCP handshake, JSON serialization/deserialization, and HTTP loopback overhead (~4–8 ms).
+- **Conclusion:** If hosted as an external microservice, **networking overhead exceeds compute time by 300%** (Network Inversion).
+
+#### B. Production Hybrid Solution: In-Process Default with Microservice Support
+Implemented in [`gateway/router/complexity_scorer.py`](gateway/router/complexity_scorer.py):
+1. **Primary Route (In-Process):** Runs embedded via ONNX Runtime / PyTorch inside the Gateway worker processes, achieving sub-3ms routing with zero network overhead.
+2. **Decoupled Fallback (Microservice):** If horizontal gateway autoscaling requires centralized routing telemetry, the standalone server can be launched via:
+   ```bash
+   make serve-router   # Launches on port 8090
+   ```
+   The Gateway complexity scorer automatically discovers Port 8090 if active; otherwise, it seamlessly evaluates in-process.
+
+---
+
+### 14.5 CPU SLM HTTP Decoupling & Gateway Forwarding
+
+#### A. Motivation for Decoupling CPU SLM from Gateway Workers
+While the MLP router is tiny, the CPU SLM (`Qwen/Qwen2.5-3B-Instruct` GGUF) requires ~2.5 GB of RAM and 8 AVX-512 CPU threads. Running llama.cpp in-process across multi-worker FastAPI (`--workers 4`) would:
+1. Duplicate 2.5 GB RAM per worker (10 GB RAM consumed just for SLM weights).
+2. Cause CPU core saturation and thread thrashing when multiple uvicorn workers invoke OpenMP simultaneously.
+3. Risk crashing all Gateway endpoints if llama.cpp triggers a low-level C++ segmentation fault.
+
+#### B. HTTP Forwarding Implementation
+1. **Daemon Service (`Port 8082`):** [`pipeline/serve_cpu_slm.py`](pipeline/serve_cpu_slm.py) runs as an isolated daemon bound to `127.0.0.1:8082`, exposing an OpenAI-compatible `/v1/chat/completions` endpoint with request logging and token metrics.
+2. **Gateway HTTP Forwarding:** [`pipeline/rag_chain.py`](pipeline/rag_chain.py) forwards Easy queries to `http://localhost:8082/v1/chat/completions` using Server-Sent Events (SSE) streaming.
+3. **Resilient In-Process Fallback:** If the Port 8082 daemon is temporarily stopped during maintenance, `rag_chain.py` catches `URLError` and falls back to in-process llama.cpp execution to prevent query failures.
+
+---
+
+### 14.6 End-to-End Production Query Interfaces & Verification
+
+The running production system supports four querying interfaces:
+
+```
+                               ┌────────────────────────────────────────────────────────┐
+                               │       Client Interfaces & Integration Points           │
+                               └───────────────────────────┬────────────────────────────┘
+                                                           │
+          ┌───────────────────────────┬────────────────────┴───────────────┬────────────────────────────┐
+          ▼                           ▼                                    ▼                            ▼
+┌──────────────────┐        ┌──────────────────┐                 ┌──────────────────┐         ┌───────────────────┐
+│ 1. Streaming CLI │        │ 2. REPL Terminal │                 │ 3. OpenAI API    │         │ 4. Native REST    │
+│  make ask Q="..."│        │  query.py        │                 │  /v1/chat/compl  │         │  /query           │
+└──────────────────┘        └──────────────────┘                 └──────────────────┘         └───────────────────┘
+```
+
+#### 1. Instant Streaming CLI (`make ask`)
+```bash
+make ask Q="What is vermiculite and what are its uses?"
+```
+```text
+======================================================================
+🚀 CONNECTED TO RAG GATEWAY - STREAMING RESPONSE
+======================================================================
+⚡ SEMANTIC CACHE: [HIT] (Cosine Similarity: 0.9917 | Matched: "What is vermiculite and what are its primary uses?")
+🤖 PRODUCING MODEL: Redis Semantic Vector Cache (Zero-Compute Retrieval)
+🎯 ROUTE: [CACHED] -> Instant Sub-10ms Delivery | 0 GPU/CPU Compute
+📚 RETRIEVED: 2 chunks in 0.001s
+----------------------------------------------------------------------
+📝 ANSWER:
+Vermiculite is a secondary hydrated mineral derived from the alteration of phlogopite and biotite micas. It is used in smelter ladles, safe and vault linings, switchboards, and other appliances due to its low thermal conductivity.
+----------------------------------------------------------------------
+⏱️  LATENCY: 0.03s | TTFT: 0.03s | Chunks: 2
+⚡ SPEED: Instant Cache Hit | 0 Compute Cycles
+📚 TOP SOURCES REFERENCED (2 chunks):
+  [1] Studies on vermiculite and its beneficiation https://etd.iisc.ac.in/handle/2005/10003
+  [2] Studies on vermiculite and its beneficiation https://etd.iisc.ac.in/handle/2005/10003
+======================================================================
+```
+
+#### 2. Interactive Terminal Chat REPL
+```bash
+python scripts/query.py
+```
+Provides continuous interactive QA prompting with live streaming answers, route explanations, and institutional document citations.
+
+#### 3. Standard OpenAI-Compatible Endpoint (`/v1/chat/completions`)
+Allows instant integration with standard LLM clients (LangChain, LlamaIndex, OpenAI SDK, LibreChat):
+```bash
+curl -X POST http://127.0.0.1:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "X-User-Email: researcher@iisc.ac.in" \
+  -d '{
+    "model": "rag-hybrid",
+    "messages": [
+      {"role": "user", "content": "What is vermiculite and what are its uses?"}
+    ]
+  }'
+```
+Response format:
+```json
+{
+  "id": "chatcmpl-cached-ac37eb02",
+  "object": "chat.completion",
+  "model": "redis-semantic-cache",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "Vermiculite is a secondary hydrated mineral..."
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": { "prompt_tokens": 0, "completion_tokens": 35, "total_tokens": 35 },
+  "router_meta": {
+    "score": 0.0,
+    "tier": "semantic_cache",
+    "route": "cached",
+    "cached": true,
+    "similarity": 0.9917
+  }
+}
+```
+
+#### 4. High-Throughput Native REST API (`/query`)
+Supports full JSON payloads with retrieval chunk details, similarity scores, and routing metadata:
+```bash
+curl -X POST http://127.0.0.1:8080/query \
+  -H "Content-Type: application/json" \
+  -d '{"query": "Explain barium titanate synthesis.", "stream": false}'
+```
+
+#### 5. Interactive Swagger / OpenAPI Documentation
+Available directly in any browser:
+- Swagger UI: `http://localhost:8080/docs`
+- ReDoc UI: `http://localhost:8080/redoc`
+
+#### Verified Real-World Production Metrics Summary
+
+| Query Scenario | Execution Tier | Complexity Score | Throughput / Speed | End-to-End Latency | Compute Resources |
+|---|---|---|---|---|---|
+| **Hard Multi-Hop Query** | GPU vLLM (`Qwen-7B`) on A100 | $0.8421$ (Hard) | **73.55 tok/s** | 1.84s | GPU VRAM & Tensor Cores |
+| **Easy Direct Fact Query** | CPU SLM (`Qwen-3B`) via AVX-512 | $0.0003$ (Easy) | **14.73 tok/s** | 6.03s | 8 CPU threads (0 GPU) |
+| **Repeat / Semantic Query** | Redis HNSW Vector Cache | $0.0000$ (Cached) | **Instant Retrieval** | **0.03s (30ms)** | 0 Compute Cycles (200x speedup) |
+
+
+
+
+
+
 
 
 

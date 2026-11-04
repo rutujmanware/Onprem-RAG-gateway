@@ -50,9 +50,20 @@ def ask_gateway(query: str, url: str = DEFAULT_GATEWAY_URL, stream: bool = True,
         score = res.get("score", 0.0)
         answer = res.get("answer", "No answer returned.")
         chunks = res.get("chunks", [])
+        is_cached = res.get("cached", False)
+        sim = res.get("similarity")
+        matched = res.get("matched_prompt")
 
         print("\n" + "=" * 70)
-        print(f"🎯 ROUTE: [{route}] -> Tier: {tier} | Model: {model} | Complexity Score: {score}")
+        if is_cached:
+            print(f"⚡ SEMANTIC CACHE: [HIT] (Cosine Similarity: {sim} | Matched: \"{matched}\")")
+            print(f"🤖 PRODUCING MODEL: Redis Semantic Vector Cache (Zero-Compute Instant Retrieval)")
+            print(f"🎯 ROUTE: [CACHED] -> Instant Sub-10ms Delivery | 0 GPU/CPU Compute")
+        else:
+            print(f"⚡ SEMANTIC CACHE: [MISS] (Fresh Inference Generated & Saved)")
+            model_display = model if model != "unknown" else ("Qwen/Qwen2.5-7B-Instruct (GPU vLLM)" if route == "HARD" else "Qwen/Qwen2.5-3B-Instruct (CPU SLM)")
+            print(f"🤖 PRODUCING MODEL: {model_display}")
+            print(f"🎯 ROUTE: [{route}] -> Tier: {tier} | Complexity Score: {score}")
         print(f"⏱️  LATENCY: {elapsed}s | Retrieved Chunks: {len(chunks)}")
         print("=" * 70)
         print("\n📝 ANSWER:\n")
@@ -94,11 +105,23 @@ def ask_gateway(query: str, url: str = DEFAULT_GATEWAY_URL, stream: bool = True,
                 continue
 
             etype = event.get("type")
-            if etype == "route":
+            if etype == "cache":
+                status = event.get("status", "HIT")
+                sim = event.get("similarity", 1.0)
+                matched = event.get("matched_prompt", "")
+                print(f"⚡ SEMANTIC CACHE: [{status}] (Cosine Similarity: {sim:.4f} | Matched: \"{matched}\")")
+                print(f"🤖 PRODUCING MODEL: Redis Semantic Vector Cache (Zero-Compute Retrieval)")
+            elif etype == "route":
                 route = event.get("route", "").upper()
                 tier = event.get("target_tier", "")
                 prob = event.get("probability_hard", 0.0)
-                print(f"🎯 ROUTE: [{route}] -> Target Tier: {tier} | Hard Prob: {prob:.4f}")
+                model_name = "Qwen/Qwen2.5-7B-Instruct (GPU vLLM Tier)" if route == "HARD" else "Qwen/Qwen2.5-3B-Instruct (CPU SLM Tier)"
+                if tier == "semantic_cache":
+                    print(f"🎯 ROUTE: [CACHED] -> Instant Sub-10ms Delivery | 0 GPU/CPU Compute")
+                else:
+                    print(f"⚡ SEMANTIC CACHE: [MISS] (Fresh Inference Triggered)")
+                    print(f"🤖 PRODUCING MODEL: {model_name}")
+                    print(f"🎯 ROUTE: [{route}] -> Target Tier: {tier} | Hard Probability: {prob:.4f}")
             elif etype == "chunks":
                 chunks = event.get("chunks", [])
                 ret_s = event.get("retrieval_seconds", 0.0)
@@ -120,7 +143,9 @@ def ask_gateway(query: str, url: str = DEFAULT_GATEWAY_URL, stream: bool = True,
     print("\n" + "-" * 70)
     ttft_str = f"{ttft}s" if ttft is not None else f"{elapsed}s"
     print(f"⏱️  LATENCY: {elapsed}s | TTFT: {ttft_str} | Chunks: {len(chunks)}")
-    if stats.get("tokens_per_second"):
+    if stats.get("cached"):
+        print("⚡ SPEED: Instant Cache Hit | 0 Compute Cycles")
+    elif stats.get("tokens_per_second"):
         print(f"⚡ SPEED: {stats.get('tokens_per_second')} tok/s | Model: {stats.get('model', 'slm-3b-gguf')}")
 
     if chunks:

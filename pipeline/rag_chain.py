@@ -126,8 +126,16 @@ class RAGQAPipeline:
             server_root = gpu_server_url.rsplit("/v1", 1)[0]
             try:
                 import httpx
-                h_check = httpx.get(f"{server_root}/healthz", timeout=1.0)
-                if h_check.status_code == 200:
+                h_check = None
+                for ep in ["/health", "/healthz"]:
+                    try:
+                        r = httpx.get(f"{server_root}{ep}", timeout=1.0)
+                        if r.status_code == 200:
+                            h_check = r
+                            break
+                    except Exception:
+                        continue
+                if h_check is not None and h_check.status_code == 200:
                     t0_gen = time.time()
                     resp = httpx.post(
                         f"{gpu_server_url}/chat/completions",
@@ -228,6 +236,54 @@ class RAGQAPipeline:
             }
 
         # Step 2: Generate grounded answer via CPU SLM
+        # Option A: Fast HTTP path if CPU SLM daemon is running on port 8082
+        slm_server_url = os.getenv("SLM_BASE_URL", "http://localhost:8082/v1").rstrip("/")
+        server_root = slm_server_url.rsplit("/v1", 1)[0]
+        try:
+            import httpx
+            from pipeline.slm_runner import CPUSLMEngine
+            messages = CPUSLMEngine.build_rag_messages(query, chunks)
+            tokens_to_gen = max_new_tokens or 160
+            h_check = httpx.get(f"{server_root}/healthz", timeout=1.0)
+            if h_check.status_code == 200:
+                t0_gen = time.time()
+                resp = httpx.post(
+                    f"{slm_server_url}/chat/completions",
+                    json={
+                        "messages": messages,
+                        "max_tokens": tokens_to_gen,
+                        "temperature": temperature,
+                    },
+                    timeout=60.0,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                gen_duration = time.time() - t0_gen
+                total_duration = time.time() - t_start
+                ans_text = data["choices"][0]["message"]["content"]
+                tok_count = data.get("usage", {}).get("completion_tokens", len(ans_text.split()))
+                tok_s = round(tok_count / max(gen_duration, 0.001), 2)
+                return {
+                    "query": query,
+                    "answer": ans_text,
+                    "route": "easy",
+                    "target_tier": "cpu_slm",
+                    "probability_hard": easy_prob,
+                    "chunks": chunks,
+                    "stats": {
+                        "retrieval_seconds": round(retrieval_duration, 3),
+                        "generation_seconds": round(gen_duration, 3),
+                        "total_seconds": round(total_duration, 3),
+                        "num_tokens": tok_count,
+                        "tokens_per_second": tok_s,
+                        "model": data.get("model", "qwen2.5-3b-instruct-q4_k_m.gguf"),
+                        "server": "cpu-daemon-port-8082",
+                    },
+                }
+        except Exception:
+            pass
+
+        # Option B: Fallback to in-process CPU SLM
         t0_gen = time.time()
         tokens_to_gen = max_new_tokens or 160
         gen_result = self.slm_engine.answer_rag(
@@ -302,9 +358,14 @@ class RAGQAPipeline:
             stream_via_http = False
             try:
                 import httpx
-                h_check = httpx.get(f"{server_root}/healthz", timeout=1.0)
-                if h_check.status_code == 200:
-                    stream_via_http = True
+                for ep in ["/health", "/healthz"]:
+                    try:
+                        h_check = httpx.get(f"{server_root}{ep}", timeout=1.0)
+                        if h_check.status_code == 200:
+                            stream_via_http = True
+                            break
+                    except Exception:
+                        pass
             except Exception:
                 stream_via_http = False
 
@@ -431,6 +492,79 @@ class RAGQAPipeline:
             }
             return
 
+        # Step 2: Generate grounded answer via CPU SLM
+        # Option A: Fast HTTP streaming path if CPU SLM daemon is running on port 8082
+        slm_server_url = os.getenv("SLM_BASE_URL", "http://localhost:8082/v1").rstrip("/")
+        server_root = slm_server_url.rsplit("/v1", 1)[0]
+        stream_via_slm_http = False
+        try:
+            import httpx
+            h_check = httpx.get(f"{server_root}/healthz", timeout=1.0)
+            if h_check.status_code == 200:
+                stream_via_slm_http = True
+        except Exception:
+            stream_via_slm_http = False
+
+        if stream_via_slm_http:
+            t0_gen = time.time()
+            token_count = 0
+            full_response = []
+            ttft = None
+            try:
+                from pipeline.slm_runner import CPUSLMEngine
+                messages = CPUSLMEngine.build_rag_messages(query, chunks)
+                tokens_to_gen = max_new_tokens or 160
+                with httpx.stream(
+                    "POST",
+                    f"{slm_server_url}/chat/completions",
+                    json={
+                        "messages": messages,
+                        "max_tokens": tokens_to_gen,
+                        "temperature": temperature,
+                        "stream": True,
+                    },
+                    timeout=90.0,
+                ) as response:
+                    for line in response.iter_lines():
+                        if not line or not line.startswith("data: "):
+                            continue
+                        chunk_str = line[6:].strip()
+                        if chunk_str == "[DONE]":
+                            break
+                        try:
+                            chunk_data = json.loads(chunk_str)
+                            delta = chunk_data["choices"][0]["delta"].get("content", "")
+                            if delta:
+                                if ttft is None:
+                                    ttft = round(time.time() - t0_gen, 3)
+                                token_count += 1
+                                full_response.append(delta)
+                                yield {"type": "token", "delta": delta}
+                        except Exception:
+                            continue
+
+                gen_duration = time.time() - t0_gen
+                total_duration = time.time() - t_start
+                tok_per_sec = round(token_count / max(gen_duration, 0.001), 2)
+                yield {
+                    "type": "done",
+                    "full_answer": "".join(full_response),
+                    "stats": {
+                        "retrieval_seconds": round(retrieval_duration, 3),
+                        "generation_seconds": round(gen_duration, 3),
+                        "total_seconds": round(total_duration, 3),
+                        "ttft_seconds": ttft or 0.0,
+                        "num_tokens": token_count,
+                        "tokens_per_second": tok_per_sec,
+                        "model": "qwen2.5-3b-instruct-q4_k_m.gguf",
+                        "server": "cpu-daemon-port-8082",
+                    },
+                }
+                return
+            except Exception:
+                pass
+
+        # Option B: Fallback to in-process CPU SLM streaming
         t0_gen = time.time()
         first_token_time = None
         full_text = []

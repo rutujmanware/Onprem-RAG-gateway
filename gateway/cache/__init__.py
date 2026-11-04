@@ -1,3 +1,6 @@
-from gateway.cache.l0_exact import L0ExactCache
-from gateway.cache.l1_semantic import L1SemanticCache
-__all__ = ["L0ExactCache", "L1SemanticCache"]
+from gateway.cache.redis_semantic_cache import RedisSemanticCache
+
+# Backward-compatible alias for existing imports
+L1SemanticCache = RedisSemanticCache
+
+__all__ = ["RedisSemanticCache", "L1SemanticCache"]

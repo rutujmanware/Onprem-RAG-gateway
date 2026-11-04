@@ -33,12 +33,16 @@ class VLLMClient:
     async def check_health(self) -> bool:
         """Check if GPU LLM service is up and healthy."""
         try:
-            # First try root /healthz on base server
+            # Check /health (vLLM official) or /healthz (FastAPI wrapper)
             server_root = self.base_url.rsplit("/v1", 1)[0]
             async with httpx.AsyncClient(timeout=3.0) as temp_client:
-                r = await temp_client.get(f"{server_root}/healthz")
-                if r.status_code == 200:
-                    return True
+                for endpoint in ["/health", "/healthz"]:
+                    try:
+                        r = await temp_client.get(f"{server_root}{endpoint}")
+                        if r.status_code == 200:
+                            return True
+                    except Exception:
+                        pass
             # Fallback to /models
             resp = await self.client.get("/models")
             return resp.status_code == 200
