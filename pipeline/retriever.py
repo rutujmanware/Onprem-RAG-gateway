@@ -22,9 +22,11 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 import argparse
 import asyncio
+import logging
 import math
+import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 
 # Ensure project root is in sys.path
@@ -43,6 +45,33 @@ except ImportError:
     redis = None
 
 from pipeline.embeddings.embedder import LocalEmbedder
+from pipeline.query_metadata_extractor import QueryMetadataExtractor, ExtractedMetadata
+
+logger = logging.getLogger("pipeline.retriever")
+
+# Internal database keys and binary fields excluded from user responses
+EXCLUDED_CHUNK_KEYS = {
+    "chunk_key",
+    "handle_id",
+    "chunk_index",
+    "chunk_id",
+    "vector",
+    "embedding",
+}
+
+
+def sanitize_chunk(chunk: Dict[str, Any]) -> Dict[str, Any]:
+    """Remove internal chunk database keys and binary vectors from user-facing chunk output."""
+    if not isinstance(chunk, dict):
+        return chunk
+    return {k: v for k, v in chunk.items() if k not in EXCLUDED_CHUNK_KEYS}
+
+
+def sanitize_chunks(chunks: List[Any]) -> List[Dict[str, Any]]:
+    """Sanitize a list of chunks by removing internal database keys."""
+    if not isinstance(chunks, list):
+        return chunks
+    return [sanitize_chunk(c) for c in chunks]
 
 
 def load_env_file():
@@ -67,23 +96,48 @@ load_env_file()
 
 
 class RedisChunkRetriever:
-    """Embeds queries and retrieves the top-k most relevant chunks from Redis."""
+    """Embeds queries and retrieves relevant chunks from Redis using dynamic similarity thresholding."""
+
+    DEFAULT_MIN_SIMILARITY: float = float(os.getenv("RETRIEVAL_MIN_SIMILARITY", "0.52"))
+    DEFAULT_SCORE_MARGIN: float = float(os.getenv("RETRIEVAL_SCORE_MARGIN", "0.10"))
+    DEFAULT_MAX_KNEE_DROP: float = float(os.getenv("RETRIEVAL_MAX_KNEE_DROP", "0.06"))
+    DEFAULT_EF_RUNTIME: int = int(os.getenv("RETRIEVAL_EF_RUNTIME", "64"))
+    DEFAULT_DYNAMIC: bool = os.getenv("RETRIEVAL_DYNAMIC", "true").lower() in ("true", "1", "yes")
+    DEFAULT_METADATA_FILTER: bool = os.getenv("RETRIEVAL_METADATA_FILTER", "true").lower() in ("true", "1", "yes")
 
     def __init__(
         self,
         redis_url: Optional[str] = None,
         index_name: str = "rag_documents_idx",
         vector_dim: int = 384,
-        device: str = "cpu"
+        device: str = "cpu",
+        min_similarity: Optional[float] = None,
+        score_margin: Optional[float] = None,
+        max_knee_drop: Optional[float] = None,
+        ef_runtime: Optional[int] = None,
+        dynamic: Optional[bool] = None,
+        enable_metadata_filter: Optional[bool] = None,
     ):
         self.redis_url = redis_url or os.getenv("REDIS_URL", "redis://localhost:6379/0")
         self.index_name = index_name or os.getenv("REDIS_INDEX_NAME", "rag_documents_idx")
         self.vector_dim = vector_dim
         # Force CPU device for embedding to avoid any GPU/CUDA context driver crashes
         self.embedder = LocalEmbedder(dimension=self.vector_dim, device=device)
+        self.metadata_extractor = QueryMetadataExtractor()
+
+        self.min_similarity = min_similarity if min_similarity is not None else self.DEFAULT_MIN_SIMILARITY
+        self.score_margin = score_margin if score_margin is not None else self.DEFAULT_SCORE_MARGIN
+        self.max_knee_drop = max_knee_drop if max_knee_drop is not None else self.DEFAULT_MAX_KNEE_DROP
+        self.ef_runtime = ef_runtime if ef_runtime is not None else self.DEFAULT_EF_RUNTIME
+        self.dynamic = dynamic if dynamic is not None else self.DEFAULT_DYNAMIC
+        self.enable_metadata_filter = enable_metadata_filter if enable_metadata_filter is not None else self.DEFAULT_METADATA_FILTER
 
     def _build_filter_expression(self, filter_dict: Optional[Dict[str, Any]] = None) -> str:
-        """Format optional metadata filter dictionary into RediSearch query clauses."""
+        """Format optional metadata filter dictionary into RediSearch query clauses.
+
+        Sanitizes punctuation and uses tokenized search so '@department:(Materials Engineering)'
+        matches DSpace fields like 'Materials Engineering (MatEng) / View Item'.
+        """
         if not filter_dict:
             return "*"
         clauses = []
@@ -93,59 +147,270 @@ class RedisChunkRetriever:
             if isinstance(value, (int, float)):
                 clauses.append(f"@{field}:[{value} {value}]")
             else:
-                val_str = str(value).replace('"', '\\"').strip()
-                clauses.append(f'@{field}:"{val_str}"')
+                raw_val = str(value).strip()
+                # Clean punctuation to prevent RediSearch query syntax errors
+                clean_terms = re.findall(r'[A-Za-z0-9_]+', raw_val)
+                if clean_terms:
+                    terms_str = " ".join(clean_terms)
+                    clauses.append(f'@{field}:({terms_str})')
         return " ".join(clauses) if clauses else "*"
 
-    def search(self, query: str, top_k: int = 3, filter_dict: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
-        """Synchronous retrieval: embed query and match against Redis vector index."""
+    @classmethod
+    def filter_dynamic_chunks(
+        cls,
+        chunks: List[Dict[str, Any]],
+        min_similarity: Optional[float] = None,
+        score_margin: Optional[float] = None,
+        max_knee_drop: Optional[float] = None,
+        max_k: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """Filter raw candidate chunks dynamically based on similarity score distribution.
+
+        1. Absolute Relevance Floor (min_similarity, default 0.48):
+           Filters out irrelevant distractor noise and out-of-domain queries.
+        2. Adaptive Relative Margin (score_margin, default 0.10):
+           Keeps subsequent chunks only if their similarity is within score_margin of the top match.
+           If the top match is borderline (< 0.52), margin tightens to 0.05 to prevent noise drift.
+        3. Knee / Elbow Detection (max_knee_drop, default 0.06):
+           Detects steep drops between consecutive ranks and truncates the tail.
+        4. Upper Bound Clamp (max_k):
+           Limits maximum number of returned chunks (e.g. 3 for CPU SLM, 8 for GPU LLM).
+        """
+        if not chunks:
+            return []
+
+        min_sim = min_similarity if min_similarity is not None else cls.DEFAULT_MIN_SIMILARITY
+        margin = score_margin if score_margin is not None else cls.DEFAULT_SCORE_MARGIN
+        knee_drop = max_knee_drop if max_knee_drop is not None else cls.DEFAULT_MAX_KNEE_DROP
+
+        # 1. Filter candidates below absolute minimum similarity floor
+        valid = [c for c in chunks if float(c.get("similarity", 0.0)) >= min_sim]
+        if not valid:
+            return []
+
+        # Ensure sorted descending by similarity
+        valid.sort(key=lambda x: float(x.get("similarity", 0.0)), reverse=True)
+
+        top_sim = float(valid[0].get("similarity", 0.0))
+
+        # Coherence Guard: If top match is borderline (< 0.55), require corroboration.
+        # An isolated single chunk with no closely matching second chunk (within 0.04)
+        # represents an accidental semantic false positive (e.g. tangential keyword match in an unrelated thesis).
+        if top_sim < 0.55:
+            if len(valid) < 2 or (top_sim - float(valid[1].get("similarity", 0.0))) > 0.04:
+                return []
+
+        # If top match is borderline (< 0.55), tighten margin to avoid noise drift
+        effective_margin = margin if top_sim >= 0.55 else min(margin, 0.05)
+
+        selected = [valid[0]]
+        limit = max_k if (max_k is not None and max_k > 0) else len(valid)
+
+        for i in range(1, min(len(valid), limit)):
+            cur = valid[i]
+            sim = float(cur.get("similarity", 0.0))
+            prev_sim = float(valid[i - 1].get("similarity", 0.0))
+
+            # Stop if drop from top match exceeds effective margin
+            if (top_sim - sim) > effective_margin:
+                break
+
+            # Stop if consecutive drop exceeds knee threshold
+            if (prev_sim - sim) > knee_drop:
+                break
+
+            selected.append(cur)
+
+        return selected
+
+    def _execute_knn_search(
+        self,
+        r: Any,
+        text: str,
+        k: int,
+        filter_dict: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Run single KNN RediSearch vector query with optional metadata filter."""
+        query_vec = self.embedder.embed_query(text)
+        vec_bytes = np.array(query_vec, dtype=np.float32).tobytes()
+        base_filter = self._build_filter_expression(filter_dict)
+        search_query = f"({base_filter})=>[KNN {k} @vector $vec EF_RUNTIME {self.ef_runtime} AS score]"
+        results = r.execute_command(
+            "FT.SEARCH",
+            self.index_name,
+            search_query,
+            "PARAMS", "2", "vec", vec_bytes,
+            "SORTBY", "score", "ASC",
+            "DIALECT", "2",
+        )
+        return self._parse_results(results)
+
+    async def _aexecute_knn_search(
+        self,
+        r: Any,
+        text: str,
+        k: int,
+        filter_dict: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Asynchronous single KNN RediSearch vector query with optional metadata filter."""
+        query_vec = self.embedder.embed_query(text)
+        vec_bytes = np.array(query_vec, dtype=np.float32).tobytes()
+        base_filter = self._build_filter_expression(filter_dict)
+        search_query = f"({base_filter})=>[KNN {k} @vector $vec EF_RUNTIME {self.ef_runtime} AS score]"
+        results = await r.execute_command(
+            "FT.SEARCH",
+            self.index_name,
+            search_query,
+            "PARAMS", "2", "vec", vec_bytes,
+            "SORTBY", "score", "ASC",
+            "DIALECT", "2",
+        )
+        return self._parse_results(results)
+
+    def search(
+        self,
+        query: str,
+        top_k: Optional[int] = None,
+        filter_dict: Optional[Dict[str, Any]] = None,
+        dynamic: Optional[bool] = None,
+        min_similarity: Optional[float] = None,
+        score_margin: Optional[float] = None,
+        max_knee_drop: Optional[float] = None,
+        enable_metadata_filter: Optional[bool] = None,
+        include_internal_ids: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """Synchronous retrieval with automated query metadata extraction & hybrid fallback."""
         if not redis:
             raise RuntimeError("The 'redis' package is not installed. Run: pip install redis")
 
-        # 1. Embed query into float32 vector bytes
-        query_vec = self.embedder.embed_query(query)
-        vec_bytes = np.array(query_vec, dtype=np.float32).tobytes()
+        use_dynamic = self.dynamic if dynamic is None else dynamic
+        fetch_k = max(top_k or 8, 12) if use_dynamic else (top_k or 3)
+        use_meta = self.enable_metadata_filter if enable_metadata_filter is None else enable_metadata_filter
 
-        # 2. Search Redis Stack RediSearch vector index
+        # 1. Automatic Query Metadata Extraction
+        extracted_meta: Optional[ExtractedMetadata] = None
+        effective_filter = filter_dict
+        search_text = query
+
+        if use_meta and filter_dict is None:
+            extracted_meta = self.metadata_extractor.extract(query)
+            if extracted_meta.has_filters:
+                effective_filter = extracted_meta.filters
+                search_text = extracted_meta.clean_query
+
+        # 2. Stage 1: Execute search (filtered if metadata detected)
         r = redis.from_url(self.redis_url, encoding="utf-8", decode_responses=False)
+        fallback_triggered = False
         try:
-            base_filter = self._build_filter_expression(filter_dict)
-            search_query = f"({base_filter})=>[KNN {top_k} @vector $vec AS score]"
-            results = r.execute_command(
-                "FT.SEARCH",
-                self.index_name,
-                search_query,
-                "PARAMS", "2", "vec", vec_bytes,
-                "SORTBY", "score", "ASC",
-                "DIALECT", "2",
-            )
-            return self._parse_results(results)
+            raw_hits = self._execute_knn_search(r, search_text, fetch_k, effective_filter)
+
+            # 3. Stage 2: Hybrid Fallback Check
+            # If filtered search produced 0 matches, fall back to unconstrained search on raw query!
+            if not raw_hits and effective_filter:
+                logger.info(
+                    "Hybrid fallback: Filtered search with %s yielded 0 results. Falling back to full corpus vector search.",
+                    effective_filter
+                )
+                fallback_triggered = True
+                raw_hits = self._execute_knn_search(r, query, fetch_k, filter_dict=None)
         finally:
             r.close()
 
-    async def asearch(self, query: str, top_k: int = 3, filter_dict: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
-        """Asynchronous retrieval for async applications."""
+        if not use_dynamic:
+            final_chunks = raw_hits[:top_k] if top_k else raw_hits
+        else:
+            eff_min_sim = min_similarity if min_similarity is not None else self.min_similarity
+            eff_margin = score_margin if score_margin is not None else self.score_margin
+            eff_knee = max_knee_drop if max_knee_drop is not None else self.max_knee_drop
+            final_chunks = self.filter_dynamic_chunks(
+                raw_hits,
+                min_similarity=eff_min_sim,
+                score_margin=eff_margin,
+                max_knee_drop=eff_knee,
+                max_k=top_k,
+            )
+
+        # Annotate chunks with metadata tracking
+        for c in final_chunks:
+            if extracted_meta and extracted_meta.has_filters:
+                c["metadata_filter_extracted"] = extracted_meta.filters
+                c["metadata_filter_applied"] = not fallback_triggered
+                c["metadata_fallback_used"] = fallback_triggered
+
+        if not include_internal_ids:
+            final_chunks = sanitize_chunks(final_chunks)
+
+        return final_chunks
+
+    async def asearch(
+        self,
+        query: str,
+        top_k: Optional[int] = None,
+        filter_dict: Optional[Dict[str, Any]] = None,
+        dynamic: Optional[bool] = None,
+        min_similarity: Optional[float] = None,
+        score_margin: Optional[float] = None,
+        max_knee_drop: Optional[float] = None,
+        enable_metadata_filter: Optional[bool] = None,
+        include_internal_ids: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """Asynchronous retrieval with automated query metadata extraction & hybrid fallback."""
         if not aioredis:
             raise RuntimeError("The 'redis' package is not installed. Run: pip install redis")
 
-        query_vec = self.embedder.embed_query(query)
-        vec_bytes = np.array(query_vec, dtype=np.float32).tobytes()
+        use_dynamic = self.dynamic if dynamic is None else dynamic
+        fetch_k = max(top_k or 8, 12) if use_dynamic else (top_k or 3)
+        use_meta = self.enable_metadata_filter if enable_metadata_filter is None else enable_metadata_filter
+
+        extracted_meta: Optional[ExtractedMetadata] = None
+        effective_filter = filter_dict
+        search_text = query
+
+        if use_meta and filter_dict is None:
+            extracted_meta = self.metadata_extractor.extract(query)
+            if extracted_meta.has_filters:
+                effective_filter = extracted_meta.filters
+                search_text = extracted_meta.clean_query
 
         r = aioredis.from_url(self.redis_url, encoding="utf-8", decode_responses=False)
+        fallback_triggered = False
         try:
-            base_filter = self._build_filter_expression(filter_dict)
-            search_query = f"({base_filter})=>[KNN {top_k} @vector $vec AS score]"
-            results = await r.execute_command(
-                "FT.SEARCH",
-                self.index_name,
-                search_query,
-                "PARAMS", "2", "vec", vec_bytes,
-                "SORTBY", "score", "ASC",
-                "DIALECT", "2",
-            )
-            return self._parse_results(results)
+            raw_hits = await self._aexecute_knn_search(r, search_text, fetch_k, effective_filter)
+
+            if not raw_hits and effective_filter:
+                logger.info(
+                    "Async hybrid fallback: Filtered search with %s yielded 0 results. Falling back to full corpus vector search.",
+                    effective_filter
+                )
+                fallback_triggered = True
+                raw_hits = await self._aexecute_knn_search(r, query, fetch_k, filter_dict=None)
         finally:
             await r.aclose()
+
+        if not use_dynamic:
+            final_chunks = raw_hits[:top_k] if top_k else raw_hits
+        else:
+            eff_min_sim = min_similarity if min_similarity is not None else self.min_similarity
+            eff_margin = score_margin if score_margin is not None else self.score_margin
+            eff_knee = max_knee_drop if max_knee_drop is not None else self.max_knee_drop
+            final_chunks = self.filter_dynamic_chunks(
+                raw_hits,
+                min_similarity=eff_min_sim,
+                score_margin=eff_margin,
+                max_knee_drop=eff_knee,
+                max_k=top_k,
+            )
+
+        for c in final_chunks:
+            if extracted_meta and extracted_meta.has_filters:
+                c["metadata_filter_extracted"] = extracted_meta.filters
+                c["metadata_filter_applied"] = not fallback_triggered
+                c["metadata_fallback_used"] = fallback_triggered
+
+        if not include_internal_ids:
+            final_chunks = sanitize_chunks(final_chunks)
+
+        return final_chunks
 
     def _parse_results(self, results: Any) -> List[Dict[str, Any]]:
         if not results:
@@ -167,6 +432,8 @@ class RedisChunkRetriever:
                     if isinstance(attrs, dict):
                         for k, v in attrs.items():
                             str_k = k.decode("utf-8") if isinstance(k, bytes) else str(k)
+                            if str_k in ("vector", "embedding"):
+                                continue
                             str_v = v.decode("utf-8", errors="ignore") if isinstance(v, bytes) else str(v)
                             chunk_data[str_k] = str_v
 
@@ -187,7 +454,7 @@ class RedisChunkRetriever:
             for doc in results.docs:
                 chunk_data = {"chunk_key": getattr(doc, "id", "")}
                 for attr, val in doc.__dict__.items():
-                    if attr in ("id", "payload"):
+                    if attr in ("id", "payload", "vector", "embedding"):
                         continue
                     if isinstance(val, bytes):
                         val = val.decode("utf-8", errors="ignore")
@@ -202,7 +469,7 @@ class RedisChunkRetriever:
                 hits.append(chunk_data)
             return hits
 
-        # Case 2: Raw list/tuple from redis execute_command
+        # Case 3: Raw list/tuple from redis execute_command
         if isinstance(results, (list, tuple)):
             if len(results) == 0 or results[0] == 0:
                 return []
@@ -220,6 +487,8 @@ class RedisChunkRetriever:
                     if isinstance(fields, dict):
                         for k, v in fields.items():
                             str_k = k.decode("utf-8") if isinstance(k, bytes) else str(k)
+                            if str_k in ("vector", "embedding"):
+                                continue
                             str_v = v.decode("utf-8", errors="ignore") if isinstance(v, bytes) else str(v)
                             chunk_data[str_k] = str_v
                     # If fields is an alternating list [k1, v1, k2, v2, ...]
@@ -227,6 +496,8 @@ class RedisChunkRetriever:
                         for j in range(0, len(fields), 2):
                             if j + 1 < len(fields):
                                 k = fields[j].decode("utf-8") if isinstance(fields[j], bytes) else str(fields[j])
+                                if k in ("vector", "embedding"):
+                                    continue
                                 v = fields[j + 1].decode("utf-8", errors="ignore") if isinstance(fields[j + 1], bytes) else str(fields[j + 1])
                                 chunk_data[k] = v
 
@@ -242,19 +513,45 @@ class RedisChunkRetriever:
 
 def retrieve_chunks(
     query: str,
-    top_k: int = 3,
+    top_k: Optional[int] = None,
     filter_dict: Optional[Dict[str, Any]] = None,
-    redis_url: Optional[str] = None
+    redis_url: Optional[str] = None,
+    dynamic: Optional[bool] = None,
+    min_similarity: Optional[float] = None,
+    score_margin: Optional[float] = None,
+    max_knee_drop: Optional[float] = None,
+    enable_metadata_filter: Optional[bool] = None,
 ) -> List[Dict[str, Any]]:
     """Convenience helper function to retrieve chunks in one line."""
-    retriever = RedisChunkRetriever(redis_url=redis_url)
-    return retriever.search(query, top_k=top_k, filter_dict=filter_dict)
+    retriever = RedisChunkRetriever(
+        redis_url=redis_url,
+        min_similarity=min_similarity,
+        score_margin=score_margin,
+        max_knee_drop=max_knee_drop,
+        dynamic=dynamic,
+        enable_metadata_filter=enable_metadata_filter,
+    )
+    return retriever.search(
+        query,
+        top_k=top_k,
+        filter_dict=filter_dict,
+        dynamic=dynamic,
+        min_similarity=min_similarity,
+        score_margin=score_margin,
+        max_knee_drop=max_knee_drop,
+        enable_metadata_filter=enable_metadata_filter,
+    )
 
 
 def main():
     parser = argparse.ArgumentParser(description="Test chunk retrieval against Redis Vector Database")
     parser.add_argument("query", nargs="?", default=None, help="The search query text")
-    parser.add_argument("-k", "--top-k", type=int, default=3, help="Number of chunks to retrieve (default: 3)")
+    parser.add_argument("-k", "--top-k", type=int, default=None, help="Maximum number of chunks to retrieve (default: 8 dynamic, 3 static)")
+    parser.add_argument("--min-sim", type=float, default=None, help="Minimum cosine similarity floor (default: 0.48)")
+    parser.add_argument("--margin", type=float, default=None, help="Max score margin from top candidate (default: 0.10)")
+    parser.add_argument("--knee-drop", type=float, default=None, help="Max drop between consecutive candidates (default: 0.06)")
+    parser.add_argument("--static", action="store_true", help="Disable dynamic filtering and retrieve static top-k")
+    parser.add_argument("--no-meta-filter", action="store_true", help="Disable automated query metadata extraction")
     parser.add_argument("--index", default=os.getenv("REDIS_INDEX_NAME", "rag_documents_idx"), help="RediSearch index name")
     parser.add_argument("--redis-url", default=os.getenv("REDIS_URL", "redis://localhost:6379/0"), help="Redis URL")
 
@@ -266,30 +563,67 @@ def main():
         print("  python retriever.py \"deep learning for semantic segmentation\"\n")
         sys.exit(1)
 
+    use_dynamic = not args.static
+    use_meta = not args.no_meta_filter
     print("=" * 70)
-    print("🔍 CHUNK RETRIEVER")
+    print("🔍 DYNAMIC CHUNK RETRIEVER (WITH HYBRID METADATA FALLBACK)")
     print("=" * 70)
     print(f"📡 Redis URL   : {args.redis_url}")
     print(f"📑 Index       : {args.index}")
-    print(f"🎯 Top-K       : {args.top_k}")
+    print(f"⚙️  Strategy    : {'⚡ DYNAMIC SCORE-BASED' if use_dynamic else '🔒 STATIC TOP-K'}")
+    print(f"🏷️  Meta Filter : {'✅ ENABLED (HYBRID FALLBACK)' if use_meta else '❌ DISABLED'}")
+    if use_dynamic:
+        print(f"🎯 Min Sim Floor: {args.min_sim or RedisChunkRetriever.DEFAULT_MIN_SIMILARITY} | Margin: {args.margin or RedisChunkRetriever.DEFAULT_SCORE_MARGIN} | Knee Drop: {args.knee_drop or RedisChunkRetriever.DEFAULT_MAX_KNEE_DROP}")
+        print(f"📊 Upper Bound : {args.top_k or 'Uncapped (Pool: 12)'}")
+    else:
+        print(f"🎯 Static K    : {args.top_k or 3}")
     print(f"❓ Query       : \"{args.query}\"")
     print("-" * 70)
 
     try:
-        retriever = RedisChunkRetriever(redis_url=args.redis_url, index_name=args.index)
+        retriever = RedisChunkRetriever(
+            redis_url=args.redis_url,
+            index_name=args.index,
+            min_similarity=args.min_sim,
+            score_margin=args.margin,
+            max_knee_drop=args.knee_drop,
+            dynamic=use_dynamic,
+            enable_metadata_filter=use_meta,
+        )
+
+        if use_meta:
+            extracted_meta = retriever.metadata_extractor.extract(args.query)
+            if extracted_meta.has_filters:
+                print(f"🏷️  Auto-Extracted Filters: {extracted_meta.filters}")
+                print(f"🧹 Clean Semantic Query  : \"{extracted_meta.clean_query}\"")
+                print("-" * 70)
 
         print("⚡ 1. Embedding query text (CPU)...")
         emb = retriever.embedder.embed_query(args.query)
         print(f"   ✓ Vector embedded (Dimensions: {len(emb)})")
 
-        print("⚡ 2. Searching Redis Vector Database (KNN)...")
-        chunks = retriever.search(args.query, top_k=args.top_k)
+        print("⚡ 2. Searching Redis Vector Database...")
+        chunks = retriever.search(
+            args.query,
+            top_k=args.top_k,
+            dynamic=use_dynamic,
+            min_similarity=args.min_sim,
+            score_margin=args.margin,
+            max_knee_drop=args.knee_drop,
+            enable_metadata_filter=use_meta,
+        )
 
         if not chunks:
-            print(f"\n⚠️  No matching chunks found in index '{args.index}'.")
+            print(f"\n⚠️  No relevant chunks passed similarity threshold for index '{args.index}'.")
+            print("💡 The query appears to be out-of-domain or has insufficient semantic match.")
             return
 
-        print(f"\n✅ Retrieved {len(chunks)} chunks from Redis:\n")
+        if chunks[0].get("metadata_fallback_used"):
+            print(f"\n⚠️  [HYBRID FALLBACK USED] Metadata filter {chunks[0].get('metadata_filter_extracted')} returned 0 results. Successfully fell back to full corpus vector search!")
+        elif chunks[0].get("metadata_filter_applied"):
+            print(f"\n🎯 [METADATA FILTER APPLIED] Search constrained to: {chunks[0].get('metadata_filter_extracted')}")
+
+        print(f"\n✅ Dynamically Retrieved {len(chunks)} chunks from Redis:\n")
         for i, chunk in enumerate(chunks, 1):
             sim_pct = chunk.get("similarity", 0.0) * 100
             print(f"[{i}] {chunk.get('chunk_key')}  |  Cosine Similarity: {sim_pct:.2f}%")
@@ -299,6 +633,8 @@ def main():
                 print(f"    Author     : {chunk['author']}")
             if chunk.get("department"):
                 print(f"    Department : {chunk['department']}")
+            if chunk.get("advisor"):
+                print(f"    Advisor    : {chunk['advisor']}")
             content_preview = chunk.get("content", "").replace("\n", " ")[:300]
             print(f"    Content    : \"{content_preview}...\"\n")
 

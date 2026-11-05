@@ -52,7 +52,7 @@ class VLLMClient:
     async def generate_chat(
         self,
         messages: List[Dict[str, str]],
-        max_tokens: int = 512,
+        max_tokens: int = 1024,
         temperature: float = 0.2,
         top_p: float = 0.8,
         **kwargs,
@@ -75,7 +75,7 @@ class VLLMClient:
     async def generate_chat_stream(
         self,
         messages: List[Dict[str, str]],
-        max_tokens: int = 512,
+        max_tokens: int = 1024,
         temperature: float = 0.2,
         top_p: float = 0.8,
         **kwargs,

@@ -119,6 +119,11 @@ test:
 	PYTHONPATH=. $(PYTHON) tests/test_rate_limiting.py
 	PYTHONPATH=. $(PYTHON) tests/test_cache_hits.py
 	PYTHONPATH=. $(PYTHON) -m unittest tests/test_cache_insufficient_data.py
+	PYTHONPATH=. $(PYTHON) -m unittest tests/test_dynamic_retrieval.py
+	PYTHONPATH=. $(PYTHON) -m unittest tests/test_query_metadata_extractor.py
+
+test-intensive:
+	PYTHONPATH=. $(PYTHON) tests/test_intensive_full_stack.py
 
 clean:
 	find . -type d -name "__pycache__" -exec rm -rf {} +

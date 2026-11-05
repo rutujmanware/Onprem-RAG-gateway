@@ -27,6 +27,7 @@ from gateway.router.dispatcher import ModelTier, RequestDispatcher
 from gateway.clients.cpu_slm_client import CPUSLMClient
 from gateway.clients.vllm_client import VLLMClient
 from pipeline.rag_chain import RAGQAPipeline
+from pipeline.retriever import sanitize_chunks
 
 logger = logging.getLogger("gateway.main")
 
@@ -62,14 +63,14 @@ class ChatMessage(BaseModel):
 class ChatCompletionRequest(BaseModel):
     messages: List[ChatMessage]
     temperature: Optional[float] = 0.2
-    max_tokens: Optional[int] = 160
+    max_tokens: Optional[int] = None
     stream: Optional[bool] = False
 
 class DirectQueryRequest(BaseModel):
     query: str
     top_k: Optional[int] = 3
     temperature: Optional[float] = 0.2
-    max_tokens: Optional[int] = 160
+    max_tokens: Optional[int] = None
     stream: Optional[bool] = False
 
 @app.get("/healthz")
@@ -209,7 +210,7 @@ async def chat_completions(
             full_ans = []
             for event in rag.answer_query_stream(
                 query,
-                max_new_tokens=req.max_tokens or 160,
+                max_new_tokens=req.max_tokens,
                 temperature=req.temperature or 0.2,
             ):
                 if event.get("type") == "token":
@@ -262,12 +263,13 @@ async def chat_completions(
 
     # Step 2: Route Enforcement for Hard Queries -> GPU LLM Tier (Qwen 2.5 7B)
     if decision.target_tier == ModelTier.GPU_LLM:
+        gpu_max_tokens = req.max_tokens if (req.max_tokens is not None and req.max_tokens > 0) else 1024
         vllm_up = await vllm.check_health()
         if vllm_up:
             try:
                 resp = await vllm.generate_chat(
                     [{"role": m.role, "content": m.content} for m in req.messages],
-                    max_tokens=req.max_tokens or 512,
+                    max_tokens=gpu_max_tokens,
                     temperature=req.temperature or 0.2,
                 )
                 resp["router_meta"] = {
@@ -290,7 +292,7 @@ async def chat_completions(
             engine = GPULLMEngine.get_instance()
             gpu_res = engine.generate_chat(
                 [{"role": m.role, "content": m.content} for m in req.messages],
-                max_new_tokens=req.max_tokens or 512,
+                max_new_tokens=gpu_max_tokens,
                 temperature=req.temperature or 0.2,
             )
             ans_text = gpu_res["text"]
@@ -322,12 +324,13 @@ async def chat_completions(
             raise HTTPException(status_code=500, detail=f"GPU LLM generation failed: {str(e)}")
 
     # Step 3: Easy Queries -> CPU SLM Tier (Qwen 2.5 3B)
+    slm_max_tokens = req.max_tokens if (req.max_tokens is not None and req.max_tokens > 0) else 160
     slm_up = await slm.check_health()
     if slm_up:
         try:
             resp = await slm.generate_chat(
                 [{"role": m.role, "content": m.content} for m in req.messages],
-                max_tokens=req.max_tokens or 160,
+                max_tokens=slm_max_tokens,
                 temperature=req.temperature or 0.2,
             )
             resp["router_meta"] = {
@@ -348,7 +351,7 @@ async def chat_completions(
     rag_res = await run_in_threadpool(
         rag.answer_query,
         query,
-        max_new_tokens=req.max_tokens or 160,
+        max_new_tokens=slm_max_tokens,
         temperature=req.temperature or 0.2,
     )
     ans_text = rag_res.get("answer", "")
@@ -412,7 +415,7 @@ async def query_endpoint(
                 # Yield route event
                 yield f"data: {json.dumps({'type': 'route', 'route': cached_resp.get('route', 'cached'), 'target_tier': 'semantic_cache', 'probability_hard': 0.0})}\n\n"
                 # Yield chunks event
-                chunks = cached_resp.get("chunks", [])
+                chunks = sanitize_chunks(cached_resp.get("chunks", []))
                 yield f"data: {json.dumps({'type': 'chunks', 'chunks': chunks, 'retrieval_seconds': 0.001})}\n\n"
                 # Stream cached answer tokens
                 ans = cached_resp.get("answer", "")
@@ -435,6 +438,8 @@ async def query_endpoint(
             )
 
         # Non-streaming cache hit
+        if "chunks" in cached_resp:
+            cached_resp["chunks"] = sanitize_chunks(cached_resp["chunks"])
         cached_resp["cached"] = True
         cached_resp["cache_hit"] = True
         cached_resp["similarity"] = sim
@@ -453,14 +458,15 @@ async def query_endpoint(
             for event in rag.answer_query_stream(
                 query,
                 top_k=req.top_k,
-                max_new_tokens=req.max_tokens or 160,
+                max_new_tokens=req.max_tokens,
                 temperature=req.temperature or 0.2,
             ):
                 etype = event.get("type")
                 if etype == "token":
                     collected_answer.append(event.get("delta", ""))
                 elif etype == "chunks":
-                    collected_chunks = event.get("chunks", [])
+                    event["chunks"] = sanitize_chunks(event.get("chunks", []))
+                    collected_chunks = event["chunks"]
                 elif etype == "route":
                     route_info = event
                 yield f"data: {json.dumps(event)}\n\n"
@@ -494,16 +500,33 @@ async def query_endpoint(
     decision = dispatcher.decide(score)
 
     if decision.target_tier == ModelTier.GPU_LLM:
+        gpu_max_tokens = req.max_tokens if (req.max_tokens is not None and req.max_tokens > 0) else 1024
         from pipeline.retriever import RedisChunkRetriever
         from pipeline.gpu_llm_runner import GPULLMEngine
 
         retriever = RedisChunkRetriever()
         t0_ret = time.time()
         try:
-            chunks = retriever.search(query, top_k=req.top_k or 5)
+            chunks = retriever.search(query, top_k=req.top_k or 8)
         except Exception:
             chunks = []
         ret_time = round(time.time() - t0_ret, 3)
+
+        if not chunks:
+            return {
+                "query": query,
+                "answer": "No relevant documents were found in the knowledge base matching your query.",
+                "route": "hard",
+                "target_tier": "gpu_vllm",
+                "model": "retriever-filter",
+                "score": round(score, 4),
+                "chunks": [],
+                "cached": False,
+                "stats": {
+                    "retrieval_seconds": ret_time,
+                    "routing_time_seconds": round(time.time() - t0, 4),
+                },
+            }
 
         vllm_up = await vllm.check_health()
         if vllm_up:
@@ -511,7 +534,7 @@ async def query_endpoint(
                 messages = GPULLMEngine.build_rag_messages(query, chunks)
                 resp = await vllm.generate_chat(
                     messages,
-                    max_tokens=req.max_tokens or 512,
+                    max_tokens=gpu_max_tokens,
                     temperature=req.temperature or 0.2,
                 )
                 answer_text = resp["choices"][0]["message"]["content"]
@@ -522,7 +545,7 @@ async def query_endpoint(
                     "target_tier": "gpu_vllm",
                     "model": resp.get("model", "Qwen/Qwen2.5-7B-Instruct"),
                     "score": round(score, 4),
-                    "chunks": chunks,
+                    "chunks": sanitize_chunks(chunks),
                     "cached": False,
                     "stats": {
                         "retrieval_seconds": ret_time,
@@ -538,23 +561,28 @@ async def query_endpoint(
         res = rag.answer_query(
             query,
             top_k=req.top_k or 5,
-            max_new_tokens=req.max_tokens or 512,
+            max_new_tokens=gpu_max_tokens,
             temperature=req.temperature or 0.2,
         )
+        if "chunks" in res:
+            res["chunks"] = sanitize_chunks(res["chunks"])
         res["cached"] = False
         res["routing_time_seconds"] = round(time.time() - t0, 4)
         await cache.astore(query, res)
         return res
 
     # Route: Easy -> CPU SLM
+    slm_max_tokens = req.max_tokens if (req.max_tokens is not None and req.max_tokens > 0) else 160
     rag = RAGQAPipeline(top_k=req.top_k)
     res = await run_in_threadpool(
         rag.answer_query,
         query,
         top_k=req.top_k,
-        max_new_tokens=req.max_tokens or 160,
+        max_new_tokens=slm_max_tokens,
         temperature=req.temperature or 0.2,
     )
+    if "chunks" in res:
+        res["chunks"] = sanitize_chunks(res["chunks"])
     res["route"] = "easy"
     res["target_tier"] = "cpu_slm"
     res["score"] = round(score, 4)
