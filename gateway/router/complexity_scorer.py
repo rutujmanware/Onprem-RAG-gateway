@@ -29,7 +29,19 @@ class ComplexityScorer:
             logger.warning(f"ComplexityScorer: Neural router not loaded ({e}), falling back to heuristic scorer.")
 
     async def score(self, query: str, embedding=None) -> float:
-        # Priority 1: Neural MLP Router
+        # Priority 0: Dedicated Router Microservice on Port 8090 (if running)
+        router_url = os.getenv("ROUTER_BASE_URL", "http://127.0.0.1:8090").rstrip("/")
+        try:
+            import httpx
+            async with httpx.AsyncClient(timeout=0.8) as client:
+                r = await client.post(f"{router_url}/score", json={"query": query})
+                if r.status_code == 200:
+                    data = r.json()
+                    return max(0.01, min(0.99, float(data["score"])))
+        except Exception:
+            pass
+
+        # Priority 1: In-Process Neural MLP Router (< 5ms)
         if self.router is not None:
             try:
                 res = self.router.predict(query)

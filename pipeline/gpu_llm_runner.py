@@ -71,7 +71,7 @@ class GPULLMEngine:
     def generate_chat(
         self,
         messages: List[Dict[str, str]],
-        max_new_tokens: int = 512,
+        max_new_tokens: int = 1024,
         temperature: float = 0.2,
         top_p: float = 0.8,
         do_sample: bool = False,
@@ -124,7 +124,7 @@ class GPULLMEngine:
     def generate_chat_stream(
         self,
         messages: List[Dict[str, str]],
-        max_new_tokens: int = 512,
+        max_new_tokens: int = 1024,
         temperature: float = 0.2,
         top_p: float = 0.8,
         do_sample: bool = False,
@@ -181,19 +181,21 @@ class GPULLMEngine:
                 "Your objective is to provide comprehensive, accurate, and deeply reasoned answers using strictly "
                 "the provided context chunks from research theses and academic literature.\n\n"
                 "Strict Guidelines:\n"
-                "1. Synthesize trade-offs, methodologies, and cross-cutting findings clearly across multiple documents.\n"
-                "2. When comparing concepts, systematically evaluate advantages, limitations, and empirical results.\n"
-                "3. Cite your sources clearly using the document Title or Chunk ID for each key finding (e.g., [Source: <Title>]).\n"
-                "4. If the provided context is genuinely insufficient to complete a proof or comparison, explicitly specify what is missing.\n"
-                "5. Maintain academic rigor, precision, and clarity."
+                "1. Provide a comprehensive, in-depth explanation structured with clear thematic sections or markdown headers.\n"
+                "2. Synthesize trade-offs, methodologies, and cross-cutting findings thoroughly across multiple documents.\n"
+                "3. When comparing concepts, systematically evaluate advantages, limitations, and empirical results.\n"
+                "4. When derivations, equations, or physical mechanisms are discussed, explain them step-by-step with full technical depth.\n"
+                "5. Cite your sources clearly using the document Title (e.g., [Source: <Title>]) or [Document i].\n"
+                "6. Strict Grounding & Refusal: If the provided context is genuinely insufficient or does not specifically answer the research question, explicitly state: \"Based on the provided documents, there is insufficient information to answer this question.\" Do not speculate or extrapolate from tangential mentions.\n"
+                "7. Maintain academic rigor, precision, and clarity. Avoid brief or superficial summaries; provide detailed, thorough answers.\n"
+                "8. Conclude your answer with a synthesis summary or concluding remarks, ensuring complete closure."
             )
 
         context_blocks = []
         for i, chunk in enumerate(context_chunks, 1):
             title = chunk.get("title", "Untitled Document")
-            chunk_id = chunk.get("chunk_key", f"chunk_{i}")
             content = chunk.get("content", "").strip()
-            header = f"--- Document [{i}]: {title} ({chunk_id}) ---"
+            header = f"--- Document [{i}]: {title} ---"
             context_blocks.append(f"{header}\n{content}")
 
         context_str = "\n\n".join(context_blocks)
@@ -212,7 +214,7 @@ class GPULLMEngine:
         self,
         question: str,
         context_chunks: List[Dict[str, Any]],
-        max_new_tokens: int = 512,
+        max_new_tokens: int = 1024,
         temperature: float = 0.2,
         system_prompt: Optional[str] = None,
     ) -> Dict[str, Any]:

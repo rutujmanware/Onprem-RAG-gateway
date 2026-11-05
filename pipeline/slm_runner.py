@@ -263,10 +263,10 @@ class CPUSLMEngine:
                 "Strict Guidelines:\n"
                 "1. Answer concisely and directly in 2 to 4 factual sentences based strictly on the provided context.\n"
                 "2. Avoid unnecessary background introductions, preamble, or repetition.\n"
-                "3. If the context does not contain enough information to answer the question, state: "
+                "3. Strict Grounding & Refusal: If the provided documents do not directly, specifically, and unambiguously answer the user's question, you MUST refuse and state: "
                 "\"Based on the provided documents, there is insufficient information to answer this question.\" "
-                "Do not speculate or extrapolate beyond the text.\n"
-                "4. Cite your sources clearly using the document Title or Chunk ID for each key point (e.g., [Source: <Title>]).\n"
+                "Do NOT attempt to infer, extrapolate, speculate, or synthesize an answer from tangential, passing, or out-of-context mentions.\n"
+                "4. Cite your sources clearly using the document Title (e.g., [Source: <Title>]) or [Document i]. Never fabricate or cite internal chunk keys/IDs.\n"
                 "5. Keep the answer clear, structured, and factual."
             )
 
@@ -274,16 +274,12 @@ class CPUSLMEngine:
         for i, chunk in enumerate(context_chunks, 1):
             title = chunk.get("title", "Unknown Title")
             author = chunk.get("author", "Unknown Author")
-            handle = chunk.get("handle_id", "")
-            chunk_id = chunk.get("chunk_key", f"Chunk_{i}")
             content = chunk.get("content", "").strip()
 
             header = f"[Document {i} | Title: {title}"
             if author and author != "Unknown Author":
                 header += f" | Author: {author}"
-            if handle:
-                header += f" | Handle: {handle}"
-            header += f" | ID: {chunk_id}]"
+            header += "]"
 
             context_blocks.append(f"{header}\n{content}")
 

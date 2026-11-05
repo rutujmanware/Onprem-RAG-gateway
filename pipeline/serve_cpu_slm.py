@@ -103,6 +103,9 @@ def chat_completions(req: ChatCompletionRequest):
     if not raw_messages:
         raise HTTPException(status_code=400, detail="Messages list cannot be empty.")
 
+    query_snippet = raw_messages[-1]["content"][:60].replace("\n", " ")
+    print(f"\n📥 [SLM Port 8082] Received Request | Stream: {req.stream} | Tokens: {req.max_tokens or 512} | Prompt: \"{query_snippet}...\"")
+
     do_sample = (req.temperature is not None and req.temperature > 0)
     temp = req.temperature if req.temperature is not None else 0.7
     top_p = req.top_p if req.top_p is not None else 0.8
@@ -113,6 +116,8 @@ def chat_completions(req: ChatCompletionRequest):
             def event_generator():
                 cmpl_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
                 created_ts = int(time.time())
+                t0_stream = time.time()
+                streamed_tokens = 0
                 for chunk_text in engine.generate_chat_stream(
                     messages=raw_messages,
                     max_new_tokens=max_tokens,
@@ -120,6 +125,7 @@ def chat_completions(req: ChatCompletionRequest):
                     top_p=top_p,
                     do_sample=do_sample,
                 ):
+                    streamed_tokens += 1
                     data = {
                         "id": cmpl_id,
                         "object": "chat.completion.chunk",
@@ -134,6 +140,10 @@ def chat_completions(req: ChatCompletionRequest):
                         ],
                     }
                     yield f"data: {json.dumps(data)}\n\n"
+
+                gen_sec = max(time.time() - t0_stream, 0.001)
+                tok_s = round(streamed_tokens / gen_sec, 2)
+                print(f"⚡ [SLM Port 8082] Completed Stream | {streamed_tokens} tokens in {gen_sec:.2f}s ({tok_s} tok/s)")
 
                 done_data = {
                     "id": cmpl_id,
@@ -153,6 +163,7 @@ def chat_completions(req: ChatCompletionRequest):
 
             return StreamingResponse(event_generator(), media_type="text/event-stream")
 
+        t0_gen = time.time()
         result = engine.generate_chat(
             messages=raw_messages,
             max_new_tokens=max_tokens,
@@ -160,6 +171,8 @@ def chat_completions(req: ChatCompletionRequest):
             top_p=top_p,
             do_sample=do_sample,
         )
+        gen_sec = max(time.time() - t0_gen, 0.001)
+        print(f"⚡ [SLM Port 8082] Completed Generation | {result['num_tokens']} tokens in {gen_sec:.2f}s ({result.get('tokens_per_second', 0)} tok/s)")
 
         cmpl_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
         return {

@@ -63,7 +63,7 @@ class ChatCompletionRequest(BaseModel):
     messages: List[ChatMessage]
     temperature: Optional[float] = 0.2
     top_p: Optional[float] = 0.8
-    max_tokens: Optional[int] = Field(default=512, alias="max_tokens")
+    max_tokens: Optional[int] = Field(default=768, alias="max_tokens")
     stream: Optional[bool] = False
 
 
@@ -118,7 +118,7 @@ def chat_completions(req: ChatCompletionRequest):
     do_sample = (req.temperature is not None and req.temperature > 0)
     temp = req.temperature if req.temperature is not None else 0.2
     top_p = req.top_p if req.top_p is not None else 0.8
-    max_tokens = req.max_tokens or 512
+    max_tokens = req.max_tokens or 768
 
     try:
         if req.stream:
