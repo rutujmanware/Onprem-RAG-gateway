@@ -1,0 +1,74 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AskIISc</title>
+<style>
+:root{--bg:#fafaf8;--fg:#1c1c1a;--mut:#6b6b66;--card:#fff;--bd:#e3e2dc;--ac:#7a1f2b;--slm:#2b6e4f;--llm:#7a1f2b}
+@media(prefers-color-scheme:dark){:root{--bg:#161615;--fg:#ececea;--mut:#9a9a94;--card:#202020;--bd:#33332f;--ac:#d98a96;--slm:#6fcf9f;--llm:#e5949f}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 system-ui,sans-serif;display:flex;flex-direction:column;height:100dvh}
+header{padding:10px 16px;border-bottom:1px solid var(--bd);display:flex;gap:12px;align-items:center;flex-wrap:wrap}
+header h1{font-size:17px;margin:0;margin-right:auto}select,button,textarea{font:inherit;color:inherit;background:var(--card);border:1px solid var(--bd);border-radius:8px;padding:6px 10px}
+#log{flex:1;overflow:auto;padding:16px;display:flex;flex-direction:column;gap:14px;max-width:860px;width:100%;margin:0 auto}
+.msg{padding:10px 14px;border-radius:12px;border:1px solid var(--bd);background:var(--card);white-space:pre-wrap;word-wrap:break-word}
+.user{align-self:flex-end;background:var(--ac);color:#fff;border-color:transparent;max-width:80%}
+.badge{display:inline-block;font-size:12px;padding:1px 8px;border-radius:99px;border:1px solid currentColor;margin:0 6px 6px 0}
+.slm{color:var(--slm)}.llm{color:var(--llm)}.cache{color:var(--mut)}.note{color:var(--mut);font-size:12px;margin-top:6px}
+details{margin-top:8px;font-size:13px;color:var(--mut)}details div{margin:6px 0;white-space:pre-wrap}
+form{display:flex;gap:8px;padding:12px 16px;border-top:1px solid var(--bd);max-width:860px;width:100%;margin:0 auto}
+textarea{flex:1;resize:none;height:44px}button{background:var(--ac);color:#fff;border:0;padding:0 18px;cursor:pointer}button:disabled{opacity:.5}
+#gate{position:fixed;inset:0;background:var(--bg);display:none;align-items:center;justify-content:center;z-index:10}
+#gate .box{background:var(--card);border:1px solid var(--bd);border-radius:14px;padding:28px;width:min(380px,92vw);display:flex;flex-direction:column;gap:12px}
+#gate h2{margin:0 0 4px;font-size:19px}#gate input{font:inherit;color:inherit;background:var(--bg);border:1px solid var(--bd);border-radius:8px;padding:9px 11px}
+#gate button{padding:9px}#gate .err{color:crimson;font-size:13px;min-height:18px}
+</style></head><body>
+<header><h1>AskIISc · thesis Q&amp;A</h1>
+<label>Thesis <select id="thesis"><option value="">all theses</option></select></label>
+<label>Model <select id="force"><option value="">auto (router)</option><option value="slm">force SLM</option><option value="llm">force 7B</option></select></label>
+<span id="who" class="note"></span><button id="clear" type="button" style="background:var(--card);color:var(--fg);border:1px solid var(--bd);padding:6px 12px">New chat</button></header>
+<div id="gate"><div class="box"><h2>Sign in to AskIISc</h2>
+<div class="note">Use your IISc email address. We will email you a 6-digit code.</div>
+<input id="em" type="email" autocomplete="email" placeholder="name@iisc.ac.in">
+<button id="gen" type="button">Generate OTP</button>
+<div id="step2" style="display:none;flex-direction:column;gap:12px"><input id="otp" inputmode="numeric" maxlength="6" autocomplete="one-time-code" placeholder="6-digit code"><button id="ver" type="button">Verify &amp; continue</button></div>
+<div class="err" id="gerr"></div></div></div>
+<div id="log"></div>
+<form id="f"><textarea id="q" placeholder="Ask about the theses… (Enter to send, Shift+Enter for newline)" autofocus></textarea><button id="go">Send</button></form>
+<script>
+const $=s=>document.querySelector(s),log=$('#log');let history=[];const DEBUG=new URLSearchParams(location.search).has('debug');
+const el=(c,t)=>{const d=document.createElement('div');d.className=c;if(t!==undefined)d.textContent=t;log.append(d);log.scrollTop=log.scrollHeight;return d};
+let cd=null;
+function showGate(on){$('#gate').style.display=on?'flex':'none'}
+async function post(u,b){const r=await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});let d={};try{d=await r.json()}catch(_){}return {ok:r.ok,status:r.status,d}}
+$('#gen').onclick=async()=>{$('#gerr').textContent='';const b=$('#gen');b.disabled=true;const r=await post('/auth/otp/request',{email:$('#em').value});
+ if(!r.ok){$('#gerr').textContent=r.d.error||'Failed';b.disabled=false;return}
+ $('#step2').style.display='flex';$('#otp').focus();let t=r.d.resend_in||60;clearInterval(cd);cd=setInterval(()=>{b.textContent=t>0?`Resend in ${t--}s`:'Generate OTP again';if(t<0){clearInterval(cd);b.disabled=false}},1000)};
+$('#ver').onclick=async()=>{$('#gerr').textContent='';const r=await post('/auth/otp/verify',{email:$('#em').value,code:$('#otp').value});
+ if(!r.ok){$('#gerr').textContent=r.d.error||'Failed';return}location.reload()};
+$('#otp').addEventListener('keydown',e=>{if(e.key==='Enter')$('#ver').click()});
+fetch('/me').then(r=>r.json()).then(m=>{if(m.backend==='gateway'){$('#thesis').parentElement.style.display='none';$('#force').parentElement.style.display='none'}if(m.login_required&&!m.email&&m.auth_mode==='otp')showGate(true);$('#who').innerHTML=m.email?`Signed in: ${m.email} · <a href="#" id="lo">sign out</a>`:(m.auth_mode==='entra'?`Public access · <a href="/auth/login">Sign in with IISc account</a>`:`Not signed in`);
+ const lo=$('#lo');if(lo)lo.onclick=async e=>{e.preventDefault();await fetch('/auth/logout',{method:'POST'});location.reload()}});
+fetch('/theses').then(r=>r.json()).then(a=>a.forEach(t=>{const o=new Option(t,t);$('#thesis').add(o)})).catch(()=>{});
+$('#clear').onclick=()=>{history=[];log.innerHTML=''};
+$('#q').addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();$('#f').requestSubmit()}});
+$('#f').onsubmit=async e=>{e.preventDefault();const q=$('#q').value.trim();if(!q)return;$('#q').value='';$('#go').disabled=true;
+ el('msg user',q);const box=el('msg'),head=document.createElement('div'),body=document.createElement('span'),foot=document.createElement('div');
+ foot.className='note';box.append(head,body,foot);let text='',dtEl=null;
+ const showSources=cs=>{if(dtEl)dtEl.remove();dtEl=null;if(!cs.length)return;const dt=document.createElement('details');dt.innerHTML='<summary>'+cs.length+' sources</summary>';cs.forEach(c=>{const x=document.createElement('div');x.textContent=`[${c.n}] ${c.title||c.thesis_id}`+(c.chapter?` · ${c.chapter}`:'')+(c.version?` · v${c.version}`:'')+(DEBUG?` (dist ${Number(c.distance).toFixed(3)})`:'')+`\n${c.text}…`;dt.append(x)});foot.before(dt);dtEl=dt};
+ try{const r=await fetch('/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:q,history,thesis_id:$('#thesis').value||null,force:$('#force').value||null})});
+  if(r.status===401){body.textContent='Your session has expired. Please sign in again.';showGate(true);$('#go').disabled=false;return}
+  const rd=r.body.getReader(),dec=new TextDecoder();let buf='';
+  while(true){const {value,done}=await rd.read();if(done)break;buf+=dec.decode(value,{stream:true});let i;
+   while((i=buf.indexOf('\n\n'))>=0){const blk=buf.slice(0,i);buf=buf.slice(i+2);const ev=/event: (.*)/.exec(blk)?.[1],d=JSON.parse(/data: (.*)/s.exec(blk)[1]);
+    if(ev==='meta'){head.innerHTML=d.route?`<span class="badge ${d.route}">${d.route==='slm'?'SLM':d.route==='cache'?'Cached answer':'LLM'}</span>`:'';if(DEBUG&&d.s!=null)head.innerHTML+=`<span class="badge" style="color:var(--mut)">P(hard)=${d.s} / α=${d.alpha}</span>`;
+      showSources(d.citations)}
+    else if(ev==='sources'){showSources(d.citations)}
+    else if(ev==='token'){text+=d.t;body.textContent=text}
+    else if(ev==='escalate'){text='';body.textContent='';foot.textContent=`SLM confidence ${d.conf} < ${d.threshold}; re-answering with 7B…`}
+    else if(ev==='fallback'){text='';body.textContent='';foot.textContent=`${d.from} unavailable → using ${d.to}`}
+    else if(ev==='refused'){body.innerHTML='';body.textContent=d.msg+' ';const a=document.createElement('a');a.href=d.login;a.textContent='Sign in';body.append(a)}
+    else if(ev==='warning'){foot.textContent=d.msg}
+    else if(ev==='error'){body.textContent=d.msg;body.style.color='crimson'}
+    else if(ev==='done'){if(d.refused){foot.textContent='no model was called';continue}foot.textContent=DEBUG?`answered by ${d.model}${d.escalated?' (escalated)':''} · embed ${d.timings.embed_ms}ms · retrieve ${d.timings.retrieve_ms}ms · total ${d.timings.total_ms}ms`+(d.conf?` · conf ${d.conf}`:''):''}
+    log.scrollTop=log.scrollHeight}}
+  if(text){history.push({role:'user',content:q},{role:'assistant',content:text})}
+ }catch(err){body.textContent='Network error: '+err;body.style.color='crimson'}
+ $('#go').disabled=false;$('#q').focus()};
+</script></body></html>

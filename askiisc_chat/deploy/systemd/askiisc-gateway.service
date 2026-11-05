@@ -1,0 +1,20 @@
+[Unit]
+Description=AskIISc gateway (FastAPI: router, retrieval, chat UI)
+After=network.target askiisc-vllm.service askiisc-slm.service docker.service
+Wants=askiisc-vllm.service askiisc-slm.service
+
+[Service]
+User=askiisc
+WorkingDirectory=/opt/askiisc/app
+EnvironmentFile=/etc/askiisc/askiisc.env
+# Embedder + MLP stay on CPU: never let torch grab GPU memory the 7B needs; cap threads so llama.cpp keeps its cores
+Environment=CUDA_VISIBLE_DEVICES=-1 OMP_NUM_THREADS=2 TOKENIZERS_PARALLELISM=false
+StateDirectory=askiisc
+ExecStart=/opt/askiisc/venv-gw/bin/python -m askiisc.app
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target
