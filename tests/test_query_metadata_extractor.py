@@ -76,6 +76,49 @@ class TestQueryMetadataExtractor(unittest.TestCase):
         self.assertNotIn("(", expr.split("@department:")[1].split(")")[1])
         self.assertIn("@department:(Materials Engineering MatEng View Item)", expr)
 
+    def test_catalog_count_csa_query(self):
+        """Verify extraction and intent classification for 'how many thesis of CSA department exist'."""
+        q = "how many thesis of CSA department exist"
+        meta = self.extractor.extract(q)
+        self.assertTrue(meta.is_count_query)
+        self.assertTrue(meta.is_catalog_query)
+        self.assertEqual(meta.filters.get("department"), "Computer Science and Automation")
+        self.assertEqual(meta.clean_query, "")
+
+    def test_catalog_author_query(self):
+        """Verify catalog existence extraction for 'is there paper with author ramaswamy'."""
+        q = "is there paper with author ramaswamy"
+        meta = self.extractor.extract(q)
+        self.assertTrue(meta.is_catalog_query)
+        self.assertEqual(meta.filters.get("author"), "ramaswamy")
+        self.assertEqual(meta.clean_query, "")
+
+    def test_catalog_advisor_query(self):
+        """Verify count extraction for 'how many papers are there by prof. Shalabh Bhatnagar'."""
+        q = "how many papers are there by prof. Shalabh Bhatnagar"
+        meta = self.extractor.extract(q)
+        self.assertTrue(meta.is_count_query)
+        self.assertTrue(meta.is_catalog_query)
+        self.assertEqual(meta.filters.get("advisor"), "Shalabh Bhatnagar")
+        self.assertEqual(meta.clean_query, "")
+
+    def test_catalog_topic_existence(self):
+        """Verify topic extraction for 'is there any paper based on computer architecture'."""
+        q = "is there any paper based on computer architecture"
+        meta = self.extractor.extract(q)
+        self.assertTrue(meta.is_catalog_query)
+        self.assertEqual(meta.clean_query, "computer architecture")
+
+    def test_handle_id_and_quoted_title(self):
+        """Verify handle ID and title lookup patterns."""
+        q1 = "Show thesis with handle id 12355"
+        meta1 = self.extractor.extract(q1)
+        self.assertEqual(meta1.filters.get("handle_id"), "12355")
+
+        q2 = 'Find paper titled "Instruction scheduling for RISC processors"'
+        meta2 = self.extractor.extract(q2)
+        self.assertEqual(meta2.filters.get("title"), "Instruction scheduling for RISC processors")
+
 
 if __name__ == "__main__":
     unittest.main()

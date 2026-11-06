@@ -1,0 +1,813 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>AskIISc · Institutional Thesis Q&amp;A</title>
+  <link rel="stylesheet" href="/static/vendor/katex.min.css">
+  <script src="/static/vendor/katex.min.js"></script>
+  <script src="/static/vendor/marked.min.js"></script>
+  <style>
+    :root {
+      --bg: #fafaf8;
+      --fg: #1c1c1a;
+      --mut: #6b6b66;
+      --card: #ffffff;
+      --bd: #e3e2dc;
+      --ac: #7a1f2b;
+      --ac-hover: #942735;
+      --slm: #2b6e4f;
+      --llm: #7a1f2b;
+      --cache: #4a5568;
+      --code-bg: #f4f3ef;
+      --border-radius: 12px;
+    }
+    @media(prefers-color-scheme: dark) {
+      :root {
+        --bg: #141413;
+        --fg: #ececea;
+        --mut: #9a9a94;
+        --card: #1e1e1d;
+        --bd: #30302c;
+        --ac: #d98a96;
+        --ac-hover: #e8a0ab;
+        --slm: #6fcf9f;
+        --llm: #e5949f;
+        --cache: #a0aec0;
+        --code-bg: #282826;
+      }
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--fg);
+      font: 15px/1.6 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      display: flex;
+      flex-direction: column;
+      height: 100dvh;
+    }
+    header {
+      padding: 12px 20px;
+      border-bottom: 1px solid var(--bd);
+      display: flex;
+      gap: 14px;
+      align-items: center;
+      flex-wrap: wrap;
+      background: var(--card);
+    }
+    header h1 {
+      font-size: 18px;
+      font-weight: 600;
+      margin: 0;
+      margin-right: auto;
+      letter-spacing: -0.01em;
+    }
+    select, button, textarea {
+      font: inherit;
+      color: inherit;
+      background: var(--card);
+      border: 1px solid var(--bd);
+      border-radius: 8px;
+      padding: 6px 12px;
+    }
+    #chat {
+      display: none;
+      flex: 1;
+      flex-direction: column;
+      overflow: hidden;
+      width: 100%;
+    }
+    #log {
+      flex: 1;
+      overflow-y: auto;
+      padding: 20px 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 18px;
+      max-width: 900px;
+      width: 100%;
+      margin: 0 auto;
+    }
+    .msg {
+      padding: 14px 18px;
+      border-radius: var(--border-radius);
+      border: 1px solid var(--bd);
+      background: var(--card);
+      word-wrap: break-word;
+      overflow-wrap: break-word;
+      line-height: 1.6;
+    }
+    .msg p { margin: 0 0 10px 0; }
+    .msg p:last-child { margin-bottom: 0; }
+    .msg h1, .msg h2, .msg h3, .msg h4 {
+      margin: 14px 0 8px 0;
+      font-weight: 600;
+      line-height: 1.3;
+    }
+    .msg h1 { font-size: 1.3em; }
+    .msg h2 { font-size: 1.2em; }
+    .msg h3 { font-size: 1.1em; }
+    .msg ul, .msg ol {
+      margin: 8px 0 10px 20px;
+      padding: 0;
+    }
+    .msg li { margin-bottom: 4px; }
+    .msg code {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-size: 0.9em;
+      background: var(--code-bg);
+      padding: 2px 5px;
+      border-radius: 4px;
+    }
+    .msg pre {
+      background: var(--code-bg);
+      padding: 12px;
+      border-radius: 8px;
+      overflow-x: auto;
+      margin: 10px 0;
+    }
+    .msg pre code {
+      background: transparent;
+      padding: 0;
+    }
+    .msg blockquote {
+      margin: 10px 0;
+      padding-left: 12px;
+      border-left: 3px solid var(--ac);
+      color: var(--mut);
+    }
+    .user {
+      align-self: flex-end;
+      background: var(--ac);
+      color: #ffffff;
+      border-color: transparent;
+      max-width: 82%;
+      white-space: pre-wrap;
+    }
+    .user p { margin: 0; }
+    .badge {
+      display: inline-block;
+      font-size: 11px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      padding: 2px 8px;
+      border-radius: 99px;
+      border: 1px solid currentColor;
+      margin: 0 6px 8px 0;
+    }
+    .slm { color: var(--slm); }
+    .llm { color: var(--llm); }
+    .cache { color: var(--cache); }
+    .note { color: var(--mut); font-size: 12px; margin-top: 8px; }
+    details {
+      margin-top: 10px;
+      font-size: 13px;
+      color: var(--mut);
+      border-top: 1px dashed var(--bd);
+      padding-top: 8px;
+    }
+    details summary {
+      cursor: pointer;
+      font-weight: 500;
+      user-select: none;
+    }
+    details summary:hover { color: var(--fg); }
+    details div.citation-card {
+      margin: 8px 0;
+      padding: 8px 10px;
+      background: var(--code-bg);
+      border-radius: 6px;
+      white-space: pre-wrap;
+    }
+    form {
+      display: flex;
+      gap: 10px;
+      padding: 14px 20px;
+      border-top: 1px solid var(--bd);
+      max-width: 900px;
+      width: 100%;
+      margin: 0 auto;
+      background: var(--bg);
+    }
+    textarea {
+      flex: 1;
+      resize: none;
+      height: 48px;
+      line-height: 1.4;
+      border-radius: 10px;
+      padding: 8px 12px;
+    }
+    button.send-btn {
+      background: var(--ac);
+      color: #ffffff;
+      border: 0;
+      border-radius: 10px;
+      padding: 0 22px;
+      font-weight: 500;
+      cursor: pointer;
+      transition: background 0.15s ease;
+    }
+    button.send-btn:hover { background: var(--ac-hover); }
+    button.send-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    #gate {
+      position: fixed;
+      inset: 0;
+      background: var(--bg);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      z-index: 100;
+    }
+    #gate .box {
+      background: var(--card);
+      border: 1px solid var(--bd);
+      border-radius: 16px;
+      padding: 32px;
+      width: min(420px, 92vw);
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.06);
+    }
+    #gate h2 { margin: 0 0 4px; font-size: 20px; font-weight: 600; }
+    #gate input {
+      font: inherit;
+      color: inherit;
+      background: var(--bg);
+      border: 1px solid var(--bd);
+      border-radius: 8px;
+      padding: 10px 12px;
+    }
+    #gate button {
+      padding: 10px;
+      background: var(--ac);
+      color: #fff;
+      border: 0;
+      font-weight: 500;
+      cursor: pointer;
+    }
+    #gate button:hover { background: var(--ac-hover); }
+    #gate button:disabled {
+      opacity: 0.7;
+      cursor: not-allowed;
+    }
+    .spinner {
+      display: inline-block;
+      width: 14px;
+      height: 14px;
+      border: 2px solid rgba(255, 255, 255, 0.35);
+      border-radius: 50%;
+      border-top-color: #ffffff;
+      animation: spin 0.8s linear infinite;
+      vertical-align: -2px;
+      margin-right: 8px;
+    }
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
+    #resend-btn {
+      transition: opacity 0.2s;
+    }
+    #resend-btn:disabled {
+      color: var(--mut) !important;
+      cursor: not-allowed !important;
+      opacity: 0.6;
+    }
+    #resend-btn:not(:disabled):hover {
+      text-decoration: underline !important;
+    }
+    #gate .err {
+      font-size: 13px;
+      min-height: 18px;
+      line-height: 1.4;
+    }
+    /* KaTeX Mathematical display equations */
+    .katex-display {
+      overflow-x: auto;
+      overflow-y: hidden;
+      padding: 8px 0;
+      margin: 12px 0;
+    }
+    .katex {
+      font-size: 1.05em;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>AskIISc · thesis Q&amp;A</h1>
+    <label id="lbl-thesis" style="display:none">Thesis <select id="thesis"><option value="">all theses</option></select></label>
+    <label id="lbl-force" style="display:none">Model <select id="force"><option value="">auto (router)</option><option value="slm">force SLM</option><option value="llm">force 7B</option></select></label>
+    <span id="who" class="note"></span>
+    <button id="clear" type="button" style="display:none;background:var(--card);color:var(--fg);border:1px solid var(--bd);padding:6px 14px">New chat</button>
+  </header>
+
+  <div id="gate">
+    <div class="box">
+      <h2>Sign in to AskIISc</h2>
+      <div id="gate-note" class="note">Enter your IISc email address. A 6-digit verification code will be sent to your inbox.</div>
+      <div id="step1" style="display:flex;flex-direction:column;gap:12px">
+        <input id="em" type="email" autocomplete="email" placeholder="name@iisc.ac.in">
+        <button id="gen" type="button">Generate OTP</button>
+      </div>
+      <div id="step2" style="display:none;flex-direction:column;gap:12px">
+        <div style="display:flex;justify-content:space-between;align-items:center;font-size:13px">
+          <span>Code sent to <b id="target-email" style="color:var(--fg)"></b></span>
+          <a href="#" id="change-em" style="color:var(--ac);text-decoration:underline">Change email</a>
+        </div>
+        <input id="otp" inputmode="numeric" maxlength="6" autocomplete="one-time-code" placeholder="6-digit code">
+        <button id="ver" type="button">Verify &amp; continue</button>
+        <div style="display:flex;justify-content:space-between;align-items:center;font-size:13px;color:var(--mut);margin-top:2px">
+          <span>Didn't receive code?</span>
+          <button id="resend-btn" type="button" disabled style="background:transparent;border:0;color:var(--ac);font-weight:600;padding:4px 6px;cursor:pointer">Resend OTP (60s)</button>
+        </div>
+      </div>
+      <div class="err" id="gerr"></div>
+    </div>
+  </div>
+
+  <main id="chat">
+    <div id="log"></div>
+    <form id="f">
+      <textarea id="q" placeholder="Ask about research, methods, or equations in IISc theses… (Enter to send, Shift+Enter for newline)" autofocus></textarea>
+      <button id="go" class="send-btn">Send</button>
+    </form>
+  </main>
+
+  <script>
+    const $ = s => document.querySelector(s);
+    const log = $('#log');
+    let history = [];
+    const DEBUG = new URLSearchParams(location.search).has('debug');
+
+    // -------------------------------------------------------------------------
+    // LaTeX & Markdown Formatter
+    // -------------------------------------------------------------------------
+    function renderMathAndMarkdown(text) {
+      if (!text) return '';
+      const mathBlocks = [];
+
+      // Step 1: Extract Display Math ($$ ... $$ or \[ ... \] or \begin{...} ... \end{...})
+      let processed = text.replace(
+        /\$\$([\s\S]+?)\$\$|\\\[([\s\S]+?)\\\]|\\begin\{(equation|align|gather|split|matrix|bmatrix|pmatrix|cases)\*?\}([\s\S]+?)\\end\{\3\*?\}/g,
+        (match, p1, p2, env, p3) => {
+          const formula = p1 || p2 || (env ? `\\begin{${env}}${p3}\\end{${env}}` : match);
+          try {
+            if (window.katex) {
+              const rendered = window.katex.renderToString(formula.trim(), {
+                displayMode: true,
+                throwOnError: false
+              });
+              mathBlocks.push(rendered);
+              return `\n\n%%MATH_BLOCK_${mathBlocks.length - 1}%%\n\n`;
+            }
+          } catch (e) {}
+          mathBlocks.push(`<div class="katex-display">$$${formula}$$</div>`);
+          return `\n\n%%MATH_BLOCK_${mathBlocks.length - 1}%%\n\n`;
+        }
+      );
+
+      // Step 2: Extract Inline Math ($ ... $ or \( ... \))
+      processed = processed.replace(
+        /(?<!\\)\$([^\$\n]+?)(?<!\\)\$|\\\(([^\)]+?)\\\)/g,
+        (match, p1, p2) => {
+          const formula = p1 || p2;
+          // Avoid false positives on currency numbers like $100 or empty
+          if (!formula || /^\s*\d+([.,]\d+)?\s*$/.test(formula)) return match;
+          try {
+            if (window.katex) {
+              const rendered = window.katex.renderToString(formula.trim(), {
+                displayMode: false,
+                throwOnError: false
+              });
+              mathBlocks.push(rendered);
+              return `%%MATH_BLOCK_${mathBlocks.length - 1}%%`;
+            }
+          } catch (e) {}
+          mathBlocks.push(`<span>$${formula}$</span>`);
+          return `%%MATH_BLOCK_${mathBlocks.length - 1}%%`;
+        }
+      );
+
+      // Step 3: Parse Markdown using Marked
+      let html = '';
+      if (window.marked && typeof window.marked.parse === 'function') {
+        try {
+          html = window.marked.parse(processed, { breaks: true, gfm: true });
+        } catch (e) {
+          html = processed;
+        }
+      } else {
+        html = processed
+          .replace(/&/g, '&amp;')
+          .replace(/</g, '&lt;')
+          .replace(/>/g, '&gt;')
+          .replace(/\n\n/g, '<br><br>')
+          .replace(/\n/g, '<br>');
+      }
+
+      // Step 4: Restore KaTeX HTML Blocks
+      html = html.replace(/%%MATH_BLOCK_(\d+)%%/g, (m, idx) => {
+        return mathBlocks[Number(idx)] || '';
+      });
+
+      return html;
+    }
+
+    // -------------------------------------------------------------------------
+    // SSE Stream Parser
+    // -------------------------------------------------------------------------
+    function parseSSEBlock(blk) {
+      if (!blk) return null;
+      let event = null;
+      let dataLines = [];
+      const lines = blk.split(/\r?\n/);
+      for (const line of lines) {
+        if (line.startsWith('event:')) {
+          event = line.slice(6).trim();
+        } else if (line.startsWith('data:')) {
+          dataLines.push(line.slice(5).trim());
+        }
+      }
+      if (!dataLines.length) return null;
+      const rawData = dataLines.join('\n');
+      if (rawData === '[DONE]') {
+        return { event: 'done', data: { done: true } };
+      }
+      try {
+        const data = JSON.parse(rawData);
+        if (!event) {
+          if (data.type) event = data.type;
+          else if (data.t !== undefined || data.delta !== undefined || data.content !== undefined || data.token !== undefined) event = 'token';
+          else if (data.chunks || data.citations) event = 'sources';
+        }
+        return { event, data };
+      } catch (err) {
+        return null;
+      }
+    }
+
+    // -------------------------------------------------------------------------
+    // UI Helpers
+    // -------------------------------------------------------------------------
+    const el = (c, t) => {
+      const d = document.createElement('div');
+      d.className = c;
+      if (t !== undefined) d.textContent = t;
+      log.append(d);
+      log.scrollTop = log.scrollHeight;
+      return d;
+    };
+
+    let cd = null;
+    function showGate(on) {
+      $('#gate').style.display = on ? 'flex' : 'none';
+      $('#chat').style.display = on ? 'none' : 'flex';
+      $('#clear').style.display = on ? 'none' : 'inline-block';
+    }
+
+    async function post(u, b) {
+      const r = await fetch(u, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(b)
+      });
+      let d = {};
+      try { d = await r.json(); } catch (_) {}
+      return { ok: r.ok, status: r.status, d };
+    }
+
+    // -------------------------------------------------------------------------
+    // Authentication Handlers
+    // -------------------------------------------------------------------------
+    function startResendCountdown(seconds) {
+      let t = seconds || 60;
+      const resendBtn = $('#resend-btn');
+      if (!resendBtn) return;
+      resendBtn.disabled = true;
+      resendBtn.textContent = `Resend OTP (${t}s)`;
+      clearInterval(cd);
+      cd = setInterval(() => {
+        t--;
+        if (t > 0) {
+          resendBtn.textContent = `Resend OTP (${t}s)`;
+        } else {
+          clearInterval(cd);
+          resendBtn.disabled = false;
+          resendBtn.textContent = 'Resend OTP';
+        }
+      }, 1000);
+    }
+
+    async function requestOtp(isResend = false) {
+      const email = $('#em').value.trim();
+      if (!email) {
+        $('#gerr').style.color = 'crimson';
+        $('#gerr').textContent = 'Please enter your IISc email address.';
+        return;
+      }
+      $('#gerr').textContent = '';
+      $('#gerr').style.color = '';
+      const genBtn = $('#gen');
+      const resendBtn = $('#resend-btn');
+
+      if (isResend) {
+        if (resendBtn) {
+          resendBtn.disabled = true;
+          resendBtn.innerHTML = '<span class="spinner" style="border-top-color:var(--ac);border-color:rgba(122,31,43,0.25)"></span> Sending...';
+        }
+      } else {
+        genBtn.disabled = true;
+        genBtn.innerHTML = '<span class="spinner"></span> Generating OTP...';
+      }
+
+      const endpoint = isResend ? '/auth/otp/resend' : '/auth/otp/request';
+      try {
+        const r = await post(endpoint, { email });
+        if (!r.ok) {
+          $('#gerr').style.color = 'crimson';
+          $('#gerr').textContent = r.d.error || 'Failed to request OTP';
+          genBtn.disabled = false;
+          genBtn.innerHTML = 'Generate OTP';
+          if (isResend && r.d.resend_in) {
+            startResendCountdown(r.d.resend_in);
+          } else if (resendBtn) {
+            resendBtn.disabled = false;
+            resendBtn.textContent = 'Resend OTP';
+          }
+          return;
+        }
+
+        if (r.d.message) {
+          $('#gerr').style.color = 'var(--slm)';
+          $('#gerr').textContent = r.d.message;
+        }
+
+        const targetEl = $('#target-email');
+        if (targetEl) targetEl.textContent = email;
+        const step1 = $('#step1');
+        if (step1) step1.style.display = 'none';
+        $('#step2').style.display = 'flex';
+        $('#otp').value = '';
+        $('#otp').focus();
+
+        genBtn.disabled = false;
+        genBtn.innerHTML = 'Generate OTP';
+
+        startResendCountdown(r.d.resend_in || 60);
+      } catch (err) {
+        $('#gerr').style.color = 'crimson';
+        $('#gerr').textContent = 'Network error. Please try again.';
+        genBtn.disabled = false;
+        genBtn.innerHTML = 'Generate OTP';
+        if (resendBtn) {
+          resendBtn.disabled = false;
+          resendBtn.textContent = 'Resend OTP';
+        }
+      }
+    }
+
+    $('#gen').onclick = () => requestOtp(false);
+    const resendBtnEl = $('#resend-btn');
+    if (resendBtnEl) resendBtnEl.onclick = () => requestOtp(true);
+
+    const changeEmEl = $('#change-em');
+    if (changeEmEl) {
+      changeEmEl.onclick = e => {
+        e.preventDefault();
+        clearInterval(cd);
+        $('#step2').style.display = 'none';
+        const step1 = $('#step1');
+        if (step1) step1.style.display = 'flex';
+        $('#gen').disabled = false;
+        $('#gen').innerHTML = 'Generate OTP';
+        $('#gerr').textContent = '';
+        $('#em').focus();
+      };
+    }
+
+    $('#ver').onclick = async () => {
+      const code = $('#otp').value.trim();
+      if (!code) {
+        $('#gerr').style.color = 'crimson';
+        $('#gerr').textContent = 'Please enter the 6-digit code.';
+        return;
+      }
+      $('#gerr').textContent = '';
+      $('#gerr').style.color = 'crimson';
+      const verBtn = $('#ver');
+      verBtn.disabled = true;
+      verBtn.innerHTML = '<span class="spinner"></span> Verifying...';
+      try {
+        const r = await post('/auth/otp/verify', { email: $('#em').value, code });
+        if (!r.ok) {
+          $('#gerr').textContent = r.d.error || 'Invalid or expired code';
+          verBtn.disabled = false;
+          verBtn.innerHTML = 'Verify &amp; continue';
+          return;
+        }
+        location.reload();
+      } catch (err) {
+        $('#gerr').textContent = 'Verification error. Please try again.';
+        verBtn.disabled = false;
+        verBtn.innerHTML = 'Verify &amp; continue';
+      }
+    };
+
+    $('#otp').addEventListener('keydown', e => {
+      if (e.key === 'Enter') $('#ver').click();
+    });
+    $('#em').addEventListener('keydown', e => {
+      if (e.key === 'Enter') $('#gen').click();
+    });
+
+    fetch('/me').then(r => r.json()).then(m => {
+      if (m.backend === 'gateway') {
+        $('#thesis').parentElement.style.display = 'none';
+        $('#force').parentElement.style.display = 'none';
+      }
+      if (m.login_required && !m.email) {
+        showGate(true);
+        $('#who').textContent = 'Sign-in required';
+      } else {
+        showGate(false);
+        $('#who').innerHTML = m.email ? `Signed in: ${m.email} · <a href="#" id="lo">sign out</a>` : 'Open access';
+        const lo = $('#lo');
+        if (lo) lo.onclick = async e => {
+          e.preventDefault();
+          await fetch('/auth/logout', { method: 'POST' });
+          location.reload();
+        };
+      }
+    }).catch(() => { showGate(true); });
+
+    fetch('/theses').then(r => r.json()).then(a => a.forEach(t => {
+      const o = new Option(t, t);
+      $('#thesis').add(o);
+    })).catch(() => {});
+
+    $('#clear').onclick = () => {
+      history = [];
+      log.innerHTML = '';
+    };
+
+    $('#q').addEventListener('keydown', e => {
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        $('#f').requestSubmit();
+      }
+    });
+
+    // -------------------------------------------------------------------------
+    // Chat Submission & Streaming Engine
+    // -------------------------------------------------------------------------
+    $('#f').onsubmit = async e => {
+      e.preventDefault();
+      const q = $('#q').value.trim();
+      if (!q) return;
+      $('#q').value = '';
+      $('#go').disabled = true;
+
+      el('msg user', q);
+      const box = el('msg');
+      const head = document.createElement('div');
+      const body = document.createElement('div');
+      const foot = document.createElement('div');
+      foot.className = 'note';
+      box.append(head, body, foot);
+      let text = '';
+      let dtEl = null;
+
+      const showSources = cs => {
+        if (dtEl) dtEl.remove();
+        dtEl = null;
+        if (!cs || !cs.length) return;
+        const dt = document.createElement('details');
+        dt.innerHTML = '<summary>' + cs.length + ' source document' + (cs.length > 1 ? 's' : '') + '</summary>';
+        cs.forEach(c => {
+          const x = document.createElement('div');
+          x.className = 'citation-card';
+          x.textContent = `[${c.n}] ${c.title || c.thesis_id || 'Untitled Document'}` +
+                          (c.chapter ? ` · ${c.chapter}` : '') +
+                          (c.version ? ` · v${c.version}` : '') +
+                          (DEBUG && c.distance ? ` (dist: ${Number(c.distance).toFixed(3)})` : '') +
+                          (c.text ? `\n${c.text}…` : '');
+          dt.append(x);
+        });
+        foot.before(dt);
+        dtEl = dt;
+      };
+
+      try {
+        const r = await fetch('/chat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            message: q,
+            history,
+            thesis_id: $('#thesis').value || null,
+            force: $('#force').value || null
+          })
+        });
+
+        if (r.status === 401) {
+          body.textContent = 'Your session has expired. Please sign in again.';
+          showGate(true);
+          $('#go').disabled = false;
+          return;
+        }
+
+        const rd = r.body.getReader();
+        const dec = new TextDecoder('utf-8');
+        let buf = '';
+
+        while (true) {
+          const { value, done } = await rd.read();
+          if (done) break;
+          buf += dec.decode(value, { stream: true });
+
+          let i;
+          while ((i = buf.indexOf('\n\n')) >= 0) {
+            const blk = buf.slice(0, i);
+            buf = buf.slice(i + 2);
+
+            const evObj = parseSSEBlock(blk);
+            if (!evObj) continue;
+            const { event: ev, data: d } = evObj;
+
+            if (ev === 'meta') {
+              head.innerHTML = d.route ? `<span class="badge ${d.route}">${d.route === 'slm' ? 'SLM' : d.route === 'cache' ? 'Cached answer' : 'LLM'}</span>` : '';
+              if (DEBUG && d.s != null) head.innerHTML += `<span class="badge" style="color:var(--mut)">P(hard)=${d.s} / α=${d.alpha}</span>`;
+              if (d.citations) showSources(d.citations);
+            }
+            else if (ev === 'sources') {
+              if (d.citations) showSources(d.citations);
+              else if (d.chunks) showSources(d.chunks);
+            }
+            else if (ev === 'token') {
+              const delta = d.t !== undefined ? d.t : (d.delta !== undefined ? d.delta : (d.content || d.token || ''));
+              if (delta) {
+                text += delta;
+                body.innerHTML = renderMathAndMarkdown(text);
+              }
+            }
+            else if (ev === 'escalate') {
+              foot.textContent = `SLM confidence ${d.conf} < ${d.threshold}; escalating to 7B…`;
+            }
+            else if (ev === 'fallback') {
+              foot.textContent = `${d.from} unavailable → falling back to ${d.to}`;
+            }
+            else if (ev === 'refused') {
+              body.innerHTML = renderMathAndMarkdown(d.msg || 'Query refused.') + ' ';
+              const a = document.createElement('a');
+              a.href = d.login || '/';
+              a.textContent = 'Sign in';
+              body.append(a);
+            }
+            else if (ev === 'warning') {
+              foot.textContent = d.msg || '';
+            }
+            else if (ev === 'error') {
+              body.textContent = d.msg || 'The answering service reported an error.';
+              body.style.color = 'crimson';
+            }
+            else if (ev === 'done') {
+              if (d.refused) {
+                foot.textContent = 'No models were called';
+                continue;
+              }
+              if (DEBUG && d.timings) {
+                foot.textContent = `Answered by ${d.model || 'model'}${d.escalated ? ' (escalated)' : ''} · total ${d.timings.total_ms || 0}ms`;
+              }
+            }
+            log.scrollTop = log.scrollHeight;
+          }
+        }
+
+        // Flush any remaining tokens in buffer
+        if (buf.trim()) {
+          const finalEv = parseSSEBlock(buf.trim());
+          if (finalEv && finalEv.event === 'token') {
+            const delta = finalEv.data.t || finalEv.data.delta || '';
+            text += delta;
+          }
+        }
+
+        // Final full markdown + LaTeX rendering pass
+        if (text) {
+          body.innerHTML = renderMathAndMarkdown(text);
+          history.push({ role: 'user', content: q }, { role: 'assistant', content: text });
+        }
+      } catch (err) {
+        body.textContent = 'Network connection error: ' + err;
+        body.style.color = 'crimson';
+      }
+
+      $('#go').disabled = false;
+      $('#q').focus();
+    };
+  </script>
+</body>
+</html>

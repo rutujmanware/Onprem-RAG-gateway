@@ -1,6 +1,8 @@
 import asyncio
+import pytest
 from gateway.queue.admission import TokenBucketLimiter
 
+@pytest.mark.asyncio
 async def test_burst():
     limiter = TokenBucketLimiter(capacity=2, refill_rate=1.0)
     assert await limiter.acquire("u1") is True

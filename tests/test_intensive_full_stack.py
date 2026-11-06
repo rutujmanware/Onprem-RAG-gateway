@@ -281,9 +281,26 @@ cache = RedisSemanticCache(redis_url=REDIS_URL, similarity_threshold=0.88)
 # Warm up local embedding model in cache
 cache.lookup("Warmup query for cache model")
 
-test_uuid = uuid.uuid4().hex[:12]
-test_prompt = f"What are the anomalous non-abelian topological excitations of synthetic quasi-particle {test_uuid}?"
-paraphrase_prompt = f"Explain the non-abelian topological excitations and anomalies in quasi-particle system {test_uuid}."
+def cleanup_probe_keys(prompt_str=None):
+    try:
+        for k in r_sync.keys(f"{cache.key_prefix}*"):
+            k_type = r_sync.type(k)
+            if k_type == b"hash":
+                p = r_sync.hget(k, "prompt")
+                if p and (b"probe_" in p or (prompt_str and prompt_str.encode("utf-8") in p)):
+                    r_sync.delete(k)
+            elif k_type == b"string":
+                v = r_sync.get(k)
+                if v and (b"probe_" in v or (prompt_str and prompt_str.encode("utf-8") in v)):
+                    r_sync.delete(k)
+    except Exception:
+        pass
+
+cleanup_probe_keys()
+
+test_uuid = f"probe_{int(time.time() * 1000)}"
+test_prompt = f"What are the anomalous non-abelian topological excitations of synthetic {test_uuid} quasi-particle?"
+paraphrase_prompt = f"Explain the non-abelian topological excitations and anomalies in synthetic {test_uuid} quasi-particle."
 
 # Ensure initial miss
 hit_init = cache.lookup(test_prompt)
@@ -318,9 +335,7 @@ para_ok = para_hit is not None and para_hit.get("similarity", 0) >= 0.88
 record_result("Semantic Cache", "Semantic Paraphrase Hit", para_ok, f"Latency: {para_lat_ms:.2f}ms | Sim: {para_hit.get('similarity', 0) if para_hit else 0.0:.4f}")
 
 # Clean up synthetic test prompt from Redis to keep test harness idempotent
-for k in r_sync.keys(f"{cache.key_prefix}*"):
-    if r_sync.hget(k, "prompt") == test_prompt.encode("utf-8"):
-        r_sync.delete(k)
+cleanup_probe_keys(test_prompt)
 
 # 4.3 Refusal / Insufficient Data Protection
 refusal_resp = {

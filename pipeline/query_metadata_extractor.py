@@ -20,6 +20,8 @@ class ExtractedMetadata:
     clean_query: str = ""
     has_filters: bool = False
     extracted_spans: Dict[str, str] = field(default_factory=dict)
+    is_catalog_query: bool = False
+    is_count_query: bool = False
 
 
 class QueryMetadataExtractor:
@@ -97,6 +99,41 @@ class QueryMetadataExtractor:
         (re.compile(r"\b(m\.?sc\.?|master of science)\b", re.IGNORECASE), "MSc"),
     ]
 
+    # Count patterns: "how many", "count of", "number of", "total number"
+    COUNT_PATTERNS = [
+        re.compile(r"\bhow\s+many\b", re.IGNORECASE),
+        re.compile(r"\b(?:count|number|total\s+number)\s+of\b", re.IGNORECASE),
+        re.compile(r"\btotal\s+(?:theses|thesis|papers|dissertations)\b", re.IGNORECASE),
+    ]
+
+    # Catalog & existence patterns
+    CATALOG_PATTERNS = [
+        re.compile(r"\b(?:is|are|was|were)\s+there\s+(?:any\s+)?(?:paper|papers|thesis|theses|work|study|studies|dissertation|dissertations)\b", re.IGNORECASE),
+        re.compile(r"\b(?:do|does)\s+(?:we|iisc|the\s+repo|the\s+repository|the\s+system)\s+have\b", re.IGNORECASE),
+        re.compile(r"\b(?:list|show|give\s+me)\s+(?:all\s+)?(?:the\s+)?(?:papers|theses|dissertations)\b", re.IGNORECASE),
+        re.compile(r"\bexist(?:s)?\b", re.IGNORECASE),
+        re.compile(r"\bany\s+paper\s+based\s+on\b", re.IGNORECASE),
+        re.compile(r"\bany\s+(?:paper|thesis|theses)\s+(?:on|about|regarding)\b", re.IGNORECASE),
+    ]
+
+    # Handle / accession patterns
+    HANDLE_PATTERN = re.compile(r"\b(?:(?:handle(?:\s+id)?|accession|item)\s*[:=]?\s*(?:2005/)?(\d{3,6})|2005/(\d{3,6}))\b", re.IGNORECASE)
+
+    # Title lookup patterns
+    TITLE_PATTERNS = [
+        re.compile(r'["\']([^"\']{5,100})["\']'),
+        re.compile(r"\b(?:titled|named|with title)\s+[\"']?([A-Za-z0-9\s,:-]{6,100})[\"']?", re.IGNORECASE),
+    ]
+
+    # Boilerplate patterns for clean query formulation
+    BOILERPLATE_PATTERN = re.compile(
+        r"\b(?:is|are|was|were|there|any|paper|papers|thesis|theses|dissertation|dissertations|"
+        r"research|work|study|studies|what|tell|me|about|publish|published|write|written|"
+        r"guided|supervised|under|department|dept|by|in|from|at|show|did|does|do|find|"
+        r"how|many|exist|exists|based|on|of|with|author|advisor|prof|professor|dr|have|give|list)\b",
+        re.IGNORECASE
+    )
+
     # Stopwords/filler words that should not be parsed as names
     NAME_STOPWORDS = {
         "the", "a", "an", "this", "that", "these", "those", "what", "which", "how",
@@ -132,7 +169,31 @@ class QueryMetadataExtractor:
         spans_to_remove: List[Tuple[int, int]] = []
         extracted_spans: Dict[str, str] = {}
 
-        # 1. Extract Advisor / Professor
+        # 0. Intent Classification: Count vs Catalog / Existence
+        is_count = any(bool(pat.search(raw_query)) for pat in self.COUNT_PATTERNS)
+        is_catalog = is_count or any(bool(pat.search(raw_query)) for pat in self.CATALOG_PATTERNS)
+
+        # 1. Extract Handle ID / Accession Number
+        m_handle = self.HANDLE_PATTERN.search(raw_query)
+        if m_handle:
+            handle_val = m_handle.group(1) or m_handle.group(2)
+            if handle_val:
+                filters["handle_id"] = handle_val
+                extracted_spans["handle_id"] = m_handle.group(0)
+                spans_to_remove.append(m_handle.span())
+
+        # 2. Extract Quoted or Explicit Title
+        for t_pat in self.TITLE_PATTERNS:
+            m_title = t_pat.search(raw_query)
+            if m_title:
+                title_cand = m_title.group(1).strip()
+                if len(title_cand) >= 5 and title_cand.lower() not in self.NAME_STOPWORDS:
+                    filters["title"] = title_cand
+                    extracted_spans["title"] = m_title.group(0)
+                    spans_to_remove.append(m_title.span())
+                    break
+
+        # 3. Extract Advisor / Professor
         advisor_patterns = [
             re.compile(r"\b(?:[Pp]rof(?:essor)?\.?|[Dd]r\.?)\s+([A-Za-z]+(?:\s+[A-Za-z]+)?)\b"),
             re.compile(r"\b(?:guided|supervised)\s+by\s+(?:[Pp]rof(?:essor)?\.?|[Dd]r\.?)?\s*([A-Za-z]+(?:\s+[A-Za-z]+)?)\b", re.IGNORECASE),
@@ -149,8 +210,9 @@ class QueryMetadataExtractor:
                     spans_to_remove.append(m.span())
                     break
 
-        # 2. Extract Author / Student / Owner
+        # 4. Extract Author / Student / Owner
         author_patterns = [
+            re.compile(r"\b(?:with\s+author|by\s+author)\s+([A-Za-z]+(?:\s+[A-Za-z]+)?)\b", re.IGNORECASE),
             re.compile(r"\b(?:authored|written)\s+by\s+([A-Za-z]+(?:\s+[A-Za-z]+)?)\b", re.IGNORECASE),
             re.compile(r"\bthesis\s+by\s+([A-Za-z]+(?:\s+[A-Za-z]+)?)\b", re.IGNORECASE),
             re.compile(r"(?<!guided\s)(?<!supervised\s)\bby\s+(?:student\s+)?([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\b"),
@@ -168,7 +230,7 @@ class QueryMetadataExtractor:
                         spans_to_remove.append(m.span())
                         break
 
-        # 3. Extract Academic Department
+        # 5. Extract Academic Department
         query_lower = raw_query.lower()
         for alias in self.sorted_dept_keys:
             pattern = re.compile(rf"\b(?:in|from|at|department of|dept\.? of)?\s*{re.escape(alias)}(?:\s+(?:department|dept|centre|center|unit))?\b", re.IGNORECASE)
@@ -180,7 +242,7 @@ class QueryMetadataExtractor:
                 spans_to_remove.append(m.span())
                 break
 
-        # 4. Extract Publication Year / Date
+        # 6. Extract Publication Year / Date
         year_pattern = re.compile(r"\b(?:in|from|year|during|since)?\s*(19\d{2}|20[0-2]\d)\b", re.IGNORECASE)
         m_year = year_pattern.search(raw_query)
         if m_year:
@@ -191,7 +253,7 @@ class QueryMetadataExtractor:
                 extracted_spans["date"] = m_year.group(0)
                 spans_to_remove.append(m_year.span())
 
-        # 5. Extract Degree
+        # 7. Extract Degree
         for deg_pat, deg_val in self.DEGREE_PATTERNS:
             m = deg_pat.search(raw_query)
             if m:
@@ -200,24 +262,46 @@ class QueryMetadataExtractor:
                 spans_to_remove.append(m.span())
                 break
 
-        # 6. Formulate Clean Semantic Query
+        # 8. Formulate Clean Semantic Query
+        if not filters and not is_catalog:
+            return ExtractedMetadata(
+                filters={},
+                clean_query=raw_query,
+                has_filters=False,
+                extracted_spans={},
+                is_catalog_query=False,
+                is_count_query=False,
+            )
+
         clean_q = raw_query
         if spans_to_remove:
             sorted_spans = sorted(spans_to_remove, key=lambda s: s[0], reverse=True)
             for start, end in sorted_spans:
                 clean_q = clean_q[:start] + " " + clean_q[end:]
 
-            # Remove extraneous punctuation and filler boilerplate
-            clean_q = re.sub(r"\b(?:thesis|theses|dissertation|paper|papers|research|what|is|are|tell|me|about|publish|published|write|written|guided|supervised|under|department|dept|by|in|from|at|show|did|does|do|find)\b", " ", clean_q, flags=re.IGNORECASE)
-            clean_q = re.sub(r"^\s*(?:on|for|of|about)\s+", "", clean_q, flags=re.IGNORECASE)
-            clean_q = re.sub(r"\s+", " ", clean_q).strip(" ?,.:;!")
+        # Strip boilerplate stopwords
+        cleaned_remnant = self.BOILERPLATE_PATTERN.sub(" ", clean_q)
+        cleaned_remnant = re.sub(r"^\s*(?:on|for|of|about)\s+", "", cleaned_remnant, flags=re.IGNORECASE)
+        cleaned_remnant = re.sub(r"\s+", " ", cleaned_remnant).strip(" ?,.:;!\"'")
 
-        if len(clean_q) < 3:
-            clean_q = raw_query
+        # If after removing entities and boilerplate, query has no substantive keywords left:
+        if len(cleaned_remnant) < 3:
+            if filters:
+                clean_q = ""
+                is_catalog = True
+            else:
+                clean_q = raw_query
+        else:
+            clean_q = cleaned_remnant
+
+        if is_count:
+            is_catalog = True
 
         return ExtractedMetadata(
             filters=filters,
             clean_query=clean_q,
             has_filters=bool(filters),
             extracted_spans=extracted_spans,
+            is_catalog_query=is_catalog,
+            is_count_query=is_count,
         )

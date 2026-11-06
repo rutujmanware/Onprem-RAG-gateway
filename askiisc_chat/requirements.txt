@@ -1,0 +1,12 @@
+fastapi
+uvicorn
+httpx
+redis>=5
+numpy
+scikit-learn
+joblib
+pydantic
+sentence-transformers   # only if EMBED_BACKEND=sentence-transformers
+pytest
+pyjwt[crypto]
+itsdangerous

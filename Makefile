@@ -1,4 +1,4 @@
-.PHONY: help setup dev prod-up prod-down prod-status prod-restart redis-up redis-down redis-status redis-watch up down logs ingest-pdfs query ask rag-answer serve-slm serve-gpu serve-router generate-dataset eval test clean
+.PHONY: help setup dev prod-up prod-down prod-status prod-restart chat-up chat-down chat-restart chat-status chat-logs chat-code test-smtp cache-stats cache-clear queue-stats redis-up redis-down redis-status redis-watch up down logs ingest-pdfs query ask rag-answer serve-slm serve-gpu serve-router generate-dataset eval load-test load-test-cold test test-intensive clean
 
 -include .env
 export
@@ -13,6 +13,14 @@ help:
 	@echo "Available commands:"
 	@echo "  make setup          - Create virtualenv and install dependencies"
 	@echo "  make dev            - Run Gateway service locally on port 8080 with live reload"
+	@echo "  make prod-up        - Start production stack (Gateway 6 workers, CPU SLM 4x16, vLLM, Redis)"
+	@echo "  make prod-status    - Display status and health of all production services"
+	@echo "  make prod-restart   - Restart production stack with optimized high-concurrency settings"
+	@echo "  make prod-down      - Gracefully terminate all background services (preserves Redis data)"
+	@echo "  make chat-restart   - Restart Unified Frontend Gateway on port 8080 (6 workers)"
+	@echo "  make cache-stats    - View semantic cache item count and vector index status"
+	@echo "  make cache-clear    - Clear semantic cache (keeps 2.26M chunk vector index intact)"
+	@echo "  make queue-stats    - View admission queue depth, active inferences, and shedding telemetry"
 	@echo "  make redis-up       - Start Redis Stack daemon"
 	@echo "  make redis-down     - Stop Redis Stack daemon"
 	@echo "  make redis-status   - Check Redis loading / persistence status (one-shot)"
@@ -24,12 +32,14 @@ help:
 	@echo "  make query Q=\"...\"  - Perform semantic search query against the Redis vector index"
 	@echo "  make ask Q=\"...\"    - Query the running Gateway with clean formatted answer output"
 	@echo "  make rag-answer Q=\"...\" - Answer query using retrieved context + dual-tier routing"
-	@echo "  make serve-slm      - Start Qwen 2.5 3B CPU SLM server on port 8082"
+	@echo "  make serve-slm      - Start Qwen 2.5 3B CPU SLM server (4 workers x 16 threads = 64 cores)"
 	@echo "  make serve-gpu      - Start Qwen 2.5 7B GPU LLM server on port 8000"
 	@echo "  make serve-router   - Start MLP Router microservice on port 8090"
 	@echo "  make generate-dataset - Generate synthetic multi-chunk dataset with scripts/dataset_generator.py"
 	@echo "  make eval           - Run offline benchmarks (alpha-sweep, ragas, load tests)"
-	@echo "  make test           - Run integration & security test suites"
+	@echo "  make load-test      - Run mixed concurrency load test against running gateway"
+	@echo "  make load-test-cold - Run 100 uncached cold requests load test (0% cache hits) under C=10"
+	@echo "  make test           - Run integration, security & admission queue test suites"
 	@echo "  make clean          - Remove caches and build artifacts"
 
 setup:
@@ -52,6 +62,40 @@ prod-status:
 
 prod-restart:
 	$(PYTHON) scripts/prod_stack.py restart
+
+chat-up:
+	$(PYTHON) scripts/prod_stack.py start
+	@echo "Unified AskIISc Frontend & Gateway running on port 8080 (6 workers)."
+
+chat-down:
+	$(PYTHON) scripts/prod_stack.py stop
+	@echo "Frontend on port 8080 stopped."
+
+chat-restart:
+	$(PYTHON) scripts/prod_stack.py restart
+	@echo "Unified AskIISc Frontend & Gateway restarted on port 8080 (6 workers)."
+
+chat-status:
+	@curl -s http://127.0.0.1:8080/health && echo " -> Gateway (Port 8080) UP" || echo "Gateway (Port 8080) STOPPED"
+
+chat-logs:
+	tail -n 80 -f logs/gateway.log
+
+chat-code:
+	cd askiisc_chat && ./app.sh code
+
+test-smtp:
+	$(PYTHON) scripts/test_smtp.py $(TO)
+
+cache-stats:
+	@curl -s http://127.0.0.1:8080/cache/stats || echo "Gateway is not running on 8080"
+
+cache-clear:
+	@curl -s -X POST http://127.0.0.1:8080/cache/clear
+	@echo " -> Semantic cache cleared successfully. Document vector index (2.26M chunks) is untouched."
+
+queue-stats:
+	@curl -s http://127.0.0.1:8080/queue/stats || echo "Gateway is not running on 8080"
 
 redis-up:
 	./redis-stack-server-7.2.0-v9/bin/redis-stack-server
@@ -92,7 +136,7 @@ rag-answer:
 	$(PYTHON) -m pipeline.rag_chain "$(Q)"
 
 serve-slm:
-	$(PYTHON) -m pipeline.serve_cpu_slm --port 8082
+	$(PYTHON) -m pipeline.serve_cpu_slm --port 8082 --workers 4 --threads 16
 
 serve-gpu:
 	CUDA_VISIBLE_DEVICES=0 $(PYTHON) -m vllm.entrypoints.openai.api_server \
@@ -114,7 +158,15 @@ eval:
 	$(PYTHON) -m evaluation.benchmarks.alpha_sweep
 	$(PYTHON) -m evaluation.benchmarks.ragas_eval
 
+load-test:
+	PYTHONPATH=. $(PYTHON) -m evaluation.benchmarks.load_test
+
+load-test-cold:
+	PYTHONPATH=. $(PYTHON) scripts/run_100_uncached_load_test.py
+
 test:
+	PYTHONPATH=. $(PYTHON) tests/test_admission_queue.py
+	PYTHONPATH=. $(PYTHON) -m pytest tests/test_single_port_security.py
 	PYTHONPATH=. $(PYTHON) tests/test_injection_fence.py
 	PYTHONPATH=. $(PYTHON) tests/test_rate_limiting.py
 	PYTHONPATH=. $(PYTHON) tests/test_cache_hits.py

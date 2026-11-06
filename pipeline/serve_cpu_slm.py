@@ -37,7 +37,8 @@ engine: Optional[CPUSLMEngine] = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global engine
-    engine = CPUSLMEngine.get_instance()
+    num_threads = int(os.getenv("CPU_NUM_THREADS", "16"))
+    engine = CPUSLMEngine.get_instance(num_threads=num_threads)
     yield
 
 
@@ -109,7 +110,8 @@ def chat_completions(req: ChatCompletionRequest):
     do_sample = (req.temperature is not None and req.temperature > 0)
     temp = req.temperature if req.temperature is not None else 0.7
     top_p = req.top_p if req.top_p is not None else 0.8
-    max_tokens = req.max_tokens or 512
+    # Enforce safe upper bound on CPU SLM token generation to preserve context window headroom
+    max_tokens = min(req.max_tokens or 512, 1024)
 
     try:
         if req.stream:
@@ -118,15 +120,32 @@ def chat_completions(req: ChatCompletionRequest):
                 created_ts = int(time.time())
                 t0_stream = time.time()
                 streamed_tokens = 0
-                for chunk_text in engine.generate_chat_stream(
-                    messages=raw_messages,
-                    max_new_tokens=max_tokens,
-                    temperature=temp,
-                    top_p=top_p,
-                    do_sample=do_sample,
-                ):
-                    streamed_tokens += 1
-                    data = {
+                try:
+                    for chunk_text in engine.generate_chat_stream(
+                        messages=raw_messages,
+                        max_new_tokens=max_tokens,
+                        temperature=temp,
+                        top_p=top_p,
+                        do_sample=do_sample,
+                    ):
+                        streamed_tokens += 1
+                        data = {
+                            "id": cmpl_id,
+                            "object": "chat.completion.chunk",
+                            "created": created_ts,
+                            "model": DEFAULT_MODEL_NAME,
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": {"content": chunk_text},
+                                    "finish_reason": None,
+                                }
+                            ],
+                        }
+                        yield f"data: {json.dumps(data)}\n\n"
+                except Exception as stream_err:
+                    print(f"⚠️ [SLM Port 8082] Error during stream: {stream_err}")
+                    err_data = {
                         "id": cmpl_id,
                         "object": "chat.completion.chunk",
                         "created": created_ts,
@@ -134,12 +153,12 @@ def chat_completions(req: ChatCompletionRequest):
                         "choices": [
                             {
                                 "index": 0,
-                                "delta": {"content": chunk_text},
-                                "finish_reason": None,
+                                "delta": {"content": f"\n\n[Inference note: {str(stream_err)}]"},
+                                "finish_reason": "error",
                             }
                         ],
                     }
-                    yield f"data: {json.dumps(data)}\n\n"
+                    yield f"data: {json.dumps(err_data)}\n\n"
 
                 gen_sec = max(time.time() - t0_stream, 0.001)
                 tok_s = round(streamed_tokens / gen_sec, 2)
@@ -207,12 +226,13 @@ def main():
     parser = argparse.ArgumentParser(description="Start CPU SLM API Server")
     parser.add_argument("--host", default=os.getenv("SLM_SERVER_HOST", "127.0.0.1"), help="Host to bind (default: 127.0.0.1 - localhost only for security)")
     parser.add_argument("--port", type=int, default=8082, help="Port to listen (default: 8082)")
-    parser.add_argument("--threads", type=int, default=DEFAULT_NUM_THREADS, help="CPU threads")
+    parser.add_argument("--workers", type=int, default=int(os.getenv("SLM_WORKERS", "4")), help="Worker processes")
+    parser.add_argument("--threads", type=int, default=int(os.getenv("CPU_NUM_THREADS", "16")), help="CPU threads per worker")
     args = parser.parse_args()
 
     os.environ["CPU_NUM_THREADS"] = str(args.threads)
-    print(f"🚀 Starting CPU SLM Server on http://{args.host}:{args.port} (Threads: {args.threads})")
-    uvicorn.run("pipeline.serve_cpu_slm:app", host=args.host, port=args.port, reload=False)
+    print(f"🚀 Starting CPU SLM Server on http://{args.host}:{args.port} (Workers: {args.workers}, Threads: {args.threads})")
+    uvicorn.run("pipeline.serve_cpu_slm:app", host=args.host, port=args.port, workers=args.workers, reload=False)
 
 
 if __name__ == "__main__":

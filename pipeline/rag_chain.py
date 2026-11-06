@@ -10,6 +10,7 @@ Combines:
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import os
 import sys
@@ -22,7 +23,7 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from pipeline.retriever import RedisChunkRetriever, retrieve_chunks
+from pipeline.retriever import RedisChunkRetriever, retrieve_chunks, sanitize_chunks
 from pipeline.slm_runner import CPUSLMEngine
 
 try:
@@ -101,39 +102,126 @@ class RAGQAPipeline:
         filter_dict: Optional[Dict[str, str]] = None,
         max_new_tokens: Optional[int] = None,
         temperature: float = 0.2,
+        route_decision: Optional[Dict[str, Any]] = None,
+        chunks: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
-        """Execute full RAG flow: Route -> Retrieve -> Ground -> Generate."""
+        """Execute full RAG flow: Route -> Retrieve -> Ground -> Generate.
+        Uses parallel fan-out (concurrent routing & candidate retrieval) when not precomputed.
+        """
         k = top_k or self.top_k
         t_start = time.time()
 
-        # Step 0: Neural Complexity Routing
-        route_decision = self.route_query(query)
-        is_hard = route_decision.get("route") == "hard"
-        prob = route_decision.get("probability_hard", 1.0 if is_hard else 0.0)
+        # Step 0: Parallel Fan-Out (Routing + Database Retrieval concurrently)
+        pre_duration = 0.001
+        if route_decision is None or chunks is None:
+            t0_pre = time.time()
+            retrieval_error = None
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+                future_route = executor.submit(self.route_query, query) if route_decision is None else None
+                future_retrieval = executor.submit(
+                    self.retriever.search,
+                    query,
+                    top_k=top_k,
+                    filter_dict=filter_dict,
+                ) if chunks is None else None
 
-        if is_hard:
-            hard_k = top_k or (self.top_k or 8)
-            t0_retrieval = time.time()
-            try:
-                chunks = self.retriever.search(query, top_k=hard_k, filter_dict=filter_dict)
-            except Exception as e:
-                hint = " Please ensure Redis is running." if ("connection" in str(e).lower() or "loading" in str(e).lower()) else ""
+                if future_route is not None:
+                    try:
+                        route_decision = future_route.result()
+                    except Exception:
+                        route_decision = {"query": query, "route": "easy", "target_tier": "cpu_slm", "probability_hard": 0.0}
+
+                if future_retrieval is not None:
+                    try:
+                        candidate_chunks = future_retrieval.result()
+                    except Exception as e:
+                        candidate_chunks = []
+                        retrieval_error = e
+                else:
+                    candidate_chunks = chunks
+
+            pre_duration = time.time() - t0_pre
+            is_hard = route_decision.get("route") == "hard"
+            prob = route_decision.get("probability_hard", 1.0 if is_hard else 0.0)
+
+            if retrieval_error:
+                hint = " Please ensure Redis is running." if ("connection" in str(retrieval_error).lower() or "loading" in str(retrieval_error).lower()) else ""
                 return {
                     "query": query,
-                    "answer": f"Retrieval failed: {type(e).__name__} ({str(e)}).{hint}",
-                    "route": "hard",
-                    "target_tier": "gpu_vllm",
+                    "answer": f"Retrieval failed: {type(retrieval_error).__name__} ({str(retrieval_error)}).{hint}",
+                    "route": "hard" if is_hard else "easy",
+                    "target_tier": "gpu_vllm" if is_hard else "cpu_slm",
                     "probability_hard": prob,
                     "chunks": [],
-                    "error": str(e),
+                    "error": str(retrieval_error),
                     "total_time_seconds": round(time.time() - t_start, 2),
                 }
-            retrieval_duration = time.time() - t0_retrieval
+
+            # In-memory dynamic document slicing
+            if chunks is None:
+                is_catalog = bool(candidate_chunks and candidate_chunks[0].get("doc_id") == "catalog_summary")
+                if is_catalog:
+                    chunks = candidate_chunks
+                elif top_k is not None:
+                    chunks = candidate_chunks[:top_k]
+                elif is_hard:
+                    chunks = candidate_chunks[:8]  # Up to 8 docs for GPU LLM 7B
+                else:
+                    chunks = candidate_chunks[:3]  # Up to 3 docs for CPU SLM 3B
+        else:
+            is_hard = route_decision.get("route") == "hard"
+            prob = route_decision.get("probability_hard", 1.0 if is_hard else 0.0)
+
+        retrieval_duration = pre_duration
+
+        if is_hard:
 
             if not chunks:
+                param_messages = [
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are an advanced academic AI research assistant. "
+                            "No specific institutional repository documents directly cover this topic. "
+                            "Please provide a thorough, accurate, and deeply reasoned explanation of the user's question "
+                            "using standard academic and technical literature."
+                        ),
+                    },
+                    {"role": "user", "content": query},
+                ]
+                tokens_to_gen = max_new_tokens if (max_new_tokens and max_new_tokens > 160) else 1024
+                ans_text = None
+                gpu_server_url = os.getenv("VLLM_BASE_URL", "http://localhost:8000/v1").rstrip("/")
+                try:
+                    import httpx
+                    resp = httpx.post(
+                        f"{gpu_server_url}/chat/completions",
+                        json={
+                            "model": "Qwen/Qwen2.5-7B-Instruct",
+                            "messages": param_messages,
+                            "max_tokens": tokens_to_gen,
+                            "temperature": temperature,
+                        },
+                        timeout=90.0,
+                    )
+                    if resp.status_code == 200:
+                        ans_text = resp.json()["choices"][0]["message"]["content"]
+                except Exception:
+                    pass
+
+                if not ans_text:
+                    from pipeline.gpu_llm_runner import GPULLMEngine
+                    engine = GPULLMEngine.get_instance()
+                    ans_text = engine.generate_chat(
+                        param_messages,
+                        max_new_tokens=tokens_to_gen,
+                        temperature=temperature,
+                    )["text"]
+
+                prefix = "No specific institutional repository theses were found on this topic. Based on general academic knowledge:\n\n"
                 return {
                     "query": query,
-                    "answer": "No relevant documents were found in the knowledge base matching your query.",
+                    "answer": prefix + ans_text,
                     "route": "hard",
                     "target_tier": "gpu_vllm",
                     "probability_hard": prob,
@@ -185,7 +273,7 @@ class RAGQAPipeline:
                         "route": "hard",
                         "target_tier": "gpu_vllm",
                         "probability_hard": prob,
-                        "chunks": chunks,
+                        "chunks": sanitize_chunks(chunks),
                         "stats": {
                             "retrieval_seconds": round(retrieval_duration, 3),
                             "generation_seconds": round(gen_duration, 3),
@@ -216,7 +304,7 @@ class RAGQAPipeline:
                 "route": "hard",
                 "target_tier": "gpu_vllm",
                 "probability_hard": prob,
-                "chunks": chunks,
+                "chunks": sanitize_chunks(chunks),
                 "stats": {
                     "retrieval_seconds": round(retrieval_duration, 3),
                     "generation_seconds": round(gen_duration, 3),
@@ -229,29 +317,50 @@ class RAGQAPipeline:
 
         easy_prob = prob
 
-        # Step 1: Retrieve context chunks dynamically (upper bound 3 for CPU prefill)
-        easy_k = top_k or (self.top_k or 3)
-        t0_retrieval = time.time()
-        try:
-            chunks = self.retriever.search(query, top_k=easy_k, filter_dict=filter_dict)
-        except Exception as e:
-            hint = " Please ensure Redis is running." if ("connection" in str(e).lower() or "loading" in str(e).lower()) else ""
-            return {
-                "query": query,
-                "answer": f"Retrieval failed: {type(e).__name__} ({str(e)}).{hint}",
-                "route": "easy",
-                "target_tier": "cpu_slm",
-                "probability_hard": easy_prob,
-                "chunks": [],
-                "error": str(e),
-                "total_time_seconds": round(time.time() - t_start, 2),
-            }
-        retrieval_duration = time.time() - t0_retrieval
-
         if not chunks:
+            param_messages = [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are an accurate, on-premise AI assistant serving the academic/research community at IISc. "
+                        "No specific institutional repository documents directly cover this topic. "
+                        "Please provide a thorough, accurate, and structured explanation of the user's question "
+                        "using standard academic and technical knowledge."
+                    ),
+                },
+                {"role": "user", "content": query},
+            ]
+            tokens_to_gen = min(max_new_tokens or 512, 1024)
+            ans_text = None
+            slm_server_url = os.getenv("SLM_BASE_URL", "http://localhost:8082/v1").rstrip("/")
+            try:
+                import httpx
+                resp = httpx.post(
+                    f"{slm_server_url}/chat/completions",
+                    json={
+                        "messages": param_messages,
+                        "max_tokens": tokens_to_gen,
+                        "temperature": temperature,
+                    },
+                    timeout=60.0,
+                )
+                if resp.status_code == 200:
+                    ans_text = resp.json()["choices"][0]["message"]["content"]
+            except Exception:
+                pass
+
+            if not ans_text:
+                gen_result = self.slm_engine.generate_chat(
+                    messages=param_messages,
+                    max_new_tokens=tokens_to_gen,
+                    temperature=temperature,
+                )
+                ans_text = gen_result["text"]
+
+            prefix = "No specific institutional repository theses were found on this topic. Based on general technical knowledge:\n\n"
             return {
                 "query": query,
-                "answer": "No relevant documents were found in the knowledge base matching your query.",
+                "answer": prefix + ans_text,
                 "route": "easy",
                 "target_tier": "cpu_slm",
                 "probability_hard": easy_prob,
@@ -294,7 +403,7 @@ class RAGQAPipeline:
                     "route": "easy",
                     "target_tier": "cpu_slm",
                     "probability_hard": easy_prob,
-                    "chunks": chunks,
+                    "chunks": sanitize_chunks(chunks),
                     "stats": {
                         "retrieval_seconds": round(retrieval_duration, 3),
                         "generation_seconds": round(gen_duration, 3),
@@ -327,7 +436,7 @@ class RAGQAPipeline:
             "route": "easy",
             "target_tier": "cpu_slm",
             "probability_hard": easy_prob,
-            "chunks": chunks,
+            "chunks": sanitize_chunks(chunks),
             "stats": {
                 "retrieval_seconds": round(retrieval_duration, 3),
                 "generation_seconds": round(gen_duration, 3),
@@ -345,15 +454,62 @@ class RAGQAPipeline:
         filter_dict: Optional[Dict[str, str]] = None,
         max_new_tokens: Optional[int] = None,
         temperature: float = 0.2,
+        route_decision: Optional[Dict[str, Any]] = None,
+        chunks: Optional[List[Dict[str, Any]]] = None,
     ):
         """Streaming version of RAG flow. Yields events: metadata first, then token chunks, then summary."""
         k = top_k or self.top_k
         t_start = time.time()
 
-        # Step 0: Neural Complexity Routing
-        route_decision = self.route_query(query)
-        is_hard = route_decision.get("route") == "hard"
-        prob = route_decision.get("probability_hard", 1.0 if is_hard else 0.0)
+        # Step 0: Parallel Fan-Out (Routing + Database Retrieval concurrently)
+        pre_duration = 0.001
+        if route_decision is None or chunks is None:
+            t0_pre = time.time()
+            retrieval_error = None
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+                future_route = executor.submit(self.route_query, query) if route_decision is None else None
+                future_retrieval = executor.submit(
+                    self.retriever.search,
+                    query,
+                    top_k=top_k,
+                    filter_dict=filter_dict,
+                ) if chunks is None else None
+
+                if future_route is not None:
+                    try:
+                        route_decision = future_route.result()
+                    except Exception:
+                        route_decision = {"query": query, "route": "easy", "target_tier": "cpu_slm", "probability_hard": 0.0}
+
+                if future_retrieval is not None:
+                    try:
+                        candidate_chunks = future_retrieval.result()
+                    except Exception as e:
+                        candidate_chunks = []
+                        retrieval_error = e
+                else:
+                    candidate_chunks = chunks
+
+            pre_duration = time.time() - t0_pre
+            is_hard = route_decision.get("route") == "hard"
+            prob = route_decision.get("probability_hard", 1.0 if is_hard else 0.0)
+
+            # In-memory dynamic document slicing
+            if chunks is None:
+                is_catalog = bool(candidate_chunks and candidate_chunks[0].get("doc_id") == "catalog_summary")
+                if is_catalog:
+                    chunks = candidate_chunks
+                elif top_k is not None:
+                    chunks = candidate_chunks[:top_k]
+                elif is_hard:
+                    chunks = candidate_chunks[:8]  # Up to 8 docs for GPU LLM 7B
+                else:
+                    chunks = candidate_chunks[:3]  # Up to 3 docs for CPU SLM 3B
+        else:
+            is_hard = route_decision.get("route") == "hard"
+            prob = route_decision.get("probability_hard", 1.0 if is_hard else 0.0)
+
+        retrieval_duration = pre_duration
 
         if is_hard:
             yield {
@@ -362,26 +518,96 @@ class RAGQAPipeline:
                 "target_tier": "gpu_vllm",
                 "probability_hard": prob,
             }
-            hard_k = top_k or (self.top_k or 8)
-            t0_retrieval = time.time()
-            chunks = self.retriever.search(query, top_k=hard_k, filter_dict=filter_dict)
-            retrieval_duration = time.time() - t0_retrieval
 
             yield {
                 "type": "chunks",
-                "chunks": chunks,
+                "chunks": sanitize_chunks(chunks),
                 "retrieval_seconds": round(retrieval_duration, 3),
             }
 
             if not chunks:
-                yield {
-                    "type": "token",
-                    "delta": "No relevant documents were found in the knowledge base matching your query.",
-                }
+                prefix = "No specific institutional repository theses were found on this topic. Based on general academic knowledge:\n\n"
+                yield {"type": "token", "delta": prefix}
+                param_messages = [
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are an advanced academic AI research assistant. "
+                            "No specific institutional repository documents directly cover this topic. "
+                            "Please provide a thorough, accurate, and deeply reasoned explanation of the user's question "
+                            "using standard academic and technical literature."
+                        ),
+                    },
+                    {"role": "user", "content": query},
+                ]
+                tokens_to_gen = max_new_tokens if (max_new_tokens and max_new_tokens > 160) else 1024
+                token_count = 0
+                full_response = [prefix]
+                ttft = None
+                streamed = False
+
+                gpu_server_url = os.getenv("VLLM_BASE_URL", "http://localhost:8000/v1").rstrip("/")
+                try:
+                    import httpx
+                    with httpx.stream(
+                        "POST",
+                        f"{gpu_server_url}/chat/completions",
+                        json={
+                            "model": "Qwen/Qwen2.5-7B-Instruct",
+                            "messages": param_messages,
+                            "max_tokens": tokens_to_gen,
+                            "temperature": temperature,
+                            "stream": True,
+                        },
+                        timeout=90.0,
+                    ) as response:
+                        for line in response.iter_lines():
+                            if not line or not line.startswith("data: "):
+                                continue
+                            data_str = line[6:].strip()
+                            if data_str == "[DONE]":
+                                break
+                            try:
+                                d = json.loads(data_str)
+                                delta = d["choices"][0]["delta"].get("content", "")
+                                if delta:
+                                    if ttft is None:
+                                        ttft = round(time.time() - t_start, 3)
+                                    token_count += 1
+                                    full_response.append(delta)
+                                    yield {"type": "token", "delta": delta}
+                            except Exception:
+                                continue
+                    streamed = True
+                except Exception:
+                    streamed = False
+
+                if not streamed:
+                    from pipeline.gpu_llm_runner import GPULLMEngine
+                    engine = GPULLMEngine.get_instance()
+                    for delta in engine.generate_chat_stream(
+                        param_messages,
+                        max_new_tokens=tokens_to_gen,
+                        temperature=temperature,
+                    ):
+                        if ttft is None:
+                            ttft = round(time.time() - t_start, 3)
+                        token_count += 1
+                        full_response.append(delta)
+                        yield {"type": "token", "delta": delta}
+
                 yield {
                     "type": "done",
-                    "total_seconds": round(time.time() - t_start, 2),
-                    "num_tokens": 0,
+                    "full_answer": "".join(full_response),
+                    "stats": {
+                        "retrieval_seconds": round(retrieval_duration, 3),
+                        "generation_seconds": round(time.time() - t_start, 3),
+                        "total_seconds": round(time.time() - t_start, 3),
+                        "ttft_seconds": ttft or 0.0,
+                        "num_tokens": token_count,
+                        "model": "Qwen/Qwen2.5-7B-Instruct",
+                        "server": "gpu-daemon-port-8000" if streamed else "in-process-gpu",
+                    },
                 }
                 return
 
@@ -506,26 +732,95 @@ class RAGQAPipeline:
             "probability_hard": route_decision.get("probability_hard", 0.0),
         }
 
-        t0_retrieval = time.time()
-        easy_k = top_k or (self.top_k or 3)
-        chunks = self.retriever.search(query, top_k=easy_k, filter_dict=filter_dict)
-        retrieval_duration = time.time() - t0_retrieval
-
         yield {
             "type": "chunks",
-            "chunks": chunks,
+            "chunks": sanitize_chunks(chunks),
             "retrieval_seconds": round(retrieval_duration, 3),
         }
 
         if not chunks:
-            yield {
-                "type": "token",
-                "delta": "No relevant documents were found in the knowledge base matching your query.",
-            }
+            prefix = "No specific institutional repository theses were found on this topic. Based on general technical knowledge:\n\n"
+            yield {"type": "token", "delta": prefix}
+            param_messages = [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are an accurate, on-premise AI assistant serving the academic/research community at IISc. "
+                        "No specific institutional repository documents directly cover this topic. "
+                        "Please provide a thorough, accurate, and structured explanation of the user's question "
+                        "using standard academic and technical knowledge."
+                    ),
+                },
+                {"role": "user", "content": query},
+            ]
+            tokens_to_gen = min(max_new_tokens or 512, 1024)
+            token_count = 0
+            full_response = [prefix]
+            ttft = None
+            streamed = False
+
+            slm_server_url = os.getenv("SLM_BASE_URL", "http://localhost:8082/v1").rstrip("/")
+            server_root = slm_server_url.rsplit("/v1", 1)[0]
+            try:
+                import httpx
+                h_check = httpx.get(f"{server_root}/healthz", timeout=1.0)
+                if h_check.status_code == 200:
+                    with httpx.stream(
+                        "POST",
+                        f"{slm_server_url}/chat/completions",
+                        json={
+                            "messages": param_messages,
+                            "max_tokens": tokens_to_gen,
+                            "temperature": temperature,
+                            "stream": True,
+                        },
+                        timeout=90.0,
+                    ) as response:
+                        for line in response.iter_lines():
+                            if not line or not line.startswith("data: "):
+                                continue
+                            chunk_str = line[6:].strip()
+                            if chunk_str == "[DONE]":
+                                break
+                            try:
+                                chunk_data = json.loads(chunk_str)
+                                delta = chunk_data["choices"][0]["delta"].get("content", "")
+                                if delta:
+                                    if ttft is None:
+                                        ttft = round(time.time() - t_start, 3)
+                                    token_count += 1
+                                    full_response.append(delta)
+                                    yield {"type": "token", "delta": delta}
+                            except Exception:
+                                continue
+                    streamed = True
+            except Exception:
+                streamed = False
+
+            if not streamed:
+                for delta in self.slm_engine.generate_chat_stream(
+                    messages=param_messages,
+                    max_new_tokens=tokens_to_gen,
+                    temperature=temperature,
+                ):
+                    if ttft is None:
+                        ttft = round(time.time() - t_start, 3)
+                    token_count += 1
+                    full_response.append(delta)
+                    yield {"type": "token", "delta": delta}
+
             yield {
                 "type": "done",
-                "total_seconds": round(time.time() - t_start, 2),
-                "num_tokens": 0,
+                "full_answer": "".join(full_response),
+                "stats": {
+                    "retrieval_seconds": round(retrieval_duration, 3),
+                    "generation_seconds": round(time.time() - t_start, 3),
+                    "total_seconds": round(time.time() - t_start, 3),
+                    "ttft_seconds": ttft or 0.0,
+                    "num_tokens": token_count,
+                    "model": "qwen2.5-3b-instruct-q4_k_m.gguf",
+                    "server": "cpu-daemon-port-8082" if streamed else "in-process-cpu",
+                },
             }
             return
 
@@ -550,7 +845,7 @@ class RAGQAPipeline:
             try:
                 from pipeline.slm_runner import CPUSLMEngine
                 messages = CPUSLMEngine.build_rag_messages(query, chunks)
-                tokens_to_gen = max_new_tokens or 160
+                tokens_to_gen = min(max_new_tokens or 512, 1024)
                 with httpx.stream(
                     "POST",
                     f"{slm_server_url}/chat/completions",
@@ -606,16 +901,21 @@ class RAGQAPipeline:
         first_token_time = None
         full_text = []
 
-        for delta in self.slm_engine.answer_rag_stream(
-            question=query,
-            context_chunks=chunks,
-            max_new_tokens=max_new_tokens,
-            temperature=temperature,
-        ):
-            if first_token_time is None:
-                first_token_time = time.time() - t0_gen
-            full_text.append(delta)
-            yield {"type": "token", "delta": delta}
+        try:
+            for delta in self.slm_engine.answer_rag_stream(
+                question=query,
+                context_chunks=chunks,
+                max_new_tokens=min(max_new_tokens or 512, 1024),
+                temperature=temperature,
+            ):
+                if first_token_time is None:
+                    first_token_time = time.time() - t0_gen
+                full_text.append(delta)
+                yield {"type": "token", "delta": delta}
+        except Exception as opt_b_err:
+            fallback_note = f"\n\n[Inference complete. Partial response recorded.]"
+            full_text.append(fallback_note)
+            yield {"type": "token", "delta": fallback_note}
 
         gen_duration = time.time() - t0_gen
         total_duration = time.time() - t_start

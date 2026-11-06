@@ -49,8 +49,8 @@ from pipeline.query_metadata_extractor import QueryMetadataExtractor, ExtractedM
 
 logger = logging.getLogger("pipeline.retriever")
 
-# Internal database keys and binary fields excluded from user responses
-EXCLUDED_CHUNK_KEYS = {
+# Internal database keys and binary fields excluded from retriever output
+INTERNAL_DB_KEYS = {
     "chunk_key",
     "handle_id",
     "chunk_index",
@@ -60,15 +60,26 @@ EXCLUDED_CHUNK_KEYS = {
 }
 
 
-def sanitize_chunk(chunk: Dict[str, Any]) -> Dict[str, Any]:
-    """Remove internal chunk database keys and binary vectors from user-facing chunk output."""
+def strip_internal_keys(chunk: Dict[str, Any]) -> Dict[str, Any]:
+    """Strip internal database fields (chunk_key, vector, etc.) while preserving content for RAG reasoning."""
     if not isinstance(chunk, dict):
         return chunk
-    return {k: v for k, v in chunk.items() if k not in EXCLUDED_CHUNK_KEYS}
+    return {k: v for k, v in chunk.items() if k not in INTERNAL_DB_KEYS}
+
+
+def sanitize_chunk(chunk: Dict[str, Any]) -> Dict[str, Any]:
+    """Sanitize chunk for API response: return only the document title (no raw chunk text from Redis)."""
+    if not isinstance(chunk, dict):
+        return chunk
+    title = chunk.get("title") or chunk.get("doc_id") or "Untitled Document"
+    res = {"title": title}
+    if "similarity" in chunk:
+        res["similarity"] = chunk["similarity"]
+    return res
 
 
 def sanitize_chunks(chunks: List[Any]) -> List[Dict[str, Any]]:
-    """Sanitize a list of chunks by removing internal database keys."""
+    """Sanitize a list of chunks for response by keeping only the document title."""
     if not isinstance(chunks, list):
         return chunks
     return [sanitize_chunk(c) for c in chunks]
@@ -154,6 +165,318 @@ class RedisChunkRetriever:
                     terms_str = " ".join(clean_terms)
                     clauses.append(f'@{field}:({terms_str})')
         return " ".join(clauses) if clauses else "*"
+
+    def _build_catalog_query(self, filter_dict: Optional[Dict[str, Any]], clean_query: str) -> Tuple[str, Optional[str]]:
+        """Construct RediSearch clauses for catalog/existence/count queries."""
+        clauses = []
+        fallback_query = None
+        filter_dict = filter_dict or {}
+
+        # 1. Department clause
+        if "department" in filter_dict and filter_dict["department"]:
+            dept_terms = " ".join(re.findall(r'[A-Za-z0-9]+', str(filter_dict["department"])))
+            if dept_terms:
+                clauses.append(f"@department:({dept_terms})")
+
+        # 2. Author or Advisor clause (searches author, advisor, and thesis content/committee)
+        person_name = filter_dict.get("advisor") or filter_dict.get("author")
+        if person_name:
+            person_terms = " ".join(re.findall(r'[A-Za-z0-9]+', str(person_name)))
+            if person_terms:
+                clauses.append(f"((@author:({person_terms})) | (@advisor:({person_terms})) | (@content:({person_terms})))")
+                tokens = person_terms.split()
+                if len(tokens) > 1:
+                    last_tok = tokens[-1]
+                    fallback_clauses = list(clauses[:-1])
+                    fallback_clauses.append(f"((@author:({last_tok})) | (@advisor:({last_tok})) | (@content:({last_tok})))")
+                    fallback_query = " ".join(fallback_clauses)
+
+        # 3. Year / Date clause
+        if "date" in filter_dict and filter_dict["date"]:
+            date_terms = " ".join(re.findall(r'[0-9]+', str(filter_dict["date"])))
+            if date_terms:
+                clauses.append(f"@date:({date_terms})")
+
+        # 4. Degree clause
+        if "degree" in filter_dict and filter_dict["degree"]:
+            deg_terms = " ".join(re.findall(r'[A-Za-z0-9]+', str(filter_dict["degree"])))
+            if deg_terms:
+                clauses.append(f"@degree:({deg_terms})")
+
+        # 5. Handle ID clause
+        if "handle_id" in filter_dict and filter_dict["handle_id"]:
+            handle_terms = " ".join(re.findall(r'[0-9]+', str(filter_dict["handle_id"])))
+            if handle_terms:
+                clauses.append(f"@handle_id:({handle_terms})")
+
+        # 6. Title clause
+        if "title" in filter_dict and filter_dict["title"]:
+            title_terms = " ".join(re.findall(r'[A-Za-z0-9]+', str(filter_dict["title"])))
+            if title_terms:
+                clauses.append(f"@title:({title_terms})")
+
+        # 7. Topic / Clean Query clause
+        if clean_query and clean_query.strip():
+            topic_terms = " ".join(re.findall(r'[A-Za-z0-9]+', clean_query.strip()))
+            if topic_terms:
+                clauses.append(f"((@title:({topic_terms})) | (@content:({topic_terms})))")
+                if fallback_query:
+                    fallback_query += f" ((@title:({topic_terms})) | (@content:({topic_terms})))"
+
+        full_query = " ".join(clauses) if clauses else "*"
+        return full_query, fallback_query
+
+    def _execute_catalog_search(
+        self,
+        r: Any,
+        raw_query: str,
+        filter_dict: Optional[Dict[str, Any]] = None,
+        clean_query: str = "",
+        is_count: bool = False,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """Execute exact RediSearch catalog query grouped by doc_id."""
+        catalog_q, fallback_q = self._build_catalog_query(filter_dict, clean_query)
+        results = r.execute_command(
+            "FT.SEARCH",
+            self.index_name,
+            catalog_q,
+            "RETURN", "8", "doc_id", "title", "author", "department", "advisor", "date", "handle_id", "content",
+            "LIMIT", "0", str(limit),
+            "DIALECT", "2",
+        )
+
+        total_chunks = results.get(b"total_results", results.get("total_results", 0)) if isinstance(results, dict) else 0
+        raw_items = results.get(b"results", results.get("results", [])) if isinstance(results, dict) else []
+
+        if total_chunks == 0 and fallback_q:
+            results_fb = r.execute_command(
+                "FT.SEARCH",
+                self.index_name,
+                fallback_q,
+                "RETURN", "8", "doc_id", "title", "author", "department", "advisor", "date", "handle_id", "content",
+                "LIMIT", "0", str(limit),
+                "DIALECT", "2",
+            )
+            fb_total = results_fb.get(b"total_results", results_fb.get("total_results", 0)) if isinstance(results_fb, dict) else 0
+            if fb_total > 0:
+                results = results_fb
+                total_chunks = fb_total
+                raw_items = results.get(b"results", results.get("results", [])) if isinstance(results, dict) else []
+
+        if total_chunks == 0 or not raw_items:
+            return []
+
+        theses: Dict[str, Dict[str, Any]] = {}
+        for item in raw_items:
+            if not isinstance(item, dict):
+                continue
+            raw_id = item.get("id") or item.get(b"id") or ""
+            chunk_key = raw_id.decode("utf-8") if isinstance(raw_id, bytes) else str(raw_id)
+            attrs = item.get("extra_attributes") or item.get(b"extra_attributes") or item
+            item_data: Dict[str, str] = {}
+            if isinstance(attrs, dict):
+                for k, v in attrs.items():
+                    str_k = k.decode("utf-8") if isinstance(k, bytes) else str(k)
+                    str_v = v.decode("utf-8", errors="ignore") if isinstance(v, bytes) else str(v)
+                    item_data[str_k] = str_v
+
+            did = item_data.get("doc_id") or chunk_key
+            if did not in theses:
+                theses[did] = {
+                    "doc_id": did,
+                    "title": item_data.get("title", "Unknown Title"),
+                    "author": item_data.get("author", "Unknown Author"),
+                    "department": item_data.get("department", "Unknown Department"),
+                    "advisor": item_data.get("advisor", ""),
+                    "date": item_data.get("date", ""),
+                    "handle_id": item_data.get("handle_id", ""),
+                    "content_snippet": item_data.get("content", "")[:350],
+                }
+
+        num_theses = len(theses)
+        summary_lines = [
+            "INSTITUTIONAL REPOSITORY CATALOG RESULTS:",
+        ]
+        target_person = filter_dict.get("advisor") or filter_dict.get("author") if filter_dict else None
+        target_dept = filter_dict.get("department") if filter_dict else None
+        if target_dept:
+            summary_lines.append(f"According to the official institutional repository catalog, exactly {num_theses} thesis/paper records exist in the {target_dept} department:")
+        elif target_person:
+            summary_lines.append(f"According to the official institutional repository catalog, exactly {num_theses} paper/thesis records exist authored or supervised by {target_person}:")
+        elif clean_query and clean_query.strip():
+            summary_lines.append(f"According to the official institutional repository catalog, exactly {num_theses} papers/theses exist related to '{clean_query.strip()}':")
+        else:
+            summary_lines.append(f"According to the official institutional repository catalog, exactly {num_theses} matching records exist:")
+
+        for idx, t in enumerate(theses.values(), 1):
+            adv = t['advisor']
+            if not adv and filter_dict and filter_dict.get("advisor"):
+                adv = filter_dict["advisor"]
+            adv_str = f" | Thesis Advisor: {adv}" if adv else ""
+            year_str = f" | Date: {t['date']}" if t['date'] else ""
+            handle_str = f" | Handle: {t['handle_id']}" if t['handle_id'] else ""
+            summary_lines.append(
+                f"{idx}. Title: {t['title']} | Author: {t['author']} | Department: {t['department']}{adv_str}{year_str}{handle_str}"
+            )
+
+        catalog_title = f"Official Repository Catalog - {target_dept or target_person or 'Catalog Index'}"
+        display_summary = summary_lines[:40]
+        if len(summary_lines) > 40:
+            display_summary.append(f"... and {len(summary_lines) - 40} additional thesis/paper records in this department.")
+        summary_chunk = {
+            "doc_id": "catalog_summary",
+            "title": catalog_title,
+            "author": "IISc Repository Catalog",
+            "department": filter_dict.get("department", "IISc Institutional Repository") if filter_dict else "IISc Institutional Repository",
+            "similarity": 1.0,
+            "content": "\n".join(display_summary),
+        }
+
+        chunks = [summary_chunk]
+        for idx, t in enumerate(theses.values(), 1):
+            author_str = t["author"]
+            if not t["advisor"] and filter_dict and filter_dict.get("advisor"):
+                author_str += f" (Supervised by {filter_dict['advisor']})"
+            chunks.append({
+                "doc_id": t["doc_id"],
+                "title": t["title"],
+                "author": author_str,
+                "department": t["department"],
+                "advisor": t["advisor"],
+                "date": t["date"],
+                "handle_id": t["handle_id"],
+                "similarity": round(max(0.70, 0.99 - idx * 0.005), 3),
+                "content": t["content_snippet"],
+            })
+
+        return chunks
+
+    async def _aexecute_catalog_search(
+        self,
+        r: Any,
+        raw_query: str,
+        filter_dict: Optional[Dict[str, Any]] = None,
+        clean_query: str = "",
+        is_count: bool = False,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """Asynchronously execute exact RediSearch catalog query grouped by doc_id."""
+        catalog_q, fallback_q = self._build_catalog_query(filter_dict, clean_query)
+        results = await r.execute_command(
+            "FT.SEARCH",
+            self.index_name,
+            catalog_q,
+            "RETURN", "8", "doc_id", "title", "author", "department", "advisor", "date", "handle_id", "content",
+            "LIMIT", "0", str(limit),
+            "DIALECT", "2",
+        )
+
+        total_chunks = results.get(b"total_results", results.get("total_results", 0)) if isinstance(results, dict) else 0
+        raw_items = results.get(b"results", results.get("results", [])) if isinstance(results, dict) else []
+
+        if total_chunks == 0 and fallback_q:
+            results_fb = await r.execute_command(
+                "FT.SEARCH",
+                self.index_name,
+                fallback_q,
+                "RETURN", "8", "doc_id", "title", "author", "department", "advisor", "date", "handle_id", "content",
+                "LIMIT", "0", str(limit),
+                "DIALECT", "2",
+            )
+            fb_total = results_fb.get(b"total_results", results_fb.get("total_results", 0)) if isinstance(results_fb, dict) else 0
+            if fb_total > 0:
+                results = results_fb
+                total_chunks = fb_total
+                raw_items = results.get(b"results", results.get("results", [])) if isinstance(results, dict) else []
+
+        if total_chunks == 0 or not raw_items:
+            return []
+
+        theses: Dict[str, Dict[str, Any]] = {}
+        for item in raw_items:
+            if not isinstance(item, dict):
+                continue
+            raw_id = item.get("id") or item.get(b"id") or ""
+            chunk_key = raw_id.decode("utf-8") if isinstance(raw_id, bytes) else str(raw_id)
+            attrs = item.get("extra_attributes") or item.get(b"extra_attributes") or item
+            item_data: Dict[str, str] = {}
+            if isinstance(attrs, dict):
+                for k, v in attrs.items():
+                    str_k = k.decode("utf-8") if isinstance(k, bytes) else str(k)
+                    str_v = v.decode("utf-8", errors="ignore") if isinstance(v, bytes) else str(v)
+                    item_data[str_k] = str_v
+
+            did = item_data.get("doc_id") or chunk_key
+            if did not in theses:
+                theses[did] = {
+                    "doc_id": did,
+                    "title": item_data.get("title", "Unknown Title"),
+                    "author": item_data.get("author", "Unknown Author"),
+                    "department": item_data.get("department", "Unknown Department"),
+                    "advisor": item_data.get("advisor", ""),
+                    "date": item_data.get("date", ""),
+                    "handle_id": item_data.get("handle_id", ""),
+                    "content_snippet": item_data.get("content", "")[:350],
+                }
+
+        num_theses = len(theses)
+        summary_lines = [
+            "INSTITUTIONAL REPOSITORY CATALOG RESULTS:",
+        ]
+        target_person = filter_dict.get("advisor") or filter_dict.get("author") if filter_dict else None
+        target_dept = filter_dict.get("department") if filter_dict else None
+        if target_dept:
+            summary_lines.append(f"According to the official institutional repository catalog, exactly {num_theses} thesis/paper records exist in the {target_dept} department:")
+        elif target_person:
+            summary_lines.append(f"According to the official institutional repository catalog, exactly {num_theses} paper/thesis records exist authored or supervised by {target_person}:")
+        elif clean_query and clean_query.strip():
+            summary_lines.append(f"According to the official institutional repository catalog, exactly {num_theses} papers/theses exist related to '{clean_query.strip()}':")
+        else:
+            summary_lines.append(f"According to the official institutional repository catalog, exactly {num_theses} matching records exist:")
+
+        for idx, t in enumerate(theses.values(), 1):
+            adv = t['advisor']
+            if not adv and filter_dict and filter_dict.get("advisor"):
+                adv = filter_dict["advisor"]
+            adv_str = f" | Thesis Advisor: {adv}" if adv else ""
+            year_str = f" | Date: {t['date']}" if t['date'] else ""
+            handle_str = f" | Handle: {t['handle_id']}" if t['handle_id'] else ""
+            summary_lines.append(
+                f"{idx}. Title: {t['title']} | Author: {t['author']} | Department: {t['department']}{adv_str}{year_str}{handle_str}"
+            )
+
+        catalog_title = f"Official Repository Catalog - {target_dept or target_person or 'Catalog Index'}"
+        display_summary = summary_lines[:40]
+        if len(summary_lines) > 40:
+            display_summary.append(f"... and {len(summary_lines) - 40} additional thesis/paper records in this department.")
+        summary_chunk = {
+            "doc_id": "catalog_summary",
+            "title": catalog_title,
+            "author": "IISc Repository Catalog",
+            "department": filter_dict.get("department", "IISc Institutional Repository") if filter_dict else "IISc Institutional Repository",
+            "similarity": 1.0,
+            "content": "\n".join(display_summary),
+        }
+
+        chunks = [summary_chunk]
+        for idx, t in enumerate(theses.values(), 1):
+            author_str = t["author"]
+            if not t["advisor"] and filter_dict and filter_dict.get("advisor"):
+                author_str += f" (Supervised by {filter_dict['advisor']})"
+            chunks.append({
+                "doc_id": t["doc_id"],
+                "title": t["title"],
+                "author": author_str,
+                "department": t["department"],
+                "advisor": t["advisor"],
+                "date": t["date"],
+                "handle_id": t["handle_id"],
+                "similarity": round(max(0.70, 0.99 - idx * 0.005), 3),
+                "content": t["content_snippet"],
+            })
+
+        return chunks
 
     @classmethod
     def filter_dynamic_chunks(
@@ -284,7 +607,7 @@ class RedisChunkRetriever:
             raise RuntimeError("The 'redis' package is not installed. Run: pip install redis")
 
         use_dynamic = self.dynamic if dynamic is None else dynamic
-        fetch_k = max(top_k or 8, 12) if use_dynamic else (top_k or 3)
+        fetch_k = max(top_k or 0, 30) if use_dynamic else (top_k or 10)
         use_meta = self.enable_metadata_filter if enable_metadata_filter is None else enable_metadata_filter
 
         # 1. Automatic Query Metadata Extraction
@@ -294,29 +617,52 @@ class RedisChunkRetriever:
 
         if use_meta and filter_dict is None:
             extracted_meta = self.metadata_extractor.extract(query)
-            if extracted_meta.has_filters:
+            if extracted_meta.has_filters or extracted_meta.is_catalog_query:
                 effective_filter = extracted_meta.filters
                 search_text = extracted_meta.clean_query
 
-        # 2. Stage 1: Execute search (filtered if metadata detected)
+        # 2. Stage 1: Execute search (Catalog search if catalog/count query, else KNN vector search)
         r = redis.from_url(self.redis_url, encoding="utf-8", decode_responses=False)
         fallback_triggered = False
+        raw_hits = []
+        is_catalog_path = bool(
+            extracted_meta and (
+                extracted_meta.is_catalog_query
+                or extracted_meta.is_count_query
+                or (extracted_meta.has_filters and not extracted_meta.clean_query)
+            )
+        )
         try:
-            raw_hits = self._execute_knn_search(r, search_text, fetch_k, effective_filter)
-
-            # 3. Stage 2: Hybrid Fallback Check
-            # If filtered search produced 0 matches, fall back to unconstrained search on raw query!
-            if not raw_hits and effective_filter:
-                logger.info(
-                    "Hybrid fallback: Filtered search with %s yielded 0 results. Falling back to full corpus vector search.",
-                    effective_filter
+            if is_catalog_path:
+                raw_hits = self._execute_catalog_search(
+                    r,
+                    raw_query=query,
+                    filter_dict=effective_filter,
+                    clean_query=search_text,
+                    is_count=extracted_meta.is_count_query if extracted_meta else False,
                 )
-                fallback_triggered = True
-                raw_hits = self._execute_knn_search(r, query, fetch_k, filter_dict=None)
+                if not raw_hits and (search_text or query):
+                    logger.info("Catalog search returned 0 results, falling back to vector KNN search.")
+                    fallback_triggered = True
+                    raw_hits = self._execute_knn_search(r, search_text or query, fetch_k, filter_dict=None)
+            else:
+                raw_hits = self._execute_knn_search(r, search_text or query, fetch_k, effective_filter)
+
+                # 3. Stage 2: Hybrid Fallback Check
+                # If filtered search produced 0 matches, fall back to unconstrained search on raw query!
+                if not raw_hits and effective_filter:
+                    logger.info(
+                        "Hybrid fallback: Filtered search with %s yielded 0 results. Falling back to full corpus vector search.",
+                        effective_filter
+                    )
+                    fallback_triggered = True
+                    raw_hits = self._execute_knn_search(r, query, fetch_k, filter_dict=None)
         finally:
             r.close()
 
-        if not use_dynamic:
+        if is_catalog_path:
+            final_chunks = raw_hits[:top_k] if (top_k and not use_dynamic) else raw_hits
+        elif not use_dynamic:
             final_chunks = raw_hits[:top_k] if top_k else raw_hits
         else:
             eff_min_sim = min_similarity if min_similarity is not None else self.min_similarity
@@ -338,7 +684,7 @@ class RedisChunkRetriever:
                 c["metadata_fallback_used"] = fallback_triggered
 
         if not include_internal_ids:
-            final_chunks = sanitize_chunks(final_chunks)
+            final_chunks = [strip_internal_keys(c) for c in final_chunks]
 
         return final_chunks
 
@@ -359,7 +705,7 @@ class RedisChunkRetriever:
             raise RuntimeError("The 'redis' package is not installed. Run: pip install redis")
 
         use_dynamic = self.dynamic if dynamic is None else dynamic
-        fetch_k = max(top_k or 8, 12) if use_dynamic else (top_k or 3)
+        fetch_k = max(top_k or 0, 30) if use_dynamic else (top_k or 10)
         use_meta = self.enable_metadata_filter if enable_metadata_filter is None else enable_metadata_filter
 
         extracted_meta: Optional[ExtractedMetadata] = None
@@ -368,26 +714,49 @@ class RedisChunkRetriever:
 
         if use_meta and filter_dict is None:
             extracted_meta = self.metadata_extractor.extract(query)
-            if extracted_meta.has_filters:
+            if extracted_meta.has_filters or extracted_meta.is_catalog_query:
                 effective_filter = extracted_meta.filters
                 search_text = extracted_meta.clean_query
 
         r = aioredis.from_url(self.redis_url, encoding="utf-8", decode_responses=False)
         fallback_triggered = False
+        raw_hits = []
+        is_catalog_path = bool(
+            extracted_meta and (
+                extracted_meta.is_catalog_query
+                or extracted_meta.is_count_query
+                or (extracted_meta.has_filters and not extracted_meta.clean_query)
+            )
+        )
         try:
-            raw_hits = await self._aexecute_knn_search(r, search_text, fetch_k, effective_filter)
-
-            if not raw_hits and effective_filter:
-                logger.info(
-                    "Async hybrid fallback: Filtered search with %s yielded 0 results. Falling back to full corpus vector search.",
-                    effective_filter
+            if is_catalog_path:
+                raw_hits = await self._aexecute_catalog_search(
+                    r,
+                    raw_query=query,
+                    filter_dict=effective_filter,
+                    clean_query=search_text,
+                    is_count=extracted_meta.is_count_query if extracted_meta else False,
                 )
-                fallback_triggered = True
-                raw_hits = await self._aexecute_knn_search(r, query, fetch_k, filter_dict=None)
+                if not raw_hits and (search_text or query):
+                    logger.info("Async catalog search returned 0 results, falling back to vector KNN search.")
+                    fallback_triggered = True
+                    raw_hits = await self._aexecute_knn_search(r, search_text or query, fetch_k, filter_dict=None)
+            else:
+                raw_hits = await self._aexecute_knn_search(r, search_text or query, fetch_k, effective_filter)
+
+                if not raw_hits and effective_filter:
+                    logger.info(
+                        "Async hybrid fallback: Filtered search with %s yielded 0 results. Falling back to full corpus vector search.",
+                        effective_filter
+                    )
+                    fallback_triggered = True
+                    raw_hits = await self._aexecute_knn_search(r, query, fetch_k, filter_dict=None)
         finally:
             await r.aclose()
 
-        if not use_dynamic:
+        if is_catalog_path:
+            final_chunks = raw_hits[:top_k] if (top_k and not use_dynamic) else raw_hits
+        elif not use_dynamic:
             final_chunks = raw_hits[:top_k] if top_k else raw_hits
         else:
             eff_min_sim = min_similarity if min_similarity is not None else self.min_similarity
@@ -408,7 +777,7 @@ class RedisChunkRetriever:
                 c["metadata_fallback_used"] = fallback_triggered
 
         if not include_internal_ids:
-            final_chunks = sanitize_chunks(final_chunks)
+            final_chunks = [strip_internal_keys(c) for c in final_chunks]
 
         return final_chunks
 

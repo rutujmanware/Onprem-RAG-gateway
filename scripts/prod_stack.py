@@ -170,29 +170,30 @@ def start_all():
     slm_st, _ = check_port_health(SLM_PORT, "/healthz")
     if slm_st != "READY":
         if not is_pid_running(pids.get("slm", 0)):
-            print(f"⚡ Starting CPU SLM Server on port {SLM_PORT} (Qwen 2.5 3B GGUF)...")
+            print(f"⚡ Starting CPU SLM Server on port {SLM_PORT} (Qwen 2.5 3B GGUF with 4 parallel workers)...")
             slm_cmd = [
                 PYTHON_BIN, "-m", "pipeline.serve_cpu_slm",
                 "--host", "127.0.0.1",
                 "--port", str(SLM_PORT),
-                "--threads", "8",
+                "--threads", "16",
+                "--workers", "4",
             ]
             pid = start_service("slm", slm_cmd)
             pids["slm"] = pid
     else:
         print(f"✅ CPU SLM Server is already running on port {SLM_PORT}.")
 
-    # 4. Start Production Gateway (No reload, production uvicorn)
+    # 4. Start Production Gateway (No reload, production uvicorn with 6 workers)
     gw_st, _ = check_port_health(GATEWAY_PORT, "/healthz")
     if gw_st != "READY":
         if not is_pid_running(pids.get("gateway", 0)):
-            print(f"🌐 Starting Institutional Gateway on port {GATEWAY_PORT} (0.0.0.0:8080)...")
+            print(f"🌐 Starting Institutional Gateway on port {GATEWAY_PORT} (0.0.0.0:8080 with 6 workers)...")
             gw_cmd = [
                 PYTHON_BIN, "-m", "uvicorn",
                 "gateway.main:app",
                 "--host", "0.0.0.0",
                 "--port", str(GATEWAY_PORT),
-                "--workers", "2",
+                "--workers", "6",
                 "--no-access-log",
             ]
             pid = start_service("gateway", gw_cmd)
@@ -217,14 +218,21 @@ def start_all():
     print_status()
 
 
-def stop_all():
+def stop_all(stop_redis: bool = False, stop_vllm: bool = False):
     pids = load_pids()
     print("=" * 70)
-    print("🛑 STOPPING PRODUCTION RAG GATEWAY STACK")
+    print("🛑 STOPPING PRODUCTION COMPUTE ENGINES")
     print("=" * 70)
 
-    # Stop order: Gateway -> SLM -> vLLM -> Redis
-    service_names = ["gateway", "slm", "vllm", "redis"]
+    # Stop order: Gateway -> SLM (Keep Redis and vLLM active to avoid costly reload)
+    service_names = ["gateway", "slm"]
+    if stop_vllm:
+        service_names.append("vllm")
+    if stop_redis:
+        service_names.append("redis")
+    else:
+        print("ℹ️ Preserving Redis RAM (2.26M document vectors active on port 6379).")
+
     for name in service_names:
         pid = pids.get(name)
         if pid and is_pid_running(pid):
@@ -236,8 +244,11 @@ def stop_all():
         else:
             # Fallback search if PID file was missing
             try:
-                subprocess.run(f"pkill -f 'serve_cpu_slm' 2>/dev/null || true", shell=True)
-                if name == "redis":
+                if name == "slm":
+                    subprocess.run(f"pkill -f 'serve_cpu_slm' 2>/dev/null || true", shell=True)
+                elif name == "gateway":
+                    subprocess.run(f"fuser -k {GATEWAY_PORT}/tcp 2>/dev/null || true", shell=True)
+                elif name == "redis" and stop_redis:
                     subprocess.run(f"pkill -f 'redis-stack-server' 2>/dev/null || true", shell=True)
             except Exception:
                 pass
@@ -253,9 +264,10 @@ def stop_all():
             except Exception:
                 pass
 
-    if PID_FILE.exists():
-        PID_FILE.unlink()
-    print("✅ All services stopped. GPU VRAM and CPU threads released.")
+    # Update PID file to keep preserved services
+    remaining_pids = {k: v for k, v in pids.items() if k not in service_names}
+    save_pids(remaining_pids)
+    print("✅ Compute engines stopped.")
 
 
 def print_status():
@@ -298,9 +310,8 @@ def print_status():
 
     print("=" * 70)
     if all_ready:
-        print("🎉 ALL SYSTEMS ONLINE & OPERATIONAL: Ready for high-concurrency campus traffic.")
-        print("🌐 Public API Endpoint: http://0.0.0.0:8080/query")
-        print("📄 API Documentation:   http://0.0.0.0:8080/docs")
+        print("🎉 ALL SYSTEMS ONLINE & OPERATIONAL: Ready for campus traffic.")
+        print("🌐 Unified AskIISc Frontend UI: http://0.0.0.0:8080/")
     elif has_loading:
         print("⏳ STACK IS INITIALIZING: Redis is actively loading its 12GB dataset into RAM.")
         print("💡 Run 'make redis-watch' in another terminal to track live loading progress.")

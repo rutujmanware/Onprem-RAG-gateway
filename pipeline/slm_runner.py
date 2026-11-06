@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -64,6 +65,7 @@ class CPUSLMEngine:
         self.dtype = dtype
         self.device = torch.device("cpu")
         self.is_gguf = str(self.model_name).endswith(".gguf") or os.getenv("SLM_ENGINE") == "gguf"
+        self._lock = threading.Lock()
 
         # Apply thread settings to prevent core thrashing across NUMA nodes
         torch.set_num_threads(self.num_threads)
@@ -84,7 +86,7 @@ class CPUSLMEngine:
                 n_threads=self.num_threads,
                 n_threads_batch=self.num_threads_batch,
                 n_batch=512,
-                n_ctx=int(os.getenv("SLM_CONTEXT_WINDOW", "2048")),
+                n_ctx=int(os.getenv("SLM_CONTEXT_WINDOW", "8192")),
                 verbose=False,
             )
             self.tokenizer = None
@@ -112,7 +114,7 @@ class CPUSLMEngine:
     def generate_chat(
         self,
         messages: List[Dict[str, str]],
-        max_new_tokens: int = 160,
+        max_new_tokens: int = 1024,
         temperature: float = 0.2,
         top_p: float = 0.8,
         do_sample: bool = False,
@@ -120,13 +122,43 @@ class CPUSLMEngine:
         """Generate response given a list of chat messages [{'role': ..., 'content': ...}]."""
         if self.is_gguf:
             t0 = time.time()
-            response = self.model.create_chat_completion(
-                messages=messages,
-                max_tokens=max_new_tokens,
-                temperature=float(temperature) if do_sample else 0.0,
-                top_p=float(top_p) if do_sample else 1.0,
-                stream=False,
-            )
+            n_ctx = self.model.n_ctx() if hasattr(self.model, "n_ctx") else 8192
+            raw_text = "".join(m.get("content", "") for m in messages)
+            try:
+                prompt_tokens = len(self.model.tokenize(raw_text.encode("utf-8", errors="ignore"))) + len(messages) * 16
+            except Exception:
+                prompt_tokens = len(raw_text) // 3 + 64
+
+            # If prompt alone exceeds context window, truncate user message content
+            if prompt_tokens > n_ctx - 256 and messages:
+                max_content_chars = int((n_ctx - 512) * 2.5)
+                messages[-1]["content"] = messages[-1]["content"][:max_content_chars] + "\n\n[Context truncated to fit context budget]"
+                raw_text = "".join(m.get("content", "") for m in messages)
+                try:
+                    prompt_tokens = len(self.model.tokenize(raw_text.encode("utf-8", errors="ignore"))) + len(messages) * 16
+                except Exception:
+                    prompt_tokens = len(raw_text) // 3 + 64
+
+            available_tokens = max(32, n_ctx - prompt_tokens - 16)
+            effective_max_tokens = min(max_new_tokens, available_tokens)
+
+            with self._lock:
+                try:
+                    response = self.model.create_chat_completion(
+                        messages=messages,
+                        max_tokens=effective_max_tokens,
+                        temperature=float(temperature) if do_sample else 0.0,
+                        top_p=float(top_p) if do_sample else 1.0,
+                        stream=False,
+                    )
+                except ValueError:
+                    response = self.model.create_chat_completion(
+                        messages=messages,
+                        max_tokens=max(32, available_tokens // 2),
+                        temperature=float(temperature) if do_sample else 0.0,
+                        top_p=float(top_p) if do_sample else 1.0,
+                        stream=False,
+                    )
             latency = time.time() - t0
             choice = response["choices"][0]
             generated_text = choice["message"].get("content", "").strip()
@@ -188,24 +220,48 @@ class CPUSLMEngine:
     def generate_chat_stream(
         self,
         messages: List[Dict[str, str]],
-        max_new_tokens: int = 160,
+        max_new_tokens: int = 1024,
         temperature: float = 0.2,
         top_p: float = 0.8,
         do_sample: bool = False,
     ):
         """Generator yielding token text deltas in real-time as they generate on CPU."""
         if self.is_gguf:
-            stream_resp = self.model.create_chat_completion(
-                messages=messages,
-                max_tokens=max_new_tokens,
-                temperature=float(temperature) if do_sample else 0.0,
-                top_p=float(top_p) if do_sample else 1.0,
-                stream=True,
-            )
-            for chunk in stream_resp:
-                delta = chunk["choices"][0]["delta"].get("content", "")
-                if delta:
-                    yield delta
+            n_ctx = self.model.n_ctx() if hasattr(self.model, "n_ctx") else 8192
+            raw_text = "".join(m.get("content", "") for m in messages)
+            try:
+                prompt_tokens = len(self.model.tokenize(raw_text.encode("utf-8", errors="ignore"))) + len(messages) * 16
+            except Exception:
+                prompt_tokens = len(raw_text) // 3 + 64
+
+            # If prompt alone exceeds context window, truncate user message content
+            if prompt_tokens > n_ctx - 256 and messages:
+                max_content_chars = int((n_ctx - 512) * 2.5)
+                messages[-1]["content"] = messages[-1]["content"][:max_content_chars] + "\n\n[Context truncated to fit context budget]"
+                raw_text = "".join(m.get("content", "") for m in messages)
+                try:
+                    prompt_tokens = len(self.model.tokenize(raw_text.encode("utf-8", errors="ignore"))) + len(messages) * 16
+                except Exception:
+                    prompt_tokens = len(raw_text) // 3 + 64
+
+            available_tokens = max(32, n_ctx - prompt_tokens - 16)
+            effective_max_tokens = min(max_new_tokens, available_tokens)
+
+            with self._lock:
+                try:
+                    stream_resp = self.model.create_chat_completion(
+                        messages=messages,
+                        max_tokens=effective_max_tokens,
+                        temperature=float(temperature) if do_sample else 0.0,
+                        top_p=float(top_p) if do_sample else 1.0,
+                        stream=True,
+                    )
+                    for chunk in stream_resp:
+                        delta = chunk["choices"][0]["delta"].get("content", "")
+                        if delta:
+                            yield delta
+                except Exception as e:
+                    yield f"\n\n[Generation note: Context window limit reached: {str(e)[:100]}]"
             return
 
         from transformers import TextIteratorStreamer
@@ -258,19 +314,17 @@ class CPUSLMEngine:
         """Constructs a grounded, hallucination-resistant chat prompt for RAG."""
         if not system_prompt:
             system_prompt = (
-                "You are an accurate, on-premise AI assistant serving the academic/research community. "
-                "Your objective is to answer user questions truthfully using strictly the provided context chunks.\n\n"
-                "Strict Guidelines:\n"
-                "1. Answer concisely and directly in 2 to 4 factual sentences based strictly on the provided context.\n"
-                "2. Avoid unnecessary background introductions, preamble, or repetition.\n"
-                "3. Strict Grounding & Refusal: If the provided documents do not directly, specifically, and unambiguously answer the user's question, you MUST refuse and state: "
-                "\"Based on the provided documents, there is insufficient information to answer this question.\" "
-                "Do NOT attempt to infer, extrapolate, speculate, or synthesize an answer from tangential, passing, or out-of-context mentions.\n"
-                "4. Cite your sources clearly using the document Title (e.g., [Source: <Title>]) or [Document i]. Never fabricate or cite internal chunk keys/IDs.\n"
-                "5. Keep the answer clear, structured, and factual."
+                "You are an accurate, on-premise AI assistant serving the academic/research community at IISc.\n\n"
+                "Guidelines:\n"
+                "1. Repository & Thesis Queries: For repository-specific questions (e.g., thesis details, authors, department counts, specific empirical findings), base your answer strictly on the provided documents. Cite sources using [Document i] or [Source: <Title>]. If the documents lack the specific repository data requested, state clearly what is or is not available.\n"
+                "2. Conceptual & Technical Explanations: For general foundational concepts, algorithms, data structures, or scientific principles (e.g., binary search, caching, sorting, neural networks), provide a clear, accurate, and structured technical explanation (including methodology, time complexity, or key steps). When the provided documents mention or apply the concept, connect your explanation directly to the context chunks.\n"
+                "3. Conciseness & Precision: Keep answers structured, factual, and free of extraneous preamble."
             )
 
         context_blocks = []
+        max_chars = 12000  # ~3000 tokens, leaves ~5000 tokens headroom in 8192 context window
+        current_chars = 0
+
         for i, chunk in enumerate(context_chunks, 1):
             title = chunk.get("title", "Unknown Title")
             author = chunk.get("author", "Unknown Author")
@@ -281,7 +335,18 @@ class CPUSLMEngine:
                 header += f" | Author: {author}"
             header += "]"
 
-            context_blocks.append(f"{header}\n{content}")
+            block = f"{header}\n{content}"
+            if current_chars + len(block) > max_chars:
+                if context_blocks:
+                    break
+                # If first block alone exceeds budget, trim it safely
+                allowed = max(200, max_chars - current_chars)
+                block = block[:allowed] + "\n... [Context truncated to fit model context window]"
+                context_blocks.append(block)
+                break
+
+            context_blocks.append(block)
+            current_chars += len(block)
 
         context_str = "\n\n".join(context_blocks)
         user_content = f"### Retrieved Context:\n{context_str}\n\n### User Question:\n{question}\n\n### Grounded Answer:"
@@ -295,7 +360,7 @@ class CPUSLMEngine:
         self,
         question: str,
         context_chunks: List[Dict[str, Any]],
-        max_new_tokens: int = 160,
+        max_new_tokens: int = 1024,
         temperature: float = 0.2,
     ) -> Dict[str, Any]:
         """Convenience method to generate a grounded RAG answer from context chunks."""
@@ -311,7 +376,7 @@ class CPUSLMEngine:
         self,
         question: str,
         context_chunks: List[Dict[str, Any]],
-        max_new_tokens: int = 160,
+        max_new_tokens: int = 1024,
         temperature: float = 0.2,
     ):
         """Streaming generator for grounded RAG answer from context chunks."""

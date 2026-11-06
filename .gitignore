@@ -1,9 +1,48 @@
-# Environments
+# Environments & Configs
 .env
+.env.*
+.env*.local
+*.env
+*.env.*
+!.env.example
+!*.env.example
+!**/*.env.example
 .venv/
 venv/
 env/
 myenv/
+
+# Passwords, Secrets, Keys & Credentials
+*password*
+*passwd*
+*secret*.json
+*secret*.yaml
+*secret*.yml
+*secret*.txt
+secrets/
+.secrets/
+credentials.json
+*credential*.json
+*credential*.yaml
+*credential*.yml
+*credential*.txt
+*auth_token*
+*api_key*
+*access_token*
+*.pem
+*.key
+*.pkcs12
+*.pfx
+*.p12
+*.kdbx
+*.keystore
+id_rsa*
+id_ed25519*
+
+# Runtime, Process & PID Files
+*.pid
+run/
+askiisc_chat/run/
 
 # Python Cache
 __pycache__/

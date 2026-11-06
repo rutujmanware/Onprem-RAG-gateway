@@ -16,6 +16,7 @@ import os
 import sys
 import time
 import uuid
+import hashlib
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -255,6 +256,23 @@ class RedisSemanticCache:
         self.init_index()
         th = threshold or self.similarity_threshold
 
+        # Fast path 0: Exact normalized text hash match (< 1ms in Redis, 0 CPU compute)
+        norm_q = query.strip().lower()
+        exact_key = f"{self.key_prefix}exact:{hashlib.sha256(norm_q.encode('utf-8')).hexdigest()}"
+        try:
+            raw_exact = self.sync_client.get(exact_key)
+            if raw_exact:
+                exact_data = json.loads(raw_exact.decode("utf-8") if isinstance(raw_exact, bytes) else raw_exact)
+                return {
+                    "cached": True,
+                    "similarity": 1.0,
+                    "matched_prompt": exact_data.get("prompt", query),
+                    "response": exact_data.get("response", {}),
+                    "fast_exact": True,
+                }
+        except Exception:
+            pass
+
         try:
             query_vec = self.embedder.embed_query(query)
             vec_bytes = np.array(query_vec, dtype=np.float32).tobytes()
@@ -315,6 +333,23 @@ class RedisSemanticCache:
         """Asynchronously lookup semantically similar cached query from Redis."""
         await self.ainit_index()
         th = threshold or self.similarity_threshold
+
+        # Fast path 0: Exact normalized text hash match (< 1ms in Redis, 0 CPU compute)
+        norm_q = query.strip().lower()
+        exact_key = f"{self.key_prefix}exact:{hashlib.sha256(norm_q.encode('utf-8')).hexdigest()}"
+        try:
+            raw_exact = await self.async_client.get(exact_key)
+            if raw_exact:
+                exact_data = json.loads(raw_exact.decode("utf-8") if isinstance(raw_exact, bytes) else raw_exact)
+                return {
+                    "cached": True,
+                    "similarity": 1.0,
+                    "matched_prompt": exact_data.get("prompt", query),
+                    "response": exact_data.get("response", {}),
+                    "fast_exact": True,
+                }
+        except Exception:
+            pass
 
         try:
             # Vector embedding in thread to preserve async event loop
@@ -403,6 +438,14 @@ class RedisSemanticCache:
 
             self.sync_client.hset(key, mapping=payload)
             self.sync_client.expire(key, ttl)
+
+            # Store exact hash key for sub-millisecond fast path
+            try:
+                norm_q = query.strip().lower()
+                exact_key = f"{self.key_prefix}exact:{hashlib.sha256(norm_q.encode('utf-8')).hexdigest()}"
+                self.sync_client.set(exact_key, json.dumps({"prompt": query, "response": response}), ex=ttl)
+            except Exception:
+                pass
             return True
         except Exception as err:
             logger.warning("Failed to store semantic cache entry: %s", err)
@@ -443,6 +486,14 @@ class RedisSemanticCache:
 
             await self.async_client.hset(key, mapping=payload)
             await self.async_client.expire(key, ttl)
+
+            # Store exact hash key for sub-millisecond fast path
+            try:
+                norm_q = query.strip().lower()
+                exact_key = f"{self.key_prefix}exact:{hashlib.sha256(norm_q.encode('utf-8')).hexdigest()}"
+                await self.async_client.set(exact_key, json.dumps({"prompt": query, "response": response}), ex=ttl)
+            except Exception:
+                pass
             return True
         except Exception as err:
             logger.warning("Failed to async store semantic cache entry: %s", err)
@@ -504,10 +555,14 @@ class RedisSemanticCache:
         try:
             keys = self.sync_client.keys(f"{self.key_prefix}*")
             for k in keys:
-                raw_resp = self.sync_client.hget(k, "response")
-                if not raw_resp:
-                    continue
                 try:
+                    k_type = self.sync_client.type(k)
+                    k_type_str = k_type.decode("utf-8") if isinstance(k_type, bytes) else str(k_type)
+                    if k_type_str != "hash":
+                        continue
+                    raw_resp = self.sync_client.hget(k, "response")
+                    if not raw_resp:
+                        continue
                     resp_str = raw_resp.decode("utf-8", errors="replace") if isinstance(raw_resp, bytes) else str(raw_resp)
                     resp_data = json.loads(resp_str)
                     cacheable, _ = self.is_cacheable_response(resp_data)
@@ -527,10 +582,14 @@ class RedisSemanticCache:
         try:
             keys = await self.async_client.keys(f"{self.key_prefix}*")
             for k in keys:
-                raw_resp = await self.async_client.hget(k, "response")
-                if not raw_resp:
-                    continue
                 try:
+                    k_type = await self.async_client.type(k)
+                    k_type_str = k_type.decode("utf-8") if isinstance(k_type, bytes) else str(k_type)
+                    if k_type_str != "hash":
+                        continue
+                    raw_resp = await self.async_client.hget(k, "response")
+                    if not raw_resp:
+                        continue
                     resp_str = raw_resp.decode("utf-8", errors="replace") if isinstance(raw_resp, bytes) else str(raw_resp)
                     resp_data = json.loads(resp_str)
                     cacheable, _ = self.is_cacheable_response(resp_data)

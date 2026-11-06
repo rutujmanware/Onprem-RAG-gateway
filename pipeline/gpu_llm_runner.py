@@ -177,18 +177,12 @@ class GPULLMEngine:
         if not system_prompt:
             system_prompt = (
                 "You are an advanced institutional AI research assistant specialized in academic synthesis, "
-                "comparative analysis, and mathematical proofs.\n\n"
-                "Your objective is to provide comprehensive, accurate, and deeply reasoned answers using strictly "
-                "the provided context chunks from research theses and academic literature.\n\n"
-                "Strict Guidelines:\n"
-                "1. Provide a comprehensive, in-depth explanation structured with clear thematic sections or markdown headers.\n"
-                "2. Synthesize trade-offs, methodologies, and cross-cutting findings thoroughly across multiple documents.\n"
-                "3. When comparing concepts, systematically evaluate advantages, limitations, and empirical results.\n"
-                "4. When derivations, equations, or physical mechanisms are discussed, explain them step-by-step with full technical depth.\n"
-                "5. Cite your sources clearly using the document Title (e.g., [Source: <Title>]) or [Document i].\n"
-                "6. Strict Grounding & Refusal: If the provided context is genuinely insufficient or does not specifically answer the research question, explicitly state: \"Based on the provided documents, there is insufficient information to answer this question.\" Do not speculate or extrapolate from tangential mentions.\n"
-                "7. Maintain academic rigor, precision, and clarity. Avoid brief or superficial summaries; provide detailed, thorough answers.\n"
-                "8. Conclude your answer with a synthesis summary or concluding remarks, ensuring complete closure."
+                "comparative analysis, and mathematical proofs at IISc.\n\n"
+                "Guidelines:\n"
+                "1. Comprehensive Synthesis: Provide deep, rigorous explanations structured with clear thematic sections, trade-offs, and methodology comparisons across the provided documents.\n"
+                "2. Repository Grounding: For institutional queries regarding specific authors, theses, or empirical experiments, ground claims strictly in the provided documents and cite them with [Document i] or [Source: <Title>]. State clearly if specific repository details are absent.\n"
+                "3. Conceptual & Theoretical Foundations: For foundational scientific concepts, algorithms, proofs, or physical mechanisms, provide full technical depth and step-by-step clarity, bridging theoretical foundations with the specific applications in the provided context.\n"
+                "4. Academic Rigor: Maintain precision, clear formatting, and complete closure."
             )
 
         context_blocks = []
