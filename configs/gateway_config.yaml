@@ -1,84 +1,76 @@
+# ==============================================================================
+# AskIISc On-Premise Institutional RAG Gateway Configuration
+# ==============================================================================
+
 gateway:
   host: "0.0.0.0"
   port: 8080
-  workers: 4
+  workers: 6
   timeout_seconds: 60.0
-
-redis:
-  url: "redis://:Redis*2703!@localhost:6379/0"
-  decode_responses: false
-
-embedder:
-  model_name: "models/embeddings/all-MiniLM-L6-v2"
-  cache_folder: "models/embeddings"
-  dimension: 384
-  device: "cpu"
 
 routing:
-  alpha: 0.65
-  fallback_to_cpu_on_gpu_saturation: false
+  alpha: 0.65                                      # MLP Decision threshold: P(Hard) >= 0.65 -> GPU 7B, else CPU 3B
+  fallback_to_cpu_on_gpu_saturation: true
   complexity_model_path: "gateway/router/models/scorer.onnx"
   embedding_dimension: 384
-
-slm:
-  model_name: "Qwen/Qwen2.5-1.5B-Instruct-GGUF"
-  base_url: "http://cpu-slm:8080/v1"
-  timeout_seconds: 30.0
-
-vllm:
-  model_name: "Qwen/Qwen2.5-7B-Instruct-AWQ"
-  base_url: "http://vllm:8000/v1"
-  timeout_seconds: 60.0
+  embedding_model: "sentence-transformers/all-MiniLM-L6-v2"
 
 admission:
-  global_concurrency_limit: 12
-  per_user_concurrency_limit: 4
-  max_queue_depth: 100
-  queue_wait_timeout_seconds: 15.0
+  global_concurrency_limit: 30                    # Total simultaneous active inferences across all workers
+  per_user_concurrency_limit: 6                   # Max concurrent in-flight requests per individual user account
+  max_queue_depth: 120                            # Max waiting queue depth before 503 shedding
+  queue_wait_timeout_seconds: 30.0                # Max wait time in queue before 503 timeout
   scheduling_policy: "fair_round_robin"
 
 rate_limiting:
   enabled: true
   token_bucket:
-    capacity: 20
-    refill_rate: 5.0
-    burst_limit: 10
+    capacity: 60.0                                # Max burst token bucket capacity per user
+    refill_rate: 20.0                             # Tokens refilled per second
+  otp_verification:
+    max_attempts_per_minute_ip: 10                # Max OTP verify attempts per minute per IP (429 on breach)
+    max_attempts_per_minute_email: 10             # Max OTP verify attempts per minute per email
 
 cache:
-  l0_exact:
-    enabled: true
-    ttl_seconds: 3600
-    prefix: "l0:exact:"
-  l1_semantic:
-    enabled: true
-    similarity_threshold: 0.85
-    confident_threshold: 0.96
-    vector_dimension: 384
-    ttl_seconds: 7200
-    index_name: "l1_semantic_cache_idx"
-    prefix: "l1:cache:"
-    enforce_entity_guard: true
-    enable_stage2_validation: true
-    enable_stage3_verification: true
-    enable_volatile_guard: true
-    default_doc_version: "v1"
-
-retrieval:
-  index_name: "rag_documents_idx"
-  top_k: 5
-  max_context_tokens: 16000
-  require_evidence: true
+  enabled: true
+  similarity_threshold: 0.90                    # Cosine distance <= 0.10 (similarity >= 0.90)
+  vector_dimension: 384
+  ttl_seconds: 86400                            # 24 hours semantic cache TTL (86,400s)
+  index_name: "semantic_cache_idx"              # RediSearch HNSW Cosine Vector Index
+  key_prefix: "semcache:"
+  policy:
+    disallow_unretrieved_caching: true          # Never cache responses with zero retrieved chunks
+    disallow_insufficient_data_caching: true    # Never cache refusals / out-of-domain conversational queries
+    purge_uncacheable_on_startup: true
 
 security:
-  strict_auth: true
-  prompt_injection_mode: "refuse"
-  personalized_query_mode: "refuse"
+  session:
+    cookie_name: "askiisc_session"
+    samesite: "strict"                            # Enforce SameSite=Strict on session cookies
+    httponly: true
+    min_secret_entropy_bits: 256
+  csrf:
+    cookie_name: "csrftoken"
+    header_name: "X-CSRF-Token"
+    double_submit: true
+  api_docs:
+    enabled: false                                # /docs, /redoc, /openapi.json disabled (returns 404 in production)
+  prompt_injection_fence:
+    enabled: true                                 # NFR-7 injection pattern detection and XML delimiter fencing
 
 auth:
   enforce_domain: "iisc.ac.in"
+  allowed_domains:
+    - "@iisc.ac.in"
+    - "@gmail.com"
   allow_subdomains: true
+  otp:
+    code_length: 6
+    cooldown_seconds: 60
+    ttl_seconds: 600
+    atomic_burn_lua: true                         # Prevents TOCTOU concurrency race conditions
   bypass_endpoints:
-    - "/healthz"
-    - "/metrics"
-    - "/docs"
-    - "/openapi.json"
+    - "/health"
+    - "/"
+    - "/index.html"
+    - "/me"

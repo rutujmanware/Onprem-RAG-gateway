@@ -1,72 +1,56 @@
-# ==========================================
-# 1. Environments & Secrets (Local Only)
-# ==========================================
+# Environments & Configs
 .env
-.env*
-.env.example
-.env.local
-.env.bak
+.env.*
+.env*.local
+*.env
+*.env.*
+!.env.example
+!*.env.example
+!**/*.env.example
+.venv/
+venv/
+env/
+myenv/
 
-# Certificates & SSH Keys
+# Passwords, Secrets, Keys & Credentials
+*password*
+*passwd*
+*secret*.json
+*secret*.yaml
+*secret*.yml
+*secret*.txt
+secrets/
+.secrets/
+credentials.json
+*credential*.json
+*credential*.yaml
+*credential*.yml
+*credential*.txt
+*auth_token*
+*api_key*
+*access_token*
 *.pem
 *.key
-*.crt
-*.cert
+*.pkcs12
 *.pfx
 *.p12
+*.kdbx
+*.keystore
 id_rsa*
 id_ed25519*
 
-# ==========================================
-# 2. Redis Databases & Persistence Files
-# ==========================================
-*.rdb
-dump.rdb
-dump_*.rdb
-dump*.rdb
-*.aof
-appendonlydir/
-redis_server_data/
-redis-stack-server-*/
-redis-stack.tar.gz
-*.tar.gz
-*.npy
+# Runtime, Process & PID Files
 *.pid
+run/
+askiisc_chat/run/
 
-
-# ==========================================
-# 3. Model Weights & Large Binaries (>100MB)
-# ==========================================
-models/slm_gguf/*
-models/llm_7b/*
-models/embeddings/*
-!models/**/.gitkeep
-!models/**/README.md
-
-# General model checkpoints
-*.gguf
-*.safetensors
-*.bin
-*.pt
-*.pth
-
-# ==========================================
-# 4. Scraped Datasets & Raw Documents
-# ==========================================
-data/
-*.pdf
-
-# Preserve evaluation benchmark datasets
-!evaluation/datasets/*.json
-
-# ==========================================
-# 5. Python Build, Cache & Test Artifacts
-# ==========================================
+# Python Cache
 __pycache__/
 *.py[cod]
 *$py.class
 .pytest_cache/
 .coverage
+<<<<<<< HEAD
 htmlcov/
 *.log
 
@@ -84,5 +68,43 @@ ENV/
 *.swp
 *.swo
 *~
+=======
+
+# Logs
+logs/
+*.log
+!logs/.gitkeep
+free_gpus.txt
+
+# Datasets & Large Training Files (stored locally)
+*.csv
+*.jsonl
+
+# Database & Redis Server
+redis-stack-server-*/
+redis_server_data/
+*.rdb
+redis-stack.tar.gz
+dump.rdb
+dump_final.rdb
+
+# Scraped Data
+data/
+data/raw_pdfs/
+*.pdf
+*.json
+
+# Model artifacts
+*.gguf
+models/slm_gguf/*.gguf
+models/slm_gguf/qwen*
+models/slm_cpu/*
+!models/slm_cpu/.gitkeep
+models/llm_7b/*
+models/embeddings/
+packages/
+*.pt
+*.bak
+>>>>>>> e4ffd74c04120d94be9e40ed9664beb86ee22738
 .DS_Store
 Thumbs.db

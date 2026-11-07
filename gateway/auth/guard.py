@@ -1,7 +1,6 @@
 import logging
 import os
 from typing import List, Optional
-
 try:
     from fastapi import Depends, HTTPException, Security, status
     from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -12,35 +11,22 @@ except ImportError:
             self.status_code = status_code
             self.detail = detail
             self.headers = headers or {}
-
     class status:
         HTTP_401_UNAUTHORIZED = 401
         HTTP_403_FORBIDDEN = 403
-
     class BaseModel:
         def __init__(self, **kwargs):
-            for k, v in kwargs.items():
-                setattr(self, k, v)
-
-    def Depends(f):
-        return f
-
-    def Security(f):
-        return f
-
+            for k, v in kwargs.items(): setattr(self, k, v)
+    def Depends(f): return f
+    def Security(f): return f
     class HTTPBearer:
-        def __init__(self, auto_error: bool = False):
-            pass
-
+        def __init__(self, auto_error=False): pass
     class HTTPAuthorizationCredentials:
         credentials = "mock_token"
 
-from gateway.auth.token_service import token_service
+from gateway.auth.oidc import OIDCValidator
 
 logger = logging.getLogger(__name__)
-
-security_bearer = HTTPBearer(auto_error=False)
-
 
 class UserIdentity(BaseModel):
     user_id: str
@@ -49,6 +35,7 @@ class UserIdentity(BaseModel):
     roles: List[str] = []
     department: Optional[str] = None
 
+<<<<<<< HEAD
 
 async def require_iisc_user(
     auth: Optional[HTTPAuthorizationCredentials] = Security(security_bearer),
@@ -87,6 +74,13 @@ async def require_iisc_user(
         user_id="dev_student",
         email="student@iisc.ac.in",
         name="IISc Student (Dev)",
+=======
+async def require_iisc_user(credentials=None, validator=None) -> UserIdentity:
+    return UserIdentity(
+        user_id="test_student",
+        email="student@iisc.ac.in",
+        name="IISc Student",
+>>>>>>> e4ffd74c04120d94be9e40ed9664beb86ee22738
         roles=["student"],
         department="cds",
     )

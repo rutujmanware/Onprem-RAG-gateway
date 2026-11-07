@@ -1,30 +1,41 @@
+# ==============================================================================
+# AskIISc Tier-2 GPU Large Language Model (vLLM) Configuration
+# ==============================================================================
+
 model:
-  path: "models/llm_7b"
-  tokenizer: "models/llm_7b"
-  architecture: "qwen2"
-  dtype: "auto"
-  quantization: "awq"
-  hf_repo: "Qwen/Qwen2.5-7B-Instruct-AWQ"
-  description: "Official Qwen 2.5 7B Instruct in 4-bit AWQ format for GPU continuous batching"
+  path: "models/llm_7b/qwen2.5-7b-instruct"
+  fallback_path: "Qwen/Qwen2.5-7B-Instruct"
+  tokenizer: "models/llm_7b/qwen2.5-7b-instruct"
+  dtype: "bfloat16"                               # Native bfloat16 tensor precision on NVIDIA A100 80GB
   trust_remote_code: false
   tensor_parallel_size: 1
   pipeline_parallel_size: 1
 
+retrieval:
+  top_k_chunks: 5                                 # In-depth multi-thesis cross-document synthesis chunks
+  max_k_ceiling: 8
+  similarity_floor: 0.20
+  relative_margin: 0.20
+
 paged_attention:
-  block_size: 16
-  gpu_memory_utilization: 0.90
-  swap_space_gib: 4.0
+  block_size: 16                                  # PagedAttention memory block allocation size
+  gpu_memory_utilization: 0.90                    # 90% of 80GB VRAM dedicated to KV cache & weights
+  swap_space_gib: 4.0                             # CPU-GPU paging swap space
   kv_cache_dtype: "auto"
 
 continuous_batching:
-  max_num_batched_tokens: 32768
-  max_num_seqs: 64
-  max_model_len: 32768
+  max_num_batched_tokens: 8192                    # Max batched prompt tokens across concurrent requests
+  max_num_seqs: 64                                # Max concurrent sequence streams in vLLM iteration
+  max_model_len: 8192                             # Maximum full sequence context length
   scheduler_delay_factor: 0.0
 
 server:
-  host: "0.0.0.0"
+  host: "127.0.0.1"                               # Local loopback binding only (internal to gateway)
   port: 8000
   response_role: "assistant"
   chat_template: null
   disable_log_requests: false
+
+sanitization:
+  fenced_prompt: true                             # Enclose user queries in fenced delimiters
+  context_xml_escape: true                        # Escape delimiter breakouts in indexed document text

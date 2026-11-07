@@ -2,10 +2,7 @@ import logging
 import os
 import time
 from typing import Any, Dict, Optional
-try:
-    import httpx
-except ImportError:
-    httpx = None
+import httpx
 try:
     from jose import jwt, JWTError
 except ImportError:

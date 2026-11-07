@@ -1,0 +1,17 @@
+[Unit]
+Description=AskIISc vLLM (Qwen2.5-7B-Instruct, GPU)
+After=network.target
+
+[Service]
+User=askiisc
+EnvironmentFile=/etc/askiisc/askiisc.env
+Environment=HF_HUB_OFFLINE=1 VLLM_NO_USAGE_STATS=1 DO_NOT_TRACK=1 CUDA_VISIBLE_DEVICES=0
+ExecStart=/opt/askiisc/venv-vllm/bin/vllm serve ${LLM_MODEL_PATH} --served-model-name ${LLM_MODEL} \
+  --quantization fp8 --kv-cache-dtype fp8 --max-model-len 32768 --gpu-memory-utilization 0.92 \
+  --max-num-seqs 32 --enable-prefix-caching --host 127.0.0.1 --port 8000
+Restart=on-failure
+RestartSec=10
+TimeoutStartSec=900
+
+[Install]
+WantedBy=multi-user.target

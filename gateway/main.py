@@ -1,626 +1,992 @@
-import inspect
+import asyncio
+import json
+import logging
 import os
+import sys
 import time
+import uuid
+import secrets
 from contextlib import asynccontextmanager
-from pathlib import Path
 from typing import Any, Dict, List, Optional
-
-from fastapi import Depends, FastAPI, HTTPException, Response, status
-from fastapi.responses import HTMLResponse
-from fastapi.staticfiles import StaticFiles
+from pathlib import Path
+from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.responses import StreamingResponse
+from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 
-from gateway.auth.email_service import email_service
+# Ensure project root is in sys.path
+BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if BASE_DIR not in sys.path:
+    sys.path.insert(0, BASE_DIR)
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(BASE_DIR, "smtp.env"), override=False)
+    load_dotenv(os.path.join(BASE_DIR, ".env"), override=False)
+except ImportError:
+    pass
+
 from gateway.auth.guard import UserIdentity, require_iisc_user
-from gateway.auth.token_service import token_service
-from gateway.auth.user_store import hash_password, user_store, verify_password
-from gateway.dependencies import container
-from gateway.retrieval import RetrievalError, build_grounded_messages
-from gateway.security import is_personalized_query, is_prompt_injection
-from gateway.observability import metrics
+from gateway.cache.redis_semantic_cache import RedisSemanticCache
+from gateway.queue.admission import AdmissionController
+from gateway.dependencies import (
+    container, get_semantic_cache, get_complexity_scorer,
+    get_dispatcher, get_admission_controller, get_slm_client, get_vllm_client
+)
+from gateway.router.complexity_scorer import ComplexityScorer
+from gateway.router.dispatcher import ModelTier, RequestDispatcher
+from gateway.clients.cpu_slm_client import CPUSLMClient
+from gateway.clients.vllm_client import VLLMClient
+from pipeline.rag_chain import RAGQAPipeline
+from pipeline.retriever import sanitize_chunks
+from pipeline.sanitizer import sanitize_and_fence_prompt, PromptInjectionAlert
 
-
-class LoginRequest(BaseModel):
-    email: str
-    password: Optional[str] = "campus-pass"
-    persona: Optional[str] = None
-
-
-class OtpRequest(BaseModel):
-    email: str
-
-
-class RegisterRequest(BaseModel):
-    email: str
-    otp: str
-    password: str
-    name: Optional[str] = None
-    department: Optional[str] = "cds"
-    role: Optional[str] = "student"
-
-
-class ResetPasswordRequest(BaseModel):
-    email: str
-    otp: str
-    new_password: str
-
-
-class QueryScope(BaseModel):
-    thesis_id: Optional[str] = None
-    chapter: Optional[str] = None
-    doc_version: Optional[str] = "v1"
-
-
-class ChatMessage(BaseModel):
-    role: str = "user"
-    content: str
-
-
-class ChatCompletionRequest(BaseModel):
-    prompt: Optional[str] = None
-    messages: Optional[List[ChatMessage]] = None
-    scope: Optional[QueryScope] = Field(default=None)
-
-    def resolved_prompt(self) -> str:
-        if self.prompt and self.prompt.strip():
-            return self.prompt.strip()
-        if self.messages:
-            for msg in reversed(self.messages):
-                if msg.role == "user" and msg.content.strip():
-                    return msg.content.strip()
-            if self.messages[-1].content.strip():
-                return self.messages[-1].content.strip()
-        raise HTTPException(
-            status_code=400, detail="Either 'prompt' or 'messages' must be provided."
-        )
-
+logger = logging.getLogger("gateway.main")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await container.initialize()
+    # Initialize container (creates Redis semantic cache index, etc.)
+    try:
+        await container.initialize()
+        # Sanitize Redis cache on startup: purge any uncacheable entries (insufficient data, refusals)
+        cache = container.semantic_cache
+        purged = await cache.apurge_uncacheable_entries()
+        if purged > 0:
+            logger.info(f"Startup sanitized Redis cache: purged {purged} uncacheable entries.")
+    except Exception as e:
+        logger.warning(f"Container initialization warning: {e}")
     yield
-    await container.shutdown()
+    try:
+        await container.shutdown()
+    except Exception:
+        pass
 
+ENABLE_API_DOCS = os.getenv("ENABLE_API_DOCS", "0").lower() in ("1", "true", "yes")
 
 app = FastAPI(
-    title="Onprem RAG Gateway",
-    version="1.0.0",
-    description="Zero-egress IISc Institutional Thesis RAG Gateway with dual-tier cache and dynamic routing",
-    lifespan=lifespan,
+    title="AskIISc Campus Intelligence Platform",
+    description="AskIISc On-Premise Institutional RAG Gateway",
+    version="2.0.0",
+    docs_url="/docs" if ENABLE_API_DOCS else None,
+    redoc_url="/redoc" if ENABLE_API_DOCS else None,
+    openapi_url="/openapi.json" if ENABLE_API_DOCS else None,
+    lifespan=lifespan
 )
 
-# Ensure static folder exists and mount it
-STATIC_DIR = Path(__file__).resolve().parent / "static"
-if not STATIC_DIR.exists():
-    STATIC_DIR.mkdir(parents=True, exist_ok=True)
-app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+ADMIN_KEY = os.getenv("ADMIN_API_KEY", "")
 
+def require_internal_or_auth(request: Request):
+    """
+    Ensure internal/admin endpoints (/query, /cache/*) cannot be accessed
+    by arbitrary external users. Returns 404 to hide the endpoint's existence.
+    Allowed callers:
+    1. Direct loopback / localhost (127.0.0.1, ::1, testclient)
+    2. Valid authenticated web session (IISc user logged into AskIISc)
+    3. Valid X-Admin-Key / Bearer header matching ADMIN_API_KEY (if configured)
+    """
+    client_host = request.client.host if request.client else ""
+    xff = request.headers.get("x-forwarded-for")
 
-@app.get("/healthz")
+    # Direct loopback without external forwarder
+    # Security note (VULN-01 fix): Never trust client-supplied X-Forwarded-For headers
+    # to authenticate loopback access (CWE-290). Only direct local socket connections
+    # without forwarding headers are permitted unauthenticated loopback access.
+    if not xff and client_host in ("127.0.0.1", "::1", "localhost", "testclient"):
+        return True
+
+    # Allow authenticated web session
+    if "session" in request.scope:
+        user = request.session.get("user")
+        if user and user.get("exp", 0) > time.time():
+            return True
+
+    # Allow admin API key (VULN-08: constant-time comparison prevents timing side-channels)
+    if ADMIN_KEY:
+        auth_hdr = request.headers.get("X-Admin-Key") or request.headers.get("Authorization", "").replace("Bearer ", "").strip()
+        if auth_hdr and secrets.compare_digest(auth_hdr, ADMIN_KEY):
+            return True
+
+    raise HTTPException(status_code=404, detail="Not Found")
+
+# Session Security (VULN-02 Remediation):
+# Enforce high-entropy cryptographic session secret. Never allow known weak or fallback keys.
+SESSION_SECRET = os.getenv("SESSION_SECRET", "").strip()
+KNOWN_INSECURE_SECRETS = {
+    "e7b4c91a3f8d2e5b6a7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a",
+    "CHANGE_ME",
+    "secret",
+    "test-secret",
+    "supersecret",
+}
+
+if not SESSION_SECRET or SESSION_SECRET in KNOWN_INSECURE_SECRETS or len(SESSION_SECRET) < 32:
+    if os.getenv("ENVIRONMENT", "").lower() in ("production", "prod"):
+        raise RuntimeError(
+            "FATAL: Insecure or missing SESSION_SECRET in production. "
+            "Generate a secure 256-bit key using: python3 -c 'import secrets; print(secrets.token_hex(32))'"
+        )
+    logger.warning(
+        "SESSION_SECRET is unset or uses an insecure default. Generating an ephemeral high-entropy random key."
+    )
+    SESSION_SECRET = secrets.token_hex(32)
+
+from starlette.middleware.sessions import SessionMiddleware
+app.add_middleware(
+    SessionMiddleware,
+    secret_key=SESSION_SECRET,
+    https_only=os.getenv("COOKIE_SECURE", "1") == "1",
+    same_site="strict",
+    max_age=int(os.getenv("SESSION_TTL", str(8 * 3600))),
+    session_cookie="askiisc_session",
+)
+
+class ChatMessage(BaseModel):
+    role: str = Field(..., max_length=50)
+    content: str = Field(..., min_length=1, max_length=4000)
+
+class ChatCompletionRequest(BaseModel):
+    messages: List[ChatMessage] = Field(..., min_length=1, max_length=50)
+    temperature: Optional[float] = Field(default=0.2, ge=0.0, le=2.0)
+    max_tokens: Optional[int] = Field(default=None, ge=1, le=8192)
+    stream: Optional[bool] = False
+
+class DirectQueryRequest(BaseModel):
+    query: str = Field(..., min_length=2, max_length=1500)
+    top_k: Optional[int] = Field(default=None, ge=1, le=50)
+    temperature: Optional[float] = Field(default=0.2, ge=0.0, le=2.0)
+    max_tokens: Optional[int] = Field(default=2048, ge=1, le=8192)
+    stream: Optional[bool] = False
+    bypass_cache: Optional[bool] = False
+
+@app.get("/healthz", include_in_schema=False)
+@app.get("/health", include_in_schema=False)
 async def healthz():
-    components = await container.readiness()
+    return {"status": "ok"}
+
+@app.get("/cache/stats", dependencies=[Depends(require_internal_or_auth)], include_in_schema=False)
+async def cache_stats(cache: RedisSemanticCache = Depends(get_semantic_cache)):
+    count = await cache.acount()
     return {
-        "status": "ok" if components["redis"] and components["embedding_model"] else "degraded",
-        "components": components,
+        "status": "active",
+        "cache_type": "RedisSemanticCache",
+        "index_name": cache.index_name,
+        "key_prefix": cache.key_prefix,
+        "similarity_threshold": cache.similarity_threshold,
+        "vector_dim": cache.vector_dim,
+        "cached_queries_count": count,
     }
 
+class CachePurgeRequest(BaseModel):
+    query: str = Field(..., min_length=2, max_length=1500)
+    threshold: Optional[float] = Field(default=0.85, ge=0.5, le=1.0)
 
-@app.get("/readyz")
-async def readyz():
-    components = await container.readiness()
-    required = ("redis", "embedding_model", "cpu_slm")
-    if not all(components[name] for name in required):
-        raise HTTPException(status_code=503, detail={"status": "not_ready", "components": components})
-    return {"status": "ready", "components": components}
-
-@app.get("/metrics", include_in_schema=False)
-async def prometheus_metrics():
-    return Response(content=metrics.render(), media_type="text/plain; version=0.0.4")
-
-
-@app.get("/", response_class=HTMLResponse)
-async def serve_ui():
-    index_path = STATIC_DIR / "index.html"
-    if index_path.exists():
-        with open(index_path, "r", encoding="utf-8") as f:
-            return HTMLResponse(content=f.read())
-    return HTMLResponse(
-        "<h2>IISc On-Premise Thesis RAG Gateway</h2><p>Static UI file not found.</p>"
-    )
-
-
-@app.post("/auth/register/request-otp")
-async def register_request_otp(req: OtpRequest):
-    email = req.email.strip().lower()
-    if not token_service.is_allowed_email(email):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Access restricted: Registration is exclusively available for @iisc.ac.in and @gmail.com email addresses.",
-        )
-
-    existing = await user_store.get_user(email)
-    if existing:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="An account already exists for this email. Please sign in with your password.",
-        )
-
-    otp = await user_store.generate_otp(email, purpose="register", ttl_seconds=300)
-    dispatch_res = await email_service.send_otp(to_email=email, otp=otp, purpose="register")
-    if dispatch_res.get("status") == "sent":
-        msg = f"Verification code dispatched to {email}. (Note: If not in your Outlook inbox, please check your Junk/Spam folder)."
-    else:
-        err = dispatch_res.get("error") or "SMTP delivery pending"
-        msg = f"Verification code generated. (SMTP Notice: {err})"
-
-    response_payload = {
-        "message": msg,
-        "email": email,
-        "expires_in_seconds": 300,
-        "delivery_status": dispatch_res.get("status"),
-    }
-    if os.getenv("GATEWAY_DEMO_LOGIN", "true").lower() == "true":
-        response_payload["dev_otp"] = otp
-        response_payload["message"] = f"{msg} [OTP: {otp}]"
-    return response_payload
-
-
-@app.post("/auth/register/verify")
-async def register_verify(req: RegisterRequest):
-    email = req.email.strip().lower()
-    if not token_service.is_allowed_email(email):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Access restricted: Email must belong to @iisc.ac.in or @gmail.com.",
-        )
-
-    valid_otp = await user_store.verify_and_consume_otp(email, req.otp, purpose="register")
-    if not valid_otp:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid or expired OTP code. Please request a new code.",
-        )
-
-    if not req.password or len(req.password.strip()) < 6:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Password must be at least 6 characters long.",
-        )
-
-    assigned_role = (
-        req.role
-        if req.role in ("student", "faculty", "examiner", "cluster_admin")
-        else "student"
-    )
-    user_record = {
-        "email": email,
-        "name": (
-            req.name.strip()
-            if req.name
-            else email.split("@")[0].replace(".", " ").title()
-        ),
-        "department": (req.department or "cds").strip().lower(),
-        "roles": [assigned_role],
-        "password_hash": hash_password(req.password),
-        "user_id": f"usr_{email.split('@')[0]}",
-        "created_at": int(time.time()),
-    }
-    await user_store.save_user(user_record)
-
-    token = token_service.create_access_token(
-        user_id=user_record["user_id"],
-        email=email,
-        name=user_record["name"],
-        roles=user_record["roles"],
-        department=user_record["department"],
-        expires_in_seconds=86400,
-    )
-
-    return {
-        "message": "Account created and verified successfully.",
-        "access_token": token,
-        "token_type": "bearer",
-        "expires_in": 86400,
-        "user": {
-            "user_id": user_record["user_id"],
-            "email": email,
-            "name": user_record["name"],
-            "roles": user_record["roles"],
-            "department": user_record["department"],
-        },
-    }
-
-
-@app.post("/auth/login")
-async def login(req: LoginRequest):
-    email = req.email.strip().lower()
-    if not token_service.is_allowed_email(email):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Access restricted: Email address must belong to @iisc.ac.in or @gmail.com.",
-        )
-
-    account = await user_store.get_user(email)
-
-    if account:
-        if not req.password or not verify_password(
-            req.password, account.get("password_hash", "")
-        ):
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Incorrect password for this IISc account.",
-            )
-        user_id = account["user_id"]
-        name = account["name"]
-        roles = account["roles"]
-        department = account["department"]
-    else:
-        # Check demo personas if not explicitly registered
-        persona = (req.persona or "").lower()
-        if persona or "student" in email or "faculty" in email or "admin" in email:
-            if "faculty" in persona or "examiner" in persona or "faculty" in email:
-                roles = ["faculty", "examiner"]
-                department = "ece"
-                name = "Prof. R. Venkatesh"
-                user_id = "fac_ece_01"
-            elif "admin" in persona or "admin" in email:
-                roles = ["cluster_admin", "faculty_lead"]
-                department = "serc"
-                name = "Cluster Administrator"
-                user_id = "admin_serc_01"
-            else:
-                roles = ["student"]
-                department = "cds"
-                name = email.split("@")[0].replace(".", " ").title()
-                user_id = f"std_{email.split('@')[0]}"
-
-            await user_store.save_user({
-                "email": email,
-                "name": name,
-                "department": department,
-                "roles": roles,
-                "password_hash": hash_password(req.password or "campus-pass"),
-                "user_id": user_id,
-                "created_at": int(time.time()),
-            })
-        else:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="No account found for this IISc email. Please register using an OTP first.",
-            )
-
-    token = token_service.create_access_token(
-        user_id=user_id,
-        email=email,
-        name=name,
-        roles=roles,
-        department=department,
-        expires_in_seconds=86400,
-    )
-
-    return {
-        "access_token": token,
-        "token_type": "bearer",
-        "expires_in": 86400,
-        "user": {
-            "user_id": user_id,
-            "email": email,
-            "name": name,
-            "roles": roles,
-            "department": department,
-        },
-    }
-
-
-@app.post("/auth/reset-password/request-otp")
-async def reset_password_request_otp(req: OtpRequest):
-    email = req.email.strip().lower()
-    account = await user_store.get_user(email)
-    if not account:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="No account found for this email.",
-        )
-    otp = await user_store.generate_otp(email, purpose="reset", ttl_seconds=300)
-    dispatch_res = await email_service.send_otp(to_email=email, otp=otp, purpose="reset")
-    if dispatch_res.get("status") == "sent":
-        msg = f"Password reset verification code dispatched to {email}. (Note: If not in your Outlook inbox, please check your Junk/Spam folder)."
-    else:
-        err = dispatch_res.get("error") or "SMTP delivery pending"
-        msg = f"Password reset code generated. (SMTP Notice: {err})"
-
-    response_payload = {
-        "message": msg,
-        "email": email,
-        "expires_in_seconds": 300,
-        "delivery_status": dispatch_res.get("status"),
-    }
-    if os.getenv("GATEWAY_DEMO_LOGIN", "true").lower() == "true":
-        response_payload["dev_otp"] = otp
-        response_payload["message"] = f"{msg} [OTP: {otp}]"
-    return response_payload
-
-
-@app.post("/auth/reset-password/verify")
-async def reset_password_verify(req: ResetPasswordRequest):
-    email = req.email.strip().lower()
-    valid_otp = await user_store.verify_and_consume_otp(email, req.otp, purpose="reset")
-    if not valid_otp:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid or expired reset code.",
-        )
-    account = await user_store.get_user(email)
-    if not account:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Account not found."
-        )
-    account["password_hash"] = hash_password(req.new_password)
-    await user_store.save_user(account)
-    return {
-        "message": "Password updated successfully. You can now sign in with your new password."
-    }
-
-
-@app.get("/auth/me")
-async def get_current_user(user: UserIdentity = Depends(require_iisc_user)):
-    return {
-        "authenticated": True,
-        "user": {
-            "user_id": user.user_id,
-            "email": user.email,
-            "name": user.name,
-            "roles": user.roles,
-            "department": user.department,
-        },
-    }
-
-
-@app.get("/api/theses")
-async def list_theses(
-    q: Optional[str] = None,
-    dept: Optional[str] = None,
-    limit: int = 150,
-    user: UserIdentity = Depends(require_iisc_user),
+@app.post("/cache/purge", dependencies=[Depends(require_internal_or_auth)], include_in_schema=False)
+async def cache_purge_query(
+    req: CachePurgeRequest,
+    cache: RedisSemanticCache = Depends(get_semantic_cache),
 ):
-    """Catalog of authorized, actually indexed theses for the scope selector."""
-    if container.retriever is None:
-        raise HTTPException(status_code=503, detail="Document catalog is unavailable.")
-    catalog = await container.retriever.catalog(user.roles, user.user_id, query=q, department=dept, limit=limit)
-    theses = []
-    for entry in catalog:
-        raw_chapters = entry.get("chapters", ["all"])
-        formatted_chapters = []
-        for ch in raw_chapters:
-            if isinstance(ch, dict):
-                formatted_chapters.append(ch)
-            elif ch == "all":
-                formatted_chapters.append({"id": "all", "title": "Whole Document (All Chapters)"})
-            else:
-                formatted_chapters.append({"id": str(ch), "title": f"Chapter {str(ch).removeprefix('ch_')}"})
-        theses.append({**entry, "chapters": formatted_chapters})
-    return {"theses": theses, "total": len(theses)}
+    purged = await cache.apurge(req.query, threshold=req.threshold or 0.85)
+    return {
+        "status": "ok",
+        "purged_count": purged,
+        "query": req.query,
+        "threshold": req.threshold or 0.85,
+    }
 
+@app.post("/cache/clear", dependencies=[Depends(require_internal_or_auth)], include_in_schema=False)
+async def cache_clear(cache: RedisSemanticCache = Depends(get_semantic_cache)):
+    success = await cache.aclear()
+    return {"status": "cleared" if success else "failed"}
 
-@app.post("/v1/chat/completions")
+@app.post("/cache/purge-invalid", dependencies=[Depends(require_internal_or_auth)], include_in_schema=False)
+async def cache_purge_invalid(cache: RedisSemanticCache = Depends(get_semantic_cache)):
+    purged = await cache.apurge_uncacheable_entries()
+    return {"status": "ok", "purged_count": purged}
+
+@app.get("/queue/stats", dependencies=[Depends(require_internal_or_auth)], include_in_schema=False)
+async def queue_stats(admission: AdmissionController = Depends(get_admission_controller)):
+    return admission.get_stats()
+
+@app.post("/v1/chat/completions", dependencies=[Depends(require_internal_or_auth)], include_in_schema=False)
 async def chat_completions(
     req: ChatCompletionRequest,
-    response: Response,
     user: UserIdentity = Depends(require_iisc_user),
+    cache: RedisSemanticCache = Depends(get_semantic_cache),
+    scorer: ComplexityScorer = Depends(get_complexity_scorer),
+    dispatcher: RequestDispatcher = Depends(get_dispatcher),
+    slm: CPUSLMClient = Depends(get_slm_client),
+    vllm: VLLMClient = Depends(get_vllm_client),
+    admission: AdmissionController = Depends(get_admission_controller),
 ):
-    started_at = time.perf_counter()
-    prompt_text = req.resolved_prompt()
-    if is_personalized_query(prompt_text):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Personalized student-record queries are not supported or cached.",
-        )
-    if is_prompt_injection(prompt_text):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Request contains an instruction-override pattern and was refused.",
-        )
-    raw_scope = req.scope.model_dump(exclude_none=True) if req.scope else {}
+    if not req.messages:
+        raise HTTPException(status_code=400, detail="Messages list cannot be empty")
 
-    # 1. Extract canonical scope via EntityGuard (global cross-campus and specific thesis scopes are supported)
-    scope_info = container.entity_guard.extract_scope(prompt_text, raw_scope)
-    if container.retriever is None or container.admission is None:
-        raise HTTPException(status_code=503, detail="Gateway dependencies are unavailable.")
-
-    # Rate-limit every source before cache access. Resolve the revision and ACL
-    # server-side: a caller may not select an old revision or an unentitled thesis.
-    await container.admission.check_admission(user.user_id)
+    query = req.messages[-1].content.strip()
+    if not query or len(query) < 2:
+        raise HTTPException(status_code=400, detail="Query message must contain at least 2 non-whitespace characters")
+    # VULN-04: Validate prompt against adversarial injection & jailbreak patterns
     try:
-        current_version = await container.retriever.current_version(scope_info.thesis_id)
-        authorized = await container.retriever.allowed(
-            scope_info.thesis_id, user.roles, user.user_id
-        )
-    except Exception as exc:
-        raise HTTPException(status_code=503, detail="Document metadata store is unavailable.") from exc
-    if not authorized:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not entitled to this thesis.")
-    scope_info = type(scope_info)(
-        thesis_id=scope_info.thesis_id,
-        chapter=scope_info.chapter,
-        doc_version=current_version,
-    )
+        sanitize_and_fence_prompt(query)
+    except PromptInjectionAlert as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
-    # 2. Check L0 Exact Cache (FR-2)
-    l0_hit = await container.l0_cache.get(
-        prompt_text, thesis_id=scope_info.thesis_id, chapter=scope_info.chapter,
-        doc_version=scope_info.doc_version,
-    )
-    if l0_hit is not None:
-        response.headers["X-Cache"] = "HIT-L0"
-        response.headers["X-Scope-Thesis"] = scope_info.thesis_id
-        response.headers["X-Scope-Chapter"] = scope_info.chapter
-        metrics.record("HIT-L0")
-        return {
-            "cache_status": "HIT-L0",
-            "scope": {
-                "thesis_id": scope_info.thesis_id,
-                "chapter": scope_info.chapter,
-                "doc_version": scope_info.doc_version,
-            },
-            "user": user.email,
-            "data": l0_hit,
-        }
+    t0 = time.time()
 
-    # 3. Compute 384-d dense embedding ONCE
-    query_vec = container.embedder.embed_query(prompt_text)
-
-    # 4. Check L1 Semantic Cache with Three-Stage Validation & Entity Guard (FR-3)
-    l1_hit = await container.l1_cache.get(
-        query_embedding=query_vec,
-        thesis_id=scope_info.thesis_id,
-        chapter=scope_info.chapter,
-        doc_version=scope_info.doc_version,
-        prompt=prompt_text,
-        slm_client=container.slm_client,
-    )
-    if l1_hit is not None:
-        response.headers["X-Cache"] = "HIT-L1"
-        response.headers["X-Cache-Similarity"] = str(l1_hit["similarity"])
-        response.headers["X-Scope-Thesis"] = scope_info.thesis_id
-        response.headers["X-Scope-Chapter"] = scope_info.chapter
-        metrics.record("HIT-L1")
-        return {
-            "cache_status": "HIT-L1",
-            "similarity": l1_hit["similarity"],
-            "matched_prompt": l1_hit["matched_prompt"],
-            "scope": {
-                "thesis_id": scope_info.thesis_id,
-                "chapter": scope_info.chapter,
-                "doc_version": scope_info.doc_version,
-            },
-            "user": user.email,
-            "data": l1_hit["response"],
-        }
-
-    # 5. Retrieve evidence before scoring/generation. The score still reuses the
-    # query vector from L1 and never makes another embedding pass.
+    # Step 0: Semantic Vector Cache Lookup
     try:
-        chunks = await container.retriever.retrieve(
-            query_vec, scope_info.thesis_id, scope_info.chapter, scope_info.doc_version
-        )
-    except RetrievalError as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
-    # 6. L1 Cache Miss -> forward the existing embedding to FR-4 scorer.
-    maybe_coro = container.scorer.score(prompt_text, embedding=query_vec)
-    score_val = await maybe_coro if inspect.isawaitable(maybe_coro) else maybe_coro
+        hit = await cache.alookup(query)
+    except Exception:
+        hit = None
 
-    route_decision = container.dispatcher.decide(score=score_val)
-    target_tier = getattr(
-        route_decision.target_tier, "value", str(route_decision.target_tier)
-    )
+    if hit is not None:
+        cached_resp = hit.get("response", {})
+        if isinstance(cached_resp, str):
+            try:
+                cached_resp = json.loads(cached_resp)
+            except Exception:
+                cached_resp = {"answer": cached_resp}
+        ans = cached_resp.get("answer", "")
+        sim = hit.get("similarity", 1.0)
+        cmpl_id = f"chatcmpl-cached-{uuid.uuid4().hex[:8]}"
 
-    if chunks:
-        messages = build_grounded_messages(prompt_text, chunks)
-        # 7. Generate only from the selected intranet tier. GPU calls acquire a
-        # bounded, per-user admission slot for their entire execution.
-        try:
-            if target_tier == "cpu_slm" and container.slm_client:
-                model_response = await container.slm_client.generate_chat(messages)
-            elif target_tier == "gpu_vllm" and container.vllm_client:
-                async with container.admission.gpu_slot(user.user_id, check_rate=False):
-                    model_response = await container.vllm_client.generate_chat(messages)
-            else:
-                raise RuntimeError(f"No client configured for tier '{target_tier}'")
-            synthesized_text = model_response["choices"][0]["message"]["content"].strip()
-        except Exception:
-            evidence_summary = "\n\n".join(c.content for c in chunks)
-            synthesized_text = (
-                f"Based on the grounded evidence retrieved from {scope_info.thesis_id} ({scope_info.chapter}):\n\n"
-                f"{evidence_summary}"
+        if req.stream:
+            def cached_chat_stream():
+                words = ans.split(" ")
+                for i, w in enumerate(words):
+                    delta = w if i == len(words) - 1 else w + " "
+                    chunk = {
+                        "id": cmpl_id,
+                        "object": "chat.completion.chunk",
+                        "created": int(time.time()),
+                        "model": "redis-semantic-cache",
+                        "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}],
+                    }
+                    yield f"data: {json.dumps(chunk)}\n\n"
+                final_chunk = {
+                    "id": cmpl_id,
+                    "object": "chat.completion.chunk",
+                    "created": int(time.time()),
+                    "model": "redis-semantic-cache",
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                }
+                yield f"data: {json.dumps(final_chunk)}\n\n"
+                yield "data: [DONE]\n\n"
+
+            return StreamingResponse(
+                cached_chat_stream(),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                },
             )
-    else:
-        # Conversational / general query fallback when no thesis chunks match
-        general_prompt = [
-            {
-                "role": "system",
-                "content": (
-                    "You are the IISc Institutional Thesis RAG Assistant. "
-                    "For greetings or basic questions (like math or general queries), answer helpfully and concisely. "
-                    "Remind the user they can search and ask questions about IISc theses."
-                ),
+
+        return {
+            "id": cmpl_id,
+            "object": "chat.completion",
+            "model": "redis-semantic-cache",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": ans},
+                "finish_reason": "stop",
+            }],
+            "usage": {
+                "prompt_tokens": 0,
+                "completion_tokens": len(ans.split()),
+                "total_tokens": len(ans.split()),
             },
-            {"role": "user", "content": prompt_text},
-        ]
-        synthesized_text = ""
+            "router_meta": {
+                "score": 0.0,
+                "tier": "semantic_cache",
+                "route": "cached",
+                "cached": True,
+                "similarity": sim,
+                "matched_prompt": hit.get("matched_prompt", query),
+                "routing_time_seconds": round(time.time() - t0, 4),
+            },
+            "user": user.email,
+        }
+
+    # Step 1: Neural Complexity Routing (MLP Router)
+    score = await scorer.score(query)
+    decision = dispatcher.decide(score)
+
+    if req.stream:
+        rag = RAGQAPipeline()
+        cmpl_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+        created_ts = int(time.time())
+
+        def sse_chat_generator():
+            full_ans = []
+            collected_chunks = []
+            for event in rag.answer_query_stream(
+                query,
+                max_new_tokens=req.max_tokens,
+                temperature=req.temperature or 0.2,
+            ):
+                if event.get("type") == "token":
+                    delta_text = event.get("delta", "")
+                    full_ans.append(delta_text)
+                    chunk = {
+                        "id": cmpl_id,
+                        "object": "chat.completion.chunk",
+                        "created": created_ts,
+                        "model": "qwen2.5-3b-instruct-cpu" if decision.target_tier != ModelTier.GPU_LLM else "qwen2.5-7b-instruct-gpu",
+                        "choices": [{
+                            "index": 0,
+                            "delta": {"content": delta_text},
+                            "finish_reason": None,
+                        }],
+                    }
+                    yield f"data: {json.dumps(chunk)}\n\n"
+                elif event.get("type") == "chunks":
+                    collected_chunks = event.get("chunks", [])
+                elif event.get("type") == "done":
+                    final_chunk = {
+                        "id": cmpl_id,
+                        "object": "chat.completion.chunk",
+                        "created": created_ts,
+                        "model": "qwen2.5-3b-instruct-cpu" if decision.target_tier != ModelTier.GPU_LLM else "qwen2.5-7b-instruct-gpu",
+                        "choices": [{
+                            "index": 0,
+                            "delta": {},
+                            "finish_reason": "stop",
+                        }],
+                    }
+                    yield f"data: {json.dumps(final_chunk)}\n\n"
+
+            # Save generated completion to cache only when document chunks were retrieved
+            complete_text = "".join(full_ans)
+            if complete_text and collected_chunks:
+                try:
+                    cache.store(query, {"answer": complete_text, "chunks": collected_chunks})
+                except Exception:
+                    pass
+            yield "data: [DONE]\n\n"
+
+        return StreamingResponse(
+            sse_chat_generator(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    # Step 2: Route Enforcement for Hard Queries -> GPU LLM Tier (Qwen 2.5 7B)
+    if decision.target_tier == ModelTier.GPU_LLM:
+        gpu_max_tokens = req.max_tokens if (req.max_tokens is not None and req.max_tokens > 0) else 2048
+        vllm_up = await vllm.check_health()
+        if vllm_up:
+            try:
+                resp = await vllm.generate_chat(
+                    [{"role": m.role, "content": m.content} for m in req.messages],
+                    max_tokens=gpu_max_tokens,
+                    temperature=req.temperature or 0.2,
+                )
+                resp["router_meta"] = {
+                    "score": round(score, 4),
+                    "tier": decision.target_tier.value,
+                    "route": "hard",
+                    "reason": decision.reason,
+                    "routing_time_seconds": round(time.time() - t0, 4),
+                }
+                resp["user"] = user.email
+                ans_text = resp["choices"][0]["message"]["content"]
+                await cache.astore(query, {"answer": ans_text})
+                return resp
+            except Exception:
+                pass
+
+        # In-process GPU LLM fallback
         try:
-            if container.slm_client:
-                model_resp = await container.slm_client.generate_chat(general_prompt)
-                synthesized_text = model_resp["choices"][0]["message"]["content"].strip()
+            from pipeline.gpu_llm_runner import GPULLMEngine
+            engine = GPULLMEngine.get_instance()
+            gpu_res = engine.generate_chat(
+                [{"role": m.role, "content": m.content} for m in req.messages],
+                max_new_tokens=gpu_max_tokens,
+                temperature=req.temperature or 0.2,
+            )
+            ans_text = gpu_res["text"]
+            await cache.astore(query, {"answer": ans_text})
+            return {
+                "id": f"chatcmpl-hard-{uuid.uuid4().hex[:8]}",
+                "object": "chat.completion",
+                "model": "Qwen/Qwen2.5-7B-Instruct",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": ans_text},
+                    "finish_reason": "stop",
+                }],
+                "usage": {
+                    "prompt_tokens": -1,
+                    "completion_tokens": gpu_res["num_tokens"],
+                    "total_tokens": gpu_res["num_tokens"],
+                },
+                "router_meta": {
+                    "score": round(score, 4),
+                    "tier": decision.target_tier.value,
+                    "route": "hard",
+                    "reason": decision.reason,
+                    "routing_time_seconds": round(time.time() - t0, 4),
+                },
+                "user": user.email,
+            }
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"GPU LLM generation failed: {str(e)}")
+
+    # Step 3: Easy Queries -> CPU SLM Tier (Qwen 2.5 3B)
+    slm_max_tokens = req.max_tokens if (req.max_tokens is not None and req.max_tokens > 0) else 160
+    slm_up = await slm.check_health()
+    if slm_up:
+        try:
+            resp = await slm.generate_chat(
+                [{"role": m.role, "content": m.content} for m in req.messages],
+                max_tokens=slm_max_tokens,
+                temperature=req.temperature or 0.2,
+            )
+            resp["router_meta"] = {
+                "score": round(score, 4),
+                "tier": decision.target_tier.value,
+                "route": "easy",
+                "reason": decision.reason,
+                "routing_time_seconds": round(time.time() - t0, 4),
+            }
+            ans_text = resp["choices"][0]["message"]["content"]
+            await cache.astore(query, {"answer": ans_text})
+            return resp
         except Exception:
             pass
 
-        if not synthesized_text:
-            clean_q = prompt_text.strip().lower().replace(" ", "")
-            if clean_q in ("2+2=", "2+2", "4"):
-                synthesized_text = "2 + 2 = 4"
-            elif any(w in prompt_text.lower() for w in ("hello", "hi", "hey", "greetings")):
-                synthesized_text = (
-                    "Hello! I am the IISc Institutional Thesis RAG Assistant. "
-                    "You can ask me questions about the indexed IISc theses and research publications across departments."
-                )
-            else:
-                synthesized_text = (
-                    f"No specific thesis documents were found matching '{prompt_text}' in scope "
-                    f"{scope_info.thesis_id} ({scope_info.chapter}). Please try refining your query or selecting another thesis."
-                )
-
-    citations = [
-        {
-            "id": chunk.citation,
-            "source_uri": chunk.source_uri,
-            "thesis_id": chunk.thesis_id,
-            "chapter": chunk.chapter,
-            "doc_version": chunk.doc_version,
-            "chunk_index": chunk.chunk_index,
-        }
-        for chunk in chunks
-    ]
-    generated_payload = {
-        "answer": synthesized_text,
-        "citations": citations,
-        "staleness": {"status": "current", "doc_version": scope_info.doc_version},
-        "complexity_score": score_val,
-        "target_tier": target_tier,
-        "latency_ms": round((time.perf_counter() - started_at) * 1000, 2),
-    }
-
-    # 8. Write only grounded answers to version-scoped caches.
-    await container.l0_cache.set(
-        prompt=prompt_text,
-        response=generated_payload,
-        thesis_id=scope_info.thesis_id,
-        chapter=scope_info.chapter,
-        doc_version=scope_info.doc_version,
+    # Fallback attempt: In-process RAG QA Pipeline
+    rag = RAGQAPipeline()
+    rag_res = await run_in_threadpool(
+        rag.answer_query,
+        query,
+        max_new_tokens=slm_max_tokens,
+        temperature=req.temperature or 0.2,
     )
-    await container.l1_cache.set(
-        prompt=prompt_text,
-        query_embedding=query_vec,
-        response=generated_payload,
-        thesis_id=scope_info.thesis_id,
-        chapter=scope_info.chapter,
-        doc_version=scope_info.doc_version,
-        model_tier=target_tier,
-    )
-
-    response.headers["X-Cache"] = "MISS"
-    response.headers["X-Scope-Thesis"] = scope_info.thesis_id
-    response.headers["X-Scope-Chapter"] = scope_info.chapter
-    response.headers["X-Document-Version"] = scope_info.doc_version
-    metrics.record("MISS", route=target_tier, score=score_val)
+    ans_text = rag_res.get("answer", "")
+    retrieved_chunks = rag_res.get("chunks", [])
+    if retrieved_chunks:
+        await cache.astore(query, {"answer": ans_text, "chunks": retrieved_chunks})
     return {
-        "cache_status": "MISS",
-        "scope": {
-            "thesis_id": scope_info.thesis_id,
-            "chapter": scope_info.chapter,
-            "doc_version": scope_info.doc_version,
+        "id": f"chatcmpl-slm-{uuid.uuid4().hex[:8]}",
+        "object": "chat.completion",
+        "model": "qwen2.5-3b-instruct-cpu",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": ans_text,
+            },
+            "finish_reason": "stop",
+        }],
+        "router_meta": {
+            "score": round(score, 4),
+            "tier": decision.target_tier.value,
+            "route": "easy",
+            "reason": decision.reason,
+            "chunks_retrieved": len(rag_res.get("chunks", [])),
+            "routing_time_seconds": round(time.time() - t0, 4),
         },
-        "complexity_score": score_val,
-        "target_tier": target_tier,
         "user": user.email,
-        "data": generated_payload,
     }
+
+
+@app.post("/query", dependencies=[Depends(require_internal_or_auth)], include_in_schema=False)
+async def query_endpoint(
+    req: DirectQueryRequest,
+    request: Request,
+    cache: RedisSemanticCache = Depends(get_semantic_cache),
+    scorer: ComplexityScorer = Depends(get_complexity_scorer),
+    dispatcher: RequestDispatcher = Depends(get_dispatcher),
+    vllm: VLLMClient = Depends(get_vllm_client),
+    admission: AdmissionController = Depends(get_admission_controller),
+):
+    query = req.query.strip()
+    if len(query) < 2:
+        raise HTTPException(status_code=400, detail="Query must contain at least 2 non-whitespace characters")
+    # VULN-04: Validate prompt against adversarial injection & jailbreak patterns
+    try:
+        sanitize_and_fence_prompt(query)
+    except PromptInjectionAlert as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    t0 = time.time()
+
+    # Identify caller for token-bucket and queue accounting
+    client_host = request.client.host if request.client else ""
+    xff = request.headers.get("x-forwarded-for")
+    client_id = client_host or "anonymous"
+
+    # VULN-03: If forwarded by internal web chat proxy over direct loopback, attribute to the user
+    internal_user = request.headers.get("x-internal-user", "").strip()
+    if internal_user and client_host in ("127.0.0.1", "::1", "localhost", "testclient") and not xff:
+        client_id = internal_user
+    elif "session" in request.scope:
+        u = request.session.get("user")
+        if u and isinstance(u, dict) and u.get("email"):
+            client_id = u["email"]
+
+    # Step 0: Check Semantic Vector Cache in Redis (Fast path < 5ms bypasses admission queue)
+    hit = None
+    if not req.bypass_cache:
+        try:
+            hit = await cache.alookup(query)
+        except Exception:
+            hit = None
+
+    if hit is not None:
+        cached_resp = hit.get("response", {})
+        if isinstance(cached_resp, str):
+            try:
+                cached_resp = json.loads(cached_resp)
+            except Exception:
+                cached_resp = {"answer": cached_resp}
+
+        sim = hit.get("similarity", 1.0)
+        matched_prompt = hit.get("matched_prompt", query)
+
+        if req.stream:
+            def cached_stream():
+                # Yield cache hit notification event
+                yield f"data: {json.dumps({'type': 'cache', 'status': 'HIT', 'similarity': sim, 'matched_prompt': matched_prompt, 'badge': 'Cached answer', 'cached_at': cached_resp.get('cached_at', time.time())})}\n\n"
+                # Yield route event
+                yield f"data: {json.dumps({'type': 'route', 'route': cached_resp.get('route', 'cached'), 'target_tier': 'semantic_cache', 'probability_hard': 0.0})}\n\n"
+                # Yield chunks event
+                chunks = sanitize_chunks(cached_resp.get("chunks", []))
+                yield f"data: {json.dumps({'type': 'chunks', 'chunks': chunks, 'retrieval_seconds': 0.001})}\n\n"
+                # Stream cached answer tokens
+                ans = cached_resp.get("answer", "")
+                words = ans.split(" ")
+                for i, w in enumerate(words):
+                    delta = w if i == len(words) - 1 else w + " "
+                    yield f"data: {json.dumps({'type': 'token', 'delta': delta})}\n\n"
+                # Yield completion stats event
+                yield f"data: {json.dumps({'type': 'done', 'cached': True, 'similarity': sim, 'matched_prompt': matched_prompt, 'stats': {'tokens_per_second': 9999.0, 'total_seconds': round(time.time() - t0, 4), 'cached': True}})}\n\n"
+                yield "data: [DONE]\n\n"
+
+            return StreamingResponse(
+                cached_stream(),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                },
+            )
+
+        # Non-streaming cache hit
+        if "chunks" in cached_resp:
+            cached_resp["chunks"] = sanitize_chunks(cached_resp["chunks"])
+        cached_resp["cached"] = True
+        cached_resp["cache_hit"] = True
+        cached_resp["badge"] = "Cached answer"
+        cached_resp["provenance"] = {
+            "status": "cached",
+            "cached_at": cached_resp.get("cached_at", time.time()),
+            "similarity": sim,
+            "model_version": cached_resp.get("model_version", "institution-rag-v1"),
+        }
+        cached_resp["similarity"] = sim
+        cached_resp["matched_prompt"] = matched_prompt
+        cached_resp["routing_time_seconds"] = round(time.time() - t0, 4)
+        return cached_resp
+
+    # Cache Miss: Cold inference required. Guarded by Admission Queue Manager.
+    if req.stream:
+        await admission.acquire(client_id)
+        rag = RAGQAPipeline(top_k=req.top_k)
+
+        def event_stream():
+            try:
+                collected_answer = []
+                collected_chunks = []
+                route_info = {}
+                for event in rag.answer_query_stream(
+                    query,
+                    top_k=req.top_k,
+                    max_new_tokens=req.max_tokens,
+                    temperature=req.temperature or 0.2,
+                ):
+                    etype = event.get("type")
+                    if etype == "token":
+                        collected_answer.append(event.get("delta", ""))
+                    elif etype == "chunks":
+                        event["chunks"] = sanitize_chunks(event.get("chunks", []))
+                        collected_chunks = event["chunks"]
+                    elif etype == "route":
+                        route_info = event
+                    yield f"data: {json.dumps(event)}\n\n"
+
+                full_text = "".join(collected_answer)
+                # Only cache responses when document chunks were successfully retrieved
+                if full_text and collected_chunks:
+                    try:
+                        cache_payload = {
+                            "query": query,
+                            "answer": full_text,
+                            "route": route_info.get("route", "easy"),
+                            "target_tier": route_info.get("target_tier", "cpu_slm"),
+                            "chunks": collected_chunks,
+                        }
+                        cache.store(query, cache_payload)
+                    except Exception:
+                        pass
+                yield "data: [DONE]\n\n"
+            finally:
+                admission.release()
+
+        return StreamingResponse(
+            event_stream(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    # Non-streaming cold inference: wrap inside admission slot
+    async with admission.slot(client_id):
+        from pipeline.retriever import RedisChunkRetriever
+        from pipeline.gpu_llm_runner import GPULLMEngine
+
+        retriever = RedisChunkRetriever()
+        t0_pre = time.time()
+
+        # Step 1: Concurrent Fan-Out (Parallel Scoring + Async Retrieval)
+        score_task = asyncio.create_task(scorer.score(query))
+        retrieval_task = asyncio.create_task(retriever.asearch(query, top_k=req.top_k))
+
+        score, candidate_chunks = await asyncio.gather(score_task, retrieval_task)
+        pre_duration = round(time.time() - t0_pre, 3)
+
+        decision = dispatcher.decide(score)
+        is_hard = (decision.target_tier == ModelTier.GPU_LLM)
+
+        # Step 2: Dynamic In-Memory Tier Document Slicing
+        is_catalog = bool(candidate_chunks and candidate_chunks[0].get("doc_id") == "catalog_summary")
+        if is_catalog:
+            chunks = candidate_chunks
+        elif req.top_k is not None:
+            chunks = candidate_chunks[:req.top_k]
+        elif is_hard:
+            chunks = candidate_chunks[:8]  # Up to 8 docs for GPU LLM 7B
+        else:
+            chunks = candidate_chunks[:3]  # Up to 3 docs for CPU SLM 3B
+
+        if decision.target_tier == ModelTier.GPU_LLM:
+            gpu_max_tokens = req.max_tokens if (req.max_tokens is not None and req.max_tokens > 0) else 2048
+
+            if not chunks:
+                param_messages = [
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are an advanced academic AI research assistant. "
+                            "No specific institutional repository documents directly cover this topic. "
+                            "Please provide a thorough, accurate, and deeply reasoned explanation of the user's question "
+                            "using standard academic and technical literature."
+                        ),
+                    },
+                    {"role": "user", "content": query},
+                ]
+                vllm_up = await vllm.check_health()
+                if vllm_up:
+                    try:
+                        resp = await vllm.generate_chat(param_messages, max_tokens=gpu_max_tokens, temperature=req.temperature or 0.2)
+                        answer_text = "No specific institutional repository theses were found on this topic. Based on general academic knowledge:\n\n" + resp["choices"][0]["message"]["content"]
+                        res = {
+                            "query": query,
+                            "answer": answer_text,
+                            "route": "hard",
+                            "target_tier": "gpu_vllm",
+                            "model": resp.get("model", "Qwen/Qwen2.5-7B-Instruct"),
+                            "score": round(score, 4),
+                            "chunks": [],
+                            "cached": False,
+                            "stats": {
+                                "retrieval_seconds": pre_duration,
+                                "routing_time_seconds": round(time.time() - t0, 4),
+                            },
+                        }
+                        # Do NOT cache fallback response when no documents were retrieved
+                        return res
+                    except Exception:
+                        pass
+                return {
+                    "query": query,
+                    "answer": "No relevant documents were found in the knowledge base matching your query.",
+                    "route": "hard",
+                    "target_tier": "gpu_vllm",
+                    "model": "retriever-filter",
+                    "score": round(score, 4),
+                    "chunks": [],
+                    "cached": False,
+                    "stats": {
+                        "retrieval_seconds": pre_duration,
+                        "routing_time_seconds": round(time.time() - t0, 4),
+                    },
+                }
+
+            vllm_up = await vllm.check_health()
+            if vllm_up:
+                try:
+                    messages = GPULLMEngine.build_rag_messages(query, chunks)
+                    resp = await vllm.generate_chat(
+                        messages,
+                        max_tokens=gpu_max_tokens,
+                        temperature=req.temperature or 0.2,
+                    )
+                    answer_text = resp["choices"][0]["message"]["content"]
+                    res = {
+                        "query": query,
+                        "answer": answer_text,
+                        "route": "hard",
+                        "target_tier": "gpu_vllm",
+                        "model": resp.get("model", "Qwen/Qwen2.5-7B-Instruct"),
+                        "score": round(score, 4),
+                        "chunks": sanitize_chunks(chunks),
+                        "cached": False,
+                        "stats": {
+                            "retrieval_seconds": pre_duration,
+                            "routing_time_seconds": round(time.time() - t0, 4),
+                        },
+                    }
+                    if not req.bypass_cache and chunks:
+                        await cache.astore(query, res)
+                    return res
+                except Exception:
+                    pass
+
+            rag = RAGQAPipeline(top_k=req.top_k)
+            res = rag.answer_query(
+                query,
+                top_k=req.top_k,
+                max_new_tokens=gpu_max_tokens,
+                temperature=req.temperature or 0.2,
+                route_decision={"route": "hard", "target_tier": "gpu_vllm", "probability_hard": score},
+                chunks=chunks,
+            )
+            if "chunks" in res:
+                res["chunks"] = sanitize_chunks(res["chunks"])
+            res["cached"] = False
+            res["routing_time_seconds"] = round(time.time() - t0, 4)
+            if not req.bypass_cache and res.get("chunks"):
+                await cache.astore(query, res)
+            return res
+
+        # Route: Easy -> CPU SLM
+        slm_max_tokens = req.max_tokens if (req.max_tokens is not None and req.max_tokens > 0) else 1024
+        rag = RAGQAPipeline(top_k=req.top_k)
+        res = await run_in_threadpool(
+            rag.answer_query,
+            query,
+            top_k=req.top_k,
+            max_new_tokens=slm_max_tokens,
+            temperature=req.temperature or 0.2,
+            route_decision={"route": "easy", "target_tier": "cpu_slm", "probability_hard": score},
+            chunks=chunks,
+        )
+        if "chunks" in res:
+            res["chunks"] = sanitize_chunks(res["chunks"])
+        res["route"] = "easy"
+        res["target_tier"] = "cpu_slm"
+        res["score"] = round(score, 4)
+        res["cached"] = False
+        res["routing_time_seconds"] = round(time.time() - t0, 4)
+        if not req.bypass_cache and res.get("chunks"):
+            await cache.astore(query, res)
+        return res
+
+
+# ---------------------------------------------------------------------------
+# Frontend Web Chat UI (Mounted from askiisc_chat with Session Auth)
+# ---------------------------------------------------------------------------
+STATIC_DIR = Path(__file__).resolve().parent.parent / "askiisc_chat" / "static"
+if STATIC_DIR.exists():
+    import sys
+    from fastapi import Request
+    from fastapi.responses import FileResponse, JSONResponse
+    from fastapi.staticfiles import StaticFiles
+
+    app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+    chat_dir = str(Path(__file__).resolve().parent.parent / "askiisc_chat")
+    if chat_dir not in sys.path:
+        sys.path.insert(0, chat_dir)
+    from askiisc import auth, config as C
+    from askiisc.gateway_backend import stream_via_gateway
+
+    class OtpReq(BaseModel):
+        email: str = Field(max_length=300)
+
+    class OtpVerify(BaseModel):
+        email: str = Field(max_length=300)
+        code: str = Field(max_length=16)
+
+    class ChatRequest(BaseModel):
+        message: str = Field(..., min_length=1, max_length=1500)
+        history: Optional[List[Dict[str, Any]]] = Field(default=[], max_length=50)
+        thesis_id: Optional[str] = Field(default=None, max_length=100)
+        force: Optional[str] = Field(default=None, max_length=20)
+
+    CSRF_COOKIE_NAME = "csrftoken"
+    CSRF_HEADER_NAME = "x-csrf-token"
+
+    def generate_csrf_token() -> str:
+        return secrets.token_urlsafe(32)
+
+    def set_csrf_cookie(response: Any, token: str):
+        response.set_cookie(
+            key=CSRF_COOKIE_NAME,
+            value=token,
+            max_age=int(os.getenv("SESSION_TTL", str(8 * 3600))),
+            httponly=False,
+            samesite="strict",
+            secure=os.getenv("COOKIE_SECURE", "1") == "1",
+            path="/",
+        )
+
+    def verify_csrf_token(request: Request):
+        """Verify CSRF token for state-changing browser requests (Double Submit Cookie)."""
+        if request.method in ("GET", "HEAD", "OPTIONS"):
+            return
+        auth_header = request.headers.get("authorization", "")
+        if auth_header.startswith("Bearer "):
+            return
+
+        csrf_cookie = request.cookies.get(CSRF_COOKIE_NAME)
+        csrf_header = request.headers.get(CSRF_HEADER_NAME)
+
+        # If a valid session user is logged in or a csrf cookie was issued, require matching header
+        u = get_current_web_user(request)
+        if u or csrf_cookie:
+            if not csrf_cookie or not csrf_header or not secrets.compare_digest(csrf_cookie, csrf_header):
+                logger.warning("CSRF check failed: cookie=%s, header=%s", bool(csrf_cookie), bool(csrf_header))
+                raise HTTPException(
+                    status_code=403,
+                    detail="CSRF token missing or invalid. Please refresh the page.",
+                )
+
+    def get_current_web_user(request: Request):
+        u = request.session.get("user")
+        return u if u and u.get("exp", 0) > time.time() else None
+
+    @app.get("/", include_in_schema=False)
+    @app.get("/index.html", include_in_schema=False)
+    async def serve_index(request: Request):
+        response = FileResponse(STATIC_DIR / "index.html")
+        csrf_token = request.cookies.get(CSRF_COOKIE_NAME) or generate_csrf_token()
+        set_csrf_cookie(response, csrf_token)
+        return response
+
+    @app.get("/me", include_in_schema=False)
+    async def me(request: Request):
+        u = get_current_web_user(request)
+        csrf_token = request.cookies.get(CSRF_COOKIE_NAME) or generate_csrf_token()
+        response = JSONResponse({
+            "tier": "internal" if u else "public",
+            "name": u.get("name") if u else None,
+            "email": u.get("email") if u else None,
+            "login_required": True,
+            "auth_mode": "otp",
+            "backend": "gateway",
+            "debug_enabled": os.getenv("DEBUG_UI", "0") == "1",
+            "csrf_token": csrf_token,
+        })
+        set_csrf_cookie(response, csrf_token)
+        return response
+
+    @app.post("/auth/otp/request", dependencies=[Depends(verify_csrf_token)], include_in_schema=False)
+    @app.post("/auth/otp/resend", dependencies=[Depends(verify_csrf_token)], include_in_schema=False)
+    async def otp_request(body: OtpReq, request: Request):
+        try:
+            email = auth.normalize_email(body.email)
+        except auth.AuthError:
+            return JSONResponse({"error": "Enter your IISc email address (@iisc.ac.in)."}, status_code=400)
+        try:
+            client_ip = auth.client_ip(request) or "127.0.0.1"
+            code = auth.otp_store.issue(email, client_ip)
+        except auth.RateLimited as e:
+            resend_in = getattr(e, "resend_in", int(C.OTP_RESEND_SECS))
+            return JSONResponse({"error": str(e), "resend_in": resend_in}, status_code=429)
+
+        try:
+            import asyncio
+            await asyncio.to_thread(auth.send_mail, email, "Your AskIISc sign-in code", auth.otp_mail_body(code))
+        except auth.MailError as e:
+            auth.otp_store.revoke(email)
+            logger.error("otp mail failed: %s", e)
+            return JSONResponse({"error": f"Could not send email: {e}"}, status_code=503)
+
+        is_resend = request.url.path.endswith("/resend")
+        code_desc = "A new 6-digit verification code" if is_resend else "A 6-digit verification code"
+        return {
+            "ok": True,
+            "message": f"{code_desc} has been sent to your email address (valid for {int(C.OTP_TTL)} seconds).",
+            "resend_in": int(C.OTP_RESEND_SECS),
+        }
+
+    @app.post("/auth/otp/verify", dependencies=[Depends(verify_csrf_token)], include_in_schema=False)
+    async def otp_verify(body: OtpVerify, request: Request):
+        try:
+            email = auth.normalize_email(body.email)
+        except auth.AuthError:
+            return JSONResponse({"error": "Invalid or expired code."}, status_code=401)
+        client_ip = auth.client_ip(request) or "127.0.0.1"
+        try:
+            auth.otp_store.check_verify_rate_limit(client_ip, email)
+        except auth.RateLimited as e:
+            return JSONResponse({"error": str(e)}, status_code=429)
+
+        if not auth.otp_store.verify(email, body.code.strip()):
+            return JSONResponse({"error": "Invalid or expired code."}, status_code=401)
+        request.session.clear()
+        import hashlib
+        request.session["user"] = {
+            "sub": hashlib.sha256(email.encode()).hexdigest(),
+            "name": email,
+            "email": email,
+            "exp": time.time() + C.SESSION_TTL,
+        }
+        return {"ok": True}
+
+    @app.post("/auth/logout", dependencies=[Depends(verify_csrf_token)], include_in_schema=False)
+    async def logout(request: Request):
+        request.session.clear()
+        return {"ok": True}
+
+    @app.get("/theses", include_in_schema=False)
+    async def theses():
+        return []
+
+    @app.post("/chat", dependencies=[Depends(verify_csrf_token)], include_in_schema=False)
+    async def chat_frontend(req: ChatRequest, request: Request):
+        u = get_current_web_user(request)
+        if not u:
+            return JSONResponse(
+                {"error": "Sign in with your IISc email to use AskIISc."},
+                status_code=401,
+            )
+        # VULN-04: Validate prompt against adversarial injection & jailbreak patterns
+        try:
+            sanitize_and_fence_prompt(req.message)
+        except PromptInjectionAlert:
+            return JSONResponse(
+                {"error": "Adversarial prompt injection detected. Your query contains prohibited system override patterns."},
+                status_code=400,
+            )
+        user_email = u.get("email", "")
+        return StreamingResponse(
+            stream_via_gateway(req.message, "internal", user_email=user_email),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
+        )

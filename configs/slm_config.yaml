@@ -1,27 +1,37 @@
-model:
-  path: "models/slm_gguf/qwen2.5-1.5b-instruct-q4_k_m.gguf"
-  architecture: "qwen2"
-  quantization_type: "Q4_K_M"
-  context_window_tokens: 16384
+# ==============================================================================
+# AskIISc Tier-1 CPU Small Language Model (SLM) Configuration
+# ==============================================================================
 
-huggingface:
-  repo_id: "Qwen/Qwen2.5-1.5B-Instruct-GGUF"
-  filename: "qwen2.5-1.5b-instruct-q4_k_m.gguf"
-  hf_model_id: "Qwen/Qwen2.5-1.5B-Instruct"
-  description: "Official Qwen 2.5 1.5B Instruct model in Q4_K_M GGUF format for CPU-efficient on-prem inference"
+model:
+  name: "models/slm_gguf/qwen2.5-3b-instruct-q4_k_m.gguf"
+  shm_path: "/dev/shm/models/qwen2.5-3b-instruct-q4_k_m.gguf"
+  fallback_name: "Qwen/Qwen2.5-3B-Instruct"
+  architecture: "qwen2.5"
+  dtype: "q4_k_m"                                 # 4-bit medium K-quantization for fast CPU GEMM
+  context_window_tokens: 32768
+  max_new_tokens: 512                             # Generation token ceiling per query
+  default_temperature: 0.1
+  top_p: 0.9
+
+retrieval:
+  top_k_chunks: 3                                 # Dynamic chunks filtered and fed to SLM context
+  max_k_ceiling: 5
+  similarity_floor: 0.20                          # Absolute distance cut-off
+  relative_margin: 0.15
 
 cpu_affinity:
-  num_threads: 4
-  num_threads_batch: 4
-  pin_cores: [0, 1, 2, 3]
+  workers: 6                                      # 6 parallel SLM workers
+  num_threads: 16                                 # 16 PyTorch threads per worker (4 x 16 = 64 CPU cores)
+  num_threads_batch: 32                           # Prefill batch matrix multiplication thread allocation
+  omp_wait_policy: "PASSIVE"
   numa_node: 0
-  use_mmap: true
-  use_mlock: true
 
 runtime:
-  engine: "llama.cpp"
-  host: "0.0.0.0"
+  engine: "gguf"
+  host: "127.0.0.1"
   port: 8082
-  batch_size: 512
-  ubatch_size: 128
-  flash_attention: true
+  streaming: true                                 # SSE token streaming support
+
+sanitization:
+  fenced_prompt: true                             # Enclose user queries in fenced delimiters
+  context_xml_escape: true                        # Escape delimiter breakouts in indexed document text

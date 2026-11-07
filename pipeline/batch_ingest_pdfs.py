@@ -17,7 +17,6 @@ import time
 from typing import List, Optional
 
 from pipeline.crawlers.pdf_extractor import PDFExtractor
-from pipeline.env_utils import resolve_redis_url
 from pipeline.indexer import RedisDocumentIndexer
 
 logging.basicConfig(
@@ -34,11 +33,11 @@ class BatchPDFIngester:
         self,
         pdf_dir: str = "data/raw_pdfs",
         redis_url: Optional[str] = None,
-        index_name: str = "rag_documents_v2_idx",
+        index_name: str = "rag_documents_idx",
         vector_dim: int = 384,
     ):
         self.pdf_dir = pdf_dir
-        self.redis_url = resolve_redis_url(redis_url)
+        self.redis_url = redis_url or os.getenv("REDIS_URL", "redis://localhost:6379/0")
         self.index_name = index_name
         self.vector_dim = vector_dim
         self.pdf_extractor = PDFExtractor()
@@ -67,6 +66,8 @@ class BatchPDFIngester:
 
     async def run(self) -> dict:
         """Processes and indexes all PDFs into the vector database."""
+        import redis.asyncio as redis
+        
         start_time = time.time()
         pdf_files = self.find_pdfs()
 
@@ -79,47 +80,77 @@ class BatchPDFIngester:
         total_chunks = 0
         successful_docs = 0
 
-        for idx, pdf_path in enumerate(pdf_files, 1):
-            filename = os.path.basename(pdf_path)
-            doc_id = os.path.splitext(filename)[0]
-            print(f"[{idx}/{len(pdf_files)}] Extracting: {filename}...", flush=True)
-
-            sidecar = self._load_sidecar_metadata(pdf_path)
-
-            extracted = self.pdf_extractor.extract(pdf_path)
-            if not extracted or not extracted.full_text.strip():
-                try:
-                    with open(pdf_path, "r", encoding="utf-8", errors="ignore") as f:
-                        raw_text = f.read()
-                    metadata = {"source": filename, "extractor": "raw_fallback", **sidecar}
-                except Exception as exc:
-                    print(f"[ERR] Could not extract text from {filename}: {exc}", flush=True)
+        r = redis.from_url(self.redis_url, encoding="utf-8", decode_responses=True)
+        try:
+            for idx, pdf_path in enumerate(pdf_files, 1):
+                filename = os.path.basename(pdf_path)
+                doc_id = os.path.splitext(filename)[0]
+                
+                if await r.sismember("processed_pdfs_set", doc_id):
+                    print(f"[{idx}/{len(pdf_files)}] Skipping {filename} (already processed). Deleting file...", flush=True)
+                    try:
+                        os.remove(pdf_path)
+                        json_path = os.path.splitext(pdf_path)[0] + ".json"
+                        if os.path.exists(json_path):
+                            os.remove(json_path)
+                    except OSError:
+                        pass
                     continue
-            else:
-                raw_text = extracted.full_text
-                if sidecar.get("abstract"):
-                    raw_text = f"Title: {sidecar.get('title', '')}\nAbstract: {sidecar['abstract']}\n\n" + raw_text
+                
+                print(f"[{idx}/{len(pdf_files)}] Extracting: {filename}...", flush=True)
 
-                metadata = {
-                    "source": filename,
-                    "title": sidecar.get("title") or extracted.title,
-                    "pages": extracted.metadata.get("total_pages", 1),
-                    **extracted.metadata,
-                    **sidecar,
-                }
+                sidecar = self._load_sidecar_metadata(pdf_path)
 
-            try:
-                num_chunks = await self.indexer.index_document(
-                    doc_id=doc_id,
-                    raw_text=raw_text,
-                    metadata=metadata,
-                    is_paper=True,
-                )
-                total_chunks += num_chunks
-                successful_docs += 1
-                print(f"[OK] Indexed '{filename}' -> {num_chunks} vector chunks.", flush=True)
-            except Exception as exc:
-                print(f"[ERR] Failed to index {filename}: {exc}", flush=True)
+                extracted = self.pdf_extractor.extract(pdf_path)
+                if not extracted or not extracted.full_text.strip():
+                    try:
+                        with open(pdf_path, "r", encoding="utf-8", errors="ignore") as f:
+                            raw_text = f.read()
+                        metadata = {"source": filename, "extractor": "raw_fallback", **sidecar}
+                    except Exception as exc:
+                        print(f"[ERR] Could not extract text from {filename}: {exc}", flush=True)
+                        continue
+                else:
+                    raw_text = extracted.full_text
+                    if sidecar.get("abstract"):
+                        raw_text = f"Title: {sidecar.get('title', '')}\nAbstract: {sidecar['abstract']}\n\n" + raw_text
+
+                    metadata = {
+                        "source": filename,
+                        "title": sidecar.get("title") or extracted.title,
+                        "pages": extracted.metadata.get("total_pages", 1),
+                        **extracted.metadata,
+                        **sidecar,
+                    }
+
+                try:
+                    num_chunks = await self.indexer.index_document(
+                        doc_id=doc_id,
+                        raw_text=raw_text,
+                        metadata=metadata,
+                        is_paper=True,
+                    )
+                    total_chunks += num_chunks
+                    successful_docs += 1
+                    print(f"[OK] Indexed '{filename}' -> {num_chunks} vector chunks.", flush=True)
+                    
+                    # Mark as processed in Redis
+                    await r.sadd("processed_pdfs_set", doc_id)
+                    
+                    # Delete PDF and sidecar to save space
+                    try:
+                        os.remove(pdf_path)
+                        json_path = os.path.splitext(pdf_path)[0] + ".json"
+                        if os.path.exists(json_path):
+                            os.remove(json_path)
+                        print(f"[CLEANUP] Deleted '{filename}' to save space.", flush=True)
+                    except OSError as e:
+                        print(f"[WARN] Could not delete '{filename}': {e}", flush=True)
+                        
+                except Exception as exc:
+                    print(f"[ERR] Failed to index {filename}: {exc}", flush=True)
+        finally:
+            await r.aclose()
 
         elapsed = time.time() - start_time
         summary = {
@@ -144,8 +175,8 @@ class BatchPDFIngester:
 def main():
     parser = argparse.ArgumentParser(description="Batch index PDFs into Redis Stack vector search")
     parser.add_argument("--pdf-dir", default="data/raw_pdfs", help="Directory containing PDF files")
-    parser.add_argument("--redis-url", default=None, help="Redis connection URL (defaults to REDIS_URL in .env)")
-    parser.add_argument("--index-name", default="rag_documents_v2_idx")
+    parser.add_argument("--redis-url", default=os.getenv("REDIS_URL", "redis://localhost:6379/0"))
+    parser.add_argument("--index-name", default="rag_documents_idx")
     parser.add_argument("--vector-dim", type=int, default=384)
 
     args = parser.parse_args()
