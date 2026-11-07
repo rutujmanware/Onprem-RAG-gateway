@@ -9,7 +9,7 @@
 4. [Fast-Path Semantic Vector Cache](#4-fast-path-semantic-vector-cache)
 5. [Neural Complexity Router (Two-Tower MLP Engine)](#5-neural-complexity-router-two-tower-mlp-engine)
 6. [Hybrid Knowledge Retrieval & Query Metadata Extraction](#6-hybrid-knowledge-retrieval--query-metadata-extraction)
-7. [Grounding, Context Auto-Budgeting & Parametric Fallback](#7-grounding-context-auto-budgeting--parametric-fallback)
+7. [Grounding, Context Auto-Budgeting & Zero-Document Rejection](#7-grounding-context-auto-budgeting--zero-document-rejection)
 8. [Dual-Tier Inference Serving Infrastructure](#8-dual-tier-inference-serving-infrastructure)
 9. [Comprehensive Codebase Directory Map](#9-comprehensive-codebase-directory-map)
 10. [Hardware, Compute & Memory Sizing Guidelines](#10-hardware-compute--memory-sizing-guidelines)
@@ -24,34 +24,37 @@
 ### Core Architectural Pillars
 - **100% On-Premise Air-Gapped Operation:** Absolute zero-egress guarantee. No document text, query vectors, or intermediate embeddings ever leave the institutional network.
 - **Zero-GPU-Starvation Dynamic Tiering:** Employs an intelligent Two-Tower Neural Router to absorb **70% to 80%** of everyday campus queries on highly optimized **CPU Small Language Models (3B GGUF with AVX-512)** consuming **0 MiB of GPU VRAM**. The enterprise **GPU LLM (7B on NVIDIA A100)** is reserved exclusively for complex, multi-document synthesis and mathematical proofs.
-- **Microsecond Semantic Caching:** High-concurrency semantic vector cache in Redis serving repeat/similar queries in **< 5ms**, bypassing the inference queue.
+- **Ultra-Low-Latency Typo Normalization:** Microsecond-tier ($3.95\ \mu\text{s}$) token regularizer that resolves domain typographical errors before cache lookup and retrieval without altering standard English.
+- **Microsecond Semantic Caching:** High-concurrency semantic vector cache in Redis Stack (`semantic_cache_idx`) serving repeat or semantically identical queries in **< 1ms (exact)** or **< 35ms (semantic)**, bypassing model inference completely.
+- **Strict Anti-Pollution Integrity:** Answers with zero retrieved documents or institutional refusals are strictly prevented from entering the semantic cache index.
 - **Single-Port Strict Perimeter:** Single public listener (Port 8080) encapsulating authentication, rate limiting, and fair queuing, while internal engines bind strictly to `127.0.0.1`.
 
 ---
 
 ## 2. End-to-End System Topology & Decoupled Architecture
 
-The system consists of **4 independent services** orchestrated via [`scripts/prod_stack.py`](file:///data2/home/ritujmanware/onprem-rag-gateway/scripts/prod_stack.py):
+The system consists of **4 independent services** orchestrated bare-metal via [`scripts/prod_stack.py`](file:///data2/home/ritujmanware/onprem-rag-gateway/scripts/prod_stack.py):
 
 ```mermaid
 flowchart TD
     User(["Campus User / Browser"]) -->|HTTP/SSE Port 8080| GW["Institutional Gateway & Reverse Proxy"]
     
-    subgraph "Perimeter Security & Ingestion (Port 8080)"
+    subgraph "Perimeter Security & Ingress (Port 8080)"
         GW --> Auth["Email OTP Auth & Session Guard"]
-        Auth --> Injection["Prompt Injection & Jailbreak Fence"]
-        Injection --> FairQ["Token-Bucket Fair Queue & Admission Controller"]
+        Auth --> Injection["Prompt Injection & Jailbreak Fence [NFR-7]"]
+        Injection --> TypoNorm["Typo Normalizer (3.95us)"]
+        TypoNorm --> FairQ["Token-Bucket Fair Queue & Admission Controller"]
     end
 
-    subgraph "Fast Path (< 5ms)"
+    subgraph "Fast Path (< 35ms)"
         FairQ --> CacheCheck{"Semantic Cache Hit?"}
-        CacheCheck -->|"Sim >= 0.96"| RedisCache[("Redis Semantic Cache")]
+        CacheCheck -->|"Exact Match (< 1ms) or Sim >= 0.90"| RedisCache[("Redis Semantic Cache (semantic_cache_idx)")]
         RedisCache -->|"Instant Stream"| User
     end
 
     subgraph "Parallel Fan-Out on Cache Miss (~35ms)"
         CacheCheck -->|"Cache Miss"| Fork{"Concurrent Dispatch"}
-        Fork -->|"Task A: Complexity Scoring"| Router["Two-Tower MLP Scorer & Dispatcher"]
+        Fork -->|"Task A: Complexity Scoring"| Router["Two-Tower MLP Scorer (ONNX)"]
         Fork -->|"Task B: Candidate Retrieval"| RetEng["RedisChunkRetriever: HNSW KNN + RediSearch"]
         RetEng --> RedisDB[("Redis Stack Port 6379: 2.26M Chunks in RAM")]
     end
@@ -59,11 +62,17 @@ flowchart TD
     subgraph "Barrier Join & Dynamic In-Memory Slicing (< 1 microsecond)"
         Router --> Join["Barrier Join: max(T_route, T_retrieval)"]
         RedisDB --> Join
-        Join --> Slice{"Model Tier Decision"}
+        Join --> ZeroCheck{"Chunks Retrieved?"}
+        ZeroCheck -->|"0 Chunks"| RefusalReturn["Strict Institutional Refusal (Zero-Pollution)"]
+        ZeroCheck -->|"Chunks > 0"| Slice{"Model Tier Decision"}
         Slice -->|"Score < 0.65: Dynamic Slice (max 3 Chunks)"| CPUSLM["CPU SLM Port 8082: Qwen 2.5 3B GGUF AVX-512"]
         Slice -->|"Score >= 0.65: Dynamic Slice (max 8 Chunks)"| GPULLM["GPU LLM Port 8000: vLLM Qwen 2.5 7B bfloat16"]
     end
 
+    GPULLM -.->|"SLA Breach / 5xx / Timeout"| Fallback["Fallback State Machine"]
+    Fallback ==>|"Transparent Reroute"| CPUSLM
+
+    RefusalReturn -->|"Output Institutional Refusal"| User
     CPUSLM -->|"Stream Document Titles Only"| User
     GPULLM -->|"Stream Document Titles Only"| User
 ```
@@ -75,38 +84,52 @@ sequenceDiagram
     autonumber
     actor Client as Campus User / Browser
     participant GW as Institutional Gateway (Port 8080)
-    participant Cache as Redis Semantic Cache
-    participant MLP as Neural MLP Router
+    participant Norm as Typo Normalizer (3.95us)
+    participant Cache as Redis Semantic Cache (semantic_cache_idx)
+    participant MLP as Neural MLP Router (400-d)
     participant Redis as Redis Stack (Port 6379)
     participant SLM as CPU SLM Engine (Port 8082)
     participant LLM as GPU LLM Engine (Port 8000)
 
     Client->>GW: POST /query (Prompt)
-    GW->>Cache: Semantic Vector Lookup (< 5ms)
-    alt Cache Hit (Sim >= 0.96)
+    GW->>Norm: normalize(query) -> sanitized query
+    Norm-->>GW: Cleaned Query (< 5us)
+    GW->>Cache: Semantic Vector Lookup (all-MiniLM-L6-v2, Sim >= 0.90)
+    alt Cache Hit (Sim >= 0.90)
         Cache-->>GW: Return Pre-Cached Generation
-        GW-->>Client: Instant Token Stream (< 5ms)
+        GW-->>Client: Instant Token Stream (< 35ms)
     else Cache Miss
         par Concurrent Fan-Out (max ~35ms)
             GW->>MLP: score(query) -> P(hard)
             MLP-->>GW: Complexity Score
         and
-            GW->>Redis: asearch(query) -> HNSW KNN
+            GW->>Redis: asearch(query) -> HNSW KNN (EF_RUNTIME 64)
             Redis-->>GW: 30 Candidate Chunks
         end
-        Note over GW: Barrier Join & Dynamic In-Memory Slicing (< 1 microsecond)
-        alt Easy Tier (Score < 0.65)
-            Note over GW: Slice to top 1-3 chunks
-            GW->>SLM: POST /chat/completions (Prompt + 3 Chunks)
+        Note over GW: Barrier Join & Dynamic Knee-Drop Pruning
+        alt Zero Chunks Retrieved
+            GW-->>Client: "No specific institutional repository theses were found on this topic."
+            Note over GW: Anti-Pollution Shield: Never cache 0-chunk refusal
+        else Easy Tier (Score < 0.65)
+            Note over GW: Slice to dynamic top 1-3 chunks
+            GW->>SLM: POST /chat/completions (Prompt + Chunks)
             SLM-->>GW: Stream Token Deltas (AVX-512)
             GW-->>Client: Stream Tokens + Document Titles Only
+            GW->>Cache: Asynchronously Store Valid Response in Vector Cache
         else Hard Tier (Score >= 0.65)
-            Note over GW: Slice to top 1-8 chunks
-            GW->>LLM: POST /v1/chat/completions (Prompt + 8 Chunks)
-            LLM-->>GW: Stream Token Deltas (vLLM PagedAttention)
-            GW-->>Client: Stream Tokens + Document Titles Only
+            Note over GW: Slice to dynamic top 1-8 chunks
+            GW->>LLM: POST /v1/chat/completions (Prompt + Chunks)
+            alt GPU Online & Responsive
+                LLM-->>GW: Stream Token Deltas (vLLM PagedAttention)
+                GW-->>Client: Stream Tokens + Document Titles Only
+                GW->>Cache: Asynchronously Store Valid Response in Vector Cache
+            else GPU Timeout (> 30s) or 5xx Error
+                Note over GW: Fallback Triggered: Reroute to CPU SLM
+                GW->>SLM: POST /chat/completions (Prompt + Chunks)
+                SLM-->>GW: Stream Token Deltas
+                GW-->>Client: Stream Tokens + Document Titles Only
+            end
         end
-        GW->>Cache: Asynchronously Store Response in Vector Cache
     end
 ```
 
@@ -114,9 +137,9 @@ sequenceDiagram
 
 | Service | Port | Binding | Security / Firewall Boundary | Technology |
 | :--- | :---: | :---: | :--- | :--- |
-| **Unified Campus Gateway** | `8080` | `0.0.0.0` | **Public Facing (Intranet)**; Session Cookies, CSRF, Rate Limiting | FastAPI, Uvicorn (6 workers) |
+| **Unified Campus Gateway & UI** | `8080` | `0.0.0.0` | **Public Facing (Intranet)**; Session Cookies, CSRF, Token-Bucket Admission | FastAPI, Uvicorn (6 workers) |
 | **Redis Stack Server** | `6379` | `127.0.0.1` | **Loopback Only**; Password Protected (`REDIS_PASSWORD`) | RediSearch + RedisJSON + HNSW |
-| **CPU SLM Daemon** | `8082` | `127.0.0.1` | **Loopback Only**; Internal microservice | FastAPI, `llama.cpp` (6 workers x 16 threads) |
+| **CPU SLM Daemon** | `8082` | `127.0.0.1` | **Loopback Only**; Internal microservice | FastAPI, `llama.cpp` (6 workers $\times$ 16 threads) |
 | **vLLM GPU Engine** | `8000` | `127.0.0.1` | **Loopback Only**; Internal microservice | vLLM OpenAI API Server, CUDA 12.1 |
 
 ---
@@ -127,25 +150,28 @@ sequenceDiagram
 To prevent unauthorized intranet access, direct model bypass, or cache manipulation:
 - The internal daemon ports (`6379`, `8082`, `8000`) bind strictly to `127.0.0.1`.
 - Any external request directly targeting internal ports is dropped at the OS socket level.
+- External requests to `/query`, `/cache/*`, and `/queue/stats` must present an authenticated campus web session or a valid `ADMIN_API_KEY`, otherwise returning HTTP 404 to obscure internal endpoint existence.
 - Automated security test suite: [`tests/test_single_port_security.py`](file:///data2/home/ritujmanware/onprem-rag-gateway/tests/test_single_port_security.py).
 
 ### 3.2 Passwordless Email OTP Authentication
 Implemented in [`askiisc_chat/askiisc/auth.py`](file:///data2/home/ritujmanware/onprem-rag-gateway/askiisc_chat/askiisc/auth.py):
-- **Campus Whitelist:** Enforces strict domain validation (`@iisc.ac.in`).
-- **Cryptographic OTP:** 6-digit cryptographically secure numeric tokens.
+- **Campus Domain Lockdown:** Enforces strict domain validation (`@iisc.ac.in`).
+- **Cryptographic OTP Tokens:** 6-digit cryptographically secure numeric tokens.
 - **Lifecycle & Expiration:** 180-second token TTL with rate-limited resend cooldown (60s).
-- **Session Handling:** Encrypted session cookies (`askiisc_session`) with `HttpOnly`, `SameSite=Lax`, and `Secure` attributes.
+- **Brute-Force & Rate Limits:** Enforces **10 OTPs/hour per email** and **1,000 OTPs/hour per IP**, backed by atomic Redis Lua scripts (`auth:otp:*`, `auth:rate:*`).
+- **Session Handling:** Encrypted session cookies (`askiisc_session`) with `HttpOnly`, `SameSite=Lax`, and `Secure` attributes, validated via constant-time digest comparison.
 
-### 3.3 Prompt Injection & Jailbreak Defense Fence
-Implemented in [`tests/test_injection_fence.py`](file:///data2/home/ritujmanware/onprem-rag-gateway/tests/test_injection_fence.py) and gateway middleware:
-- Inspects queries before vectorization for jailbreak signatures (e.g. *"ignore previous instructions"*, *"system prompt override"*, *"DAN mode"*).
-- Rejects adversarial prompts with a polite refusal before tokens enter the retrieval or inference pipelines.
+### 3.3 Prompt Injection & Jailbreak Defense Fence (NFR-7)
+Implemented in [`pipeline/sanitizer.py`](file:///data2/home/ritujmanware/onprem-rag-gateway/pipeline/sanitizer.py) and verified in [`tests/test_injection_fence.py`](file:///data2/home/ritujmanware/onprem-rag-gateway/tests/test_injection_fence.py):
+- Inspects queries before vectorization for jailbreak signatures (e.g. *"ignore previous instructions"*, *"system prompt override"*, *"DAN mode"*, system delimiter tags).
+- Rejects adversarial prompts with HTTP 400 (`PromptInjectionAlert`) before tokens enter retrieval or inference pipelines.
+- Escapes XML context boundaries to prevent document content from executing prompt-breakout attacks.
 
 ### 3.4 Token-Bucket Fair Queue & Admission Controller
-Implemented in [`gateway/queue/admission.py`](file:///data2/home/ritujmanware/onprem-rag-gateway/gateway/queue/admission.py) and [`gateway/queue/fair_queue.py`](file:///data2/home/ritujmanware/onprem-rag-gateway/gateway/queue/fair_queue.py):
-- **Concurrency Cap:** Limits total simultaneous active cold inferences to prevent CPU thread thrashing and GPU OOM.
-- **Fair-Share Token Buckets:** Tracks client IP/email token consumption. Prevents a single script from monopolizing the campus SLM/LLM capacity.
-- **Graceful Shedding:** Excess requests wait in an async priority queue; if queue timeout exceeds threshold (e.g. 15s), responds with HTTP 503 and retry-after header.
+Implemented in [`gateway/queue/admission.py`](file:///data2/home/ritujmanware/onprem-rag-gateway/gateway/queue/admission.py):
+- **Token Bucket Rate Limiting:** Per-client bucket with capacity 60.0 and refill rate 20.0 tokens/sec. Breaches trigger HTTP 429 with `Retry-After: 2`.
+- **Worker Concurrency Limit:** Bounded active inference slots (global cap 30, per-user cap 6) across 6 worker processes to prevent CPU thread thrashing and GPU out-of-memory errors.
+- **Fair Queuing & Load Shedding:** Excess requests wait in an async queue (max depth 120, wait timeout 30s). When the queue is saturated, requests are shed gracefully with HTTP 503.
 
 ---
 
@@ -154,33 +180,36 @@ Implemented in [`gateway/queue/admission.py`](file:///data2/home/ritujmanware/on
 Implemented in [`gateway/cache/redis_semantic_cache.py`](file:///data2/home/ritujmanware/onprem-rag-gateway/gateway/cache/redis_semantic_cache.py).
 
 ### Mechanism & Cache Topology
-1. Query strings are embedded into 384-dimensional dense vectors using [`BAAI/bge-small-en-v1.5`](file:///data2/home/ritujmanware/onprem-rag-gateway/models/embeddings/all-MiniLM-L6-v2) on CPU (< 4ms).
-2. Performs cosine similarity search against index `idx:semantic_cache` in Redis.
-3. If cosine similarity $\ge 0.96$:
-   - **Cache Hit:** Returns pre-generated response and metadata immediately (< 5ms).
-   - In streaming mode (`req.stream = True`), words are emitted as SSE token deltas mimicking real-time generation at > 9,000 tok/s.
-4. If similarity $< 0.96$:
-   - **Cache Miss:** Forwards query to cold RAG pipeline; asynchronously stores successful answers back to cache upon completion.
+1. Incoming queries are normalized via [`TypoNormalizer`](file:///data2/home/ritujmanware/onprem-rag-gateway/pipeline/text_processing/typo_normalizer.py) in $3.95\ \mu\text{s}$.
+2. Query text is embedded into a 384-dimensional dense vector using [`all-MiniLM-L6-v2`](file:///data2/home/ritujmanware/onprem-rag-gateway/models/embeddings/all-MiniLM-L6-v2) on CPU (< 4ms).
+3. Performs HNSW cosine similarity search against index `semantic_cache_idx` (key prefix `semcache:`) using RediSearch `FT.SEARCH` with `EF_RUNTIME 64`.
+4. **Cache Hit Decision:**
+   - If cosine similarity $\ge 0.90$ (cosine distance $\le 0.10$) or exact L0 hash match:
+     - Returns pre-generated response immediately (< 1ms exact, < 35ms semantic).
+     - Emits token deltas via SSE streaming with `cache_hit=True` metadata.
+5. **Cache Miss Decision:**
+   - If similarity $< 0.90$, dispatches to the cold RAG pipeline.
 
-### Refusal & Insufficient Data Hygiene Guard
-- [`RedisSemanticCache.is_cacheable_response`](file:///data2/home/ritujmanware/onprem-rag-gateway/gateway/cache/redis_semantic_cache.py#L180-L220):
-  - Refusal phrases (*"Based on the provided documents, there is insufficient information..."*, *"No relevant documents were found..."*, retrieval errors) are **blocked from cache storage**.
-  - `apurge_uncacheable_entries()` scans and purges legacy empty/refusal entries on gateway startup.
+### Refusal & Anti-Pollution Shield (NFR-6)
+- [`RedisSemanticCache.is_cacheable_response`](file:///data2/home/ritujmanware/onprem-rag-gateway/gateway/cache/redis_semantic_cache.py):
+  - Any response associated with zero retrieved document chunks is **strictly prohibited from cache entry**.
+  - Standard institutional refusal phrases (*"No specific institutional repository theses were found on this topic."*, *"insufficient information"*, retrieval errors) are blocked from storage.
+  - Startup routine `apurge_uncacheable_entries()` scans and evicts any legacy empty or ungrounded entries.
 
 ---
 
 ## 5. Neural Complexity Router (Two-Tower MLP Engine)
 
-Implemented in [`gateway/router/complexity_scorer.py`](file:///data2/home/ritujmanware/onprem-rag-gateway/gateway/router/complexity_scorer.py) and [`gateway/router/dispatcher.py`](file:///data2/home/ritujmanware/onprem-rag-gateway/gateway/router/dispatcher.py).
+Implemented in [`gateway/router/complexity_scorer.py`](file:///data2/home/ritujmanware/onprem-rag-gateway/gateway/router/complexity_scorer.py) and [`gateway/router/mlp_router/inference.py`](file:///data2/home/ritujmanware/onprem-rag-gateway/gateway/router/mlp_router/inference.py).
 
 ### Architectural Rationale
-Routing queries by heuristic length or keyword search is fragile. The Two-Tower MLP Router uses dense query representations to classify semantic reasoning complexity:
+The Two-Tower MLP Router classifies semantic reasoning complexity using a 400-dimensional hybrid representation without performing any database lookups:
 
 ```mermaid
 flowchart LR
-    Q[User Query Text] --> Emb[BGE-Small 384-dim Dense Embedder]
-    Q --> Ling[Linguistic & Syntactic Feature Extractor]
-    Emb --> Concat[Feature Fusion Layer: 388 Dimensions]
+    Q[User Query Text] --> Emb[all-MiniLM-L6-v2 384-dim Dense Embedder]
+    Q --> Ling[Linguistic & Intent Feature Extractor: 16 Features]
+    Emb --> Concat[Feature Fusion Layer: 400 Dimensions]
     Ling --> Concat
     Concat --> Dense1[Dense Layer: 128 ReLU + Dropout]
     Dense1 --> Dense2[Dense Layer: 64 ReLU]
@@ -190,9 +219,10 @@ flowchart LR
     Decision -->|No| Easy[CPU SLM Tier: Qwen 2.5 3B on Host CPU]
 ```
 
-- **Inference Time:** $< 3.2\text{ ms}$ on host CPU.
-- **Routing Threshold:** Queries with $P(\text{hard}) \ge 0.65$ route to GPU; all others stay on CPU.
-- **Resource Savings:** **78% of queries** are handled on CPU, reserving the GPU for heavy analytical jobs.
+- **Feature Fusion:** Combines 384 dense semantic dimensions with 16 structural/intent features (word count, punctuation complexity, `HARD_KEYWORDS` like *compare, synthesize, derive, versus*).
+- **Inference Time:** $< 5\text{ ms}$ on host CPU (average $21.8\text{ ms}$ total including embedding generation).
+- **Routing Threshold:** Queries with $P(\text{hard}) \ge 0.65$ route to GPU vLLM; all others route to CPU SLM.
+- **Resource Sparing:** **70% to 80% of queries** execute entirely on CPU, reserving the NVIDIA A100 for heavy multi-document synthesis.
 
 ---
 
@@ -210,41 +240,21 @@ Implemented in [`pipeline/retriever.py`](file:///data2/home/ritujmanware/onprem-
 - Queries like *"how many thesis of CSA department exist"* extract `@department:(Computer Science and Automation)` with `is_count=True`.
 - Queries matching catalog patterns bypass dense KNN vector distortion and execute exact RediSearch boolean queries, grouping chunks by `doc_id` to prevent multi-chunk duplicate counts.
 
-### 6.3 Dynamic Retrieval & In-Memory Tier Document Slicing Flowchart
-
-```mermaid
-flowchart TD
-    Q["User Query Text"] --> Extractor["Query Metadata Extractor"]
-    Extractor --> CheckCatalog{"Catalog / Department Query?"}
-    CheckCatalog -->|"Yes: Department / Author Filter"| RediSearch["RediSearch Tag Filter: Exact Boolean Search"]
-    CheckCatalog -->|"No: General Academic Topic"| DenseKNN["BGE-Small 384-d Embedding + HNSW KNN Vector Search"]
-    RediSearch --> Pool["Candidate Pool: Top 30 Documents"]
-    DenseKNN --> Pool
-    Pool --> FloorCheck{"Relevance Floor: Sim >= 0.52?"}
-    FloorCheck -->|"All Chunks Below Floor"| Fallback["Parametric Fallback: Structured Technical Knowledge"]
-    FloorCheck -->|"Chunks Pass Floor"| KneeDrop["Dynamic Knee-Drop Pruning: Drop Margin > 0.06"]
-    KneeDrop --> JoinSync["Barrier Join with Neural Router Complexity Score"]
-    JoinSync --> TierCheck{"Route Decision"}
-    TierCheck -->|"Score < 0.65 (Easy Tier)"| Cap3["In-Memory Slice: Dynamic Top 1 to 3 Documents"]
-    TierCheck -->|"Score >= 0.65 (Hard Tier)"| Cap8["In-Memory Slice: Dynamic Top 1 to 8 Documents"]
-    TierCheck -->|"Catalog Query"| CatalogPreserve["Preserve Complete Catalog Summary Table (Up to 40 Records)"]
-```
-
-### 6.4 Fully Dynamic Document Retrieval
+### 6.3 Fully Dynamic Document Retrieval
 Unlike traditional fixed $k=3$ or $k=5$ retrievers:
 - **Candidate Pool:** Fetches top 30 candidate chunks from Redis.
 - **Dynamic Knee-Drop Filtering:** Truncates candidate tail when score drop between consecutive ranks exceeds `0.06`.
 - **Relevance Floor:** Enforces absolute minimum cosine similarity floor (`0.52`).
-- **Dynamic Capacity:** Returns as many chunks as genuinely qualify without artificial ceilings.
+- **Adaptive Borderline Tightening:** If the top candidate is near the threshold floor, margin bounds tighten dynamically to prune marginal candidates.
 
-### 6.5 Response Sanitization (Document Titles Only)
-To minimize network payload and avoid overwhelming the user with text walls:
+### 6.4 Response Sanitization (Document Titles Only)
+To minimize network payload and avoid overwhelming the user with raw text walls:
 - The internal retriever passes full chunk content to the model for grounding.
-- In the final HTTP/SSE response sent to the client, [`sanitize_chunks()`](file:///data2/home/ritujmanware/onprem-rag-gateway/pipeline/retriever.py#L70-L85) strips all raw chunk text (`content`, `text`, `chunk_text`), returning **only document titles** and similarity scores.
+- In the final HTTP/SSE response sent to the client, [`sanitize_chunks()`](file:///data2/home/ritujmanware/onprem-rag-gateway/pipeline/retriever.py) strips all raw chunk text (`content`, `text`, `chunk_text`, `vector`, `chunk_key`), returning **only document titles**, authors, and similarity scores.
 
 ---
 
-## 7. Grounding, Context Auto-Budgeting & Parametric Fallback
+## 7. Grounding, Context Auto-Budgeting & Zero-Document Rejection
 
 ### 7.1 Context Window Auto-Budgeting
 In [`pipeline/slm_runner.py`](file:///data2/home/ritujmanware/onprem-rag-gateway/pipeline/slm_runner.py):
@@ -253,16 +263,17 @@ In [`pipeline/slm_runner.py`](file:///data2/home/ritujmanware/onprem-rag-gateway
 - **Strict Block Clamping:** Even if the first chunk (e.g., catalog summary) is massive, it is strictly sliced to fit the budget.
 - **Active Token Slicing:** Before calling `llama_cpp`, `generate_chat()` verifies `prompt_tokens <= n_ctx - 256`, trimming prompt excess and clamping `effective_max_tokens = min(max_new_tokens, n_ctx - prompt_tokens - 16)`. Mathematical overflow is impossible.
 
-### 7.2 Parametric Fallback for Zero-Document Matches
-When a user asks a foundational technical question with 0 repository matches (e.g. *"what is cache"*):
-- Instead of returning a dead-end rejection (*"No relevant documents found"*), [`pipeline/rag_chain.py`](file:///data2/home/ritujmanware/onprem-rag-gateway/pipeline/rag_chain.py#L293-L330) emits an informative header:
-  > *"No specific institutional repository theses were found on this topic. Based on general technical knowledge:"*
-- The model then provides a structured, high-quality technical explanation from its parametric weights.
+### 7.2 Zero-Document Match Behavior: Strict Institutional Refusal
+When a query yields zero relevant theses from the institutional corpus (all candidates below similarity floor `0.52`):
+- Instead of generating speculative or ungrounded answers from parametric knowledge, the system outputs exclusively:
+  > *"No specific institutional repository theses were found on this topic."*
+- Parametric general technical generation is **strictly disabled** for ungrounded queries to ensure 100% institutional grounding integrity.
+- The anti-pollution shield guarantees this refusal string is never stored in the semantic cache.
 
-### 7.3 Balanced System Prompting
-Refined prompt rules in [`pipeline/slm_runner.py`](file:///data2/home/ritujmanware/onprem-rag-gateway/pipeline/slm_runner.py#L295-L315):
-- **Repository Queries:** Strictly grounded in the provided context documents with explicit citations (`[Document i]`).
-- **Educational/Algorithmic Queries:** Complete conceptual breakdown with time complexity and steps, connecting to repository citations if mentioned, without rigid refusals.
+### 7.3 Grounded System Prompting
+Refined prompt rules in [`pipeline/slm_runner.py`](file:///data2/home/ritujmanware/onprem-rag-gateway/pipeline/slm_runner.py):
+- **Repository Grounding:** Answers must be strictly derived from the retrieved thesis chunks with explicit citations (`[Document i]`).
+- **Delimiter Fencing:** Injected document content is wrapped in `<context>` blocks with XML escaping to neutralize prompt-breakout attacks.
 
 ---
 
@@ -274,14 +285,14 @@ Implemented in [`pipeline/serve_cpu_slm.py`](file:///data2/home/ritujmanware/onp
 - **Backend:** `llama-cpp-python` compiled with native AVX-512 acceleration.
 - **Concurrency:** 6 Uvicorn workers, each with 16 decode threads and 32 batch threads.
 - **Memory Footprint:** ~2.5 GB RAM total (shared mmap weights).
-- **Performance:** 18 – 24 tokens/sec on modern server CPUs.
+- **Performance:** 18 – 24 tokens/sec on modern server CPUs; TTFT ~0.039s.
 
 ### 8.2 Tier 2: GPU LLM Server (Port 8000)
 - **Model:** `Qwen2.5-7B-Instruct` in full `bfloat16` precision (15.2 GB).
 - **Backend:** vLLM OpenAI-compatible server.
-- **VRAM Footprint:** ~18.7 GB VRAM on NVIDIA A100 (40GB) or RTX A5000 (24GB).
+- **VRAM Footprint:** ~18.7 GB VRAM on NVIDIA A100 (40GB/80GB).
 - **Features:** PagedAttention v2, continuous iteration batching, KV-cache sharing.
-- **Performance:** 45 – 55 tokens/sec per stream; > 300 tokens/sec batched.
+- **Performance:** 45 – 55 tokens/sec per stream; TTFT ~0.033s.
 
 ---
 
@@ -292,13 +303,13 @@ Implemented in [`pipeline/serve_cpu_slm.py`](file:///data2/home/ritujmanware/onp
 ├── askiisc_chat/                 # Unified Web Frontend & Chat UI
 │   ├── askiisc/                  # Chat backend adapter modules
 │   │   ├── app.py                # FastAPI chat endpoints & session auth
-│   │   ├── auth.py               # Passwordless email OTP authentication
+│   │   ├── auth.py               # Passwordless email OTP authentication (Redis Lua)
 │   │   ├── config.py             # Chat configuration & environment loader
 │   │   └── gateway_backend.py    # SSE stream translator & client to Gateway
 │   ├── static/                   # Frontend assets
 │   │   ├── index.html            # Single-page web chat application
 │   │   └── vendor/               # Offline KaTeX (LaTeX math) & Marked.js
-│   └── smtp.env                  # Intranet SMTP credentials for OTP delivery
+│   └── app.env                   # Chat configuration overrides
 │
 ├── configs/                      # Service Configuration Files
 │   ├── gateway_config.yaml       # Gateway ports, admission limits, cache thresholds
@@ -307,29 +318,34 @@ Implemented in [`pipeline/serve_cpu_slm.py`](file:///data2/home/ritujmanware/onp
 │
 ├── gateway/                      # Central API Gateway Service (Port 8080)
 │   ├── cache/
-│   │   └── redis_semantic_cache.py # Vector semantic cache (< 5ms hit latency)
+│   │   └── redis_semantic_cache.py # Vector semantic cache (< 1ms exact, < 35ms semantic)
 │   ├── queue/
-│   │   ├── admission.py          # Concurrency admission slot controller
+│   │   ├── admission.py          # Concurrency admission slot & rate limiter
 │   │   └── fair_queue.py         # Token-bucket client fair-sharing queue
 │   ├── router/
 │   │   ├── complexity_scorer.py  # Neural MLP difficulty evaluator
 │   │   ├── dispatcher.py         # Tier dispatching rules (CPU vs GPU)
-│   │   └── mlp_router/           # PyTorch Two-Tower classifier weights & logic
+│   │   └── mlp_router/           # PyTorch Two-Tower 400-d classifier weights & inference
 │   └── main.py                   # Master FastAPI gateway & SSE streaming router
 │
 ├── pipeline/                     # Core RAG Pipeline & Inference Engines
 │   ├── crawlers/                 # DSpace harvesting & PDF processing scripts
 │   ├── embeddings/
-│   │   └── embedder.py           # BGE-Small 384-dim CPU vectorizer
-│   ├── gpu_llm_runner.py         # In-process / vLLM client for 7B GPU model
+│   │   └── embedder.py           # all-MiniLM-L6-v2 384-dim CPU vectorizer
+│   ├── text_processing/
+│   │   ├── typo_normalizer.py    # Ultra-low-latency 3.95us token typo normalizer
+│   │   ├── chunker.py            # Recursive character chunker (512/64)
+│   │   └── cleaner.py            # Academic text sanitization
 │   ├── query_metadata_extractor.py # Regex & department metadata extractor
 │   ├── rag_chain.py              # End-to-end RAG QA coordinator
 │   ├── retriever.py              # Redis HNSW KNN + RediSearch hybrid retriever
+│   ├── sanitizer.py              # Prompt injection detector & context fencer (NFR-7)
 │   ├── serve_cpu_slm.py          # Port 8082 FastAPI inference server
 │   └── slm_runner.py             # CPUSLMEngine (llama.cpp GGUF + AVX-512)
 │
 ├── models/                       # Model Weights & GGUF Storage
-│   ├── embeddings/               # Local BGE-Small embedding model
+│   ├── embeddings/
+│   │   └── all-MiniLM-L6-v2/     # Local all-MiniLM-L6-v2 model weights
 │   ├── llm_7b/                   # Symlink to Qwen2.5-7B-Instruct HF repo
 │   └── slm_gguf/                 # qwen2.5-3b-instruct-q4_k_m.gguf (2.0 GB)
 │
@@ -338,19 +354,25 @@ Implemented in [`pipeline/serve_cpu_slm.py`](file:///data2/home/ritujmanware/onp
 │
 ├── scripts/                      # Management & Operations Tooling
 │   ├── prod_stack.py             # 4-tier lifecycle manager (start/stop/restart)
-│   ├── test_smtp.py              # SMTP OTP verification utility
-│   └── run_100_uncached_load_test.py # Concurrency stress-testing harness
+│   ├── clear_otp_limits.py       # Administrative OTP rate-limit reset tool
+│   └── test_smtp.py              # SMTP OTP verification utility
 │
 └── tests/                        # Automated Verification & Integration Suites
     ├── test_admission_queue.py   # Concurrency limiting & timeout tests
+    ├── test_break_hardening.py   # Adversarial inputs & CSRF security tests
     ├── test_cache_hits.py        # Redis semantic cache exact & paraphrase tests
-    ├── test_cache_insufficient_data.py # Uncacheable refusal rejection tests
+    ├── test_cache_insufficient_data.py # Anti-pollution refusal rejection tests
+    ├── test_cache_purge_and_ttl.py # TTL expiration & semantic cache purge tests
+    ├── test_constant_time_and_cookie_security.py # Timing resistance & cookie tests
+    ├── test_dos_boundary_validation.py # Payload length bounds & clamping tests
     ├── test_dynamic_retrieval.py # Knee-drop & similarity floor tests
     ├── test_injection_fence.py   # Prompt injection security fence tests
-    ├── test_intensive_full_stack.py # 24-check end-to-end integration test
+    ├── test_intensive_full_stack.py # 36-check end-to-end integration test
+    ├── test_otp_concurrency.py   # Atomic Lua OTP lockout & burn tests
     ├── test_query_metadata_extractor.py # Unit tests for metadata parser
     ├── test_rate_limiting.py     # IP & user bucket throttling tests
-    └── test_single_port_security.py # Perimeter port binding security tests
+    ├── test_single_port_security.py # Perimeter port binding security tests
+    └── test_typo_normalizer.py   # Typo normalizer latency & accuracy tests
 ```
 
 ---
@@ -397,18 +419,15 @@ tail -n 100 -f logs/slm.log
 > **NEVER terminate or restart Redis (Port 6379)** unnecessarily. Loading the 2.26 million chunk dataset from `dump_final.rdb` into RAM takes ~45 minutes on NVMe and holds active production vector caches.
 
 ### 11.2 Automated Test Verification Suite
-Run the full automated test suite containing 24 end-to-end integration checks:
+Run the full automated test suite:
 ```bash
-make test
+pytest tests/ -v
 ```
-All test suites:
-- `test_admission_queue.py`
-- `test_single_port_security.py`
-- `test_injection_fence.py`
-- `test_rate_limiting.py`
-- `test_cache_hits.py`
-- `test_cache_insufficient_data.py`
-- `test_dynamic_retrieval.py`
-- `test_query_metadata_extractor.py`
+All **84 unit and integration tests** across 15 test modules must report **100% PASS**.
 
-must report **100% PASS** before promoting any code modifications to production.
+Run the full-stack live verification suite:
+```bash
+python tests/test_intensive_full_stack.py
+```
+All **36 full-stack checks** (MLP router accuracy, CPU SLM TTFT, GPU vLLM throughput, Redis semantic cache hits, dynamic out-of-domain rejection, and output sanitization) must report **100% PASS** before promoting code modifications to production.
+

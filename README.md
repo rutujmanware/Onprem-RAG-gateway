@@ -1,390 +1,562 @@
-# On-Premise Institutional RAG Gateway
+# 🏛️ On-Premise Institutional RAG Gateway (AskIISc)
 
-A zero-egress Retrieval-Augmented Generation (RAG) system for IISc. Theses and papers are scraped from the institute's DSpace repository and stored as vectors in **Redis Stack**. A **complexity router** sends each question either to a small model on **CPU** (Qwen 2.5 3B) or to a larger **GPU** model served by **vLLM**. Admission control, rate limiting and a two-level cache sit in front of both. Users reach it through the **AskIISc web app** and sign in with a one-time code (OTP) emailed to their `@iisc.ac.in` address.
+A 100% bare-metal, zero-egress Retrieval-Augmented Generation (RAG) platform and API Gateway built for the Indian Institute of Science (IISc). The entire corpus of institutional theses and research papers (**2,261,664 chunks**) is indexed in **Redis Stack** RAM. An ONNX Two-Tower **complexity router** dynamically dispatches queries to either an ultra-fast **CPU Small Language Model** (Qwen 2.5 3B across 6 workers $\times$ 16 threads) or a high-capacity **GPU Large Language Model** (Qwen 2.5 7B served via **vLLM** on an NVIDIA A100), with automatic fallback to CPU on GPU saturation.
 
-📖 More detail: [PROJECT_PROGRESS_AND_ARCHITECTURE.md](PROJECT_PROGRESS_AND_ARCHITECTURE.md) (design, benchmarks) · [OPTIMIZATION_GUIDE.md](OPTIMIZATION_GUIDE.md) (CPU SLM tuning)
+The platform runs behind a single-port secure perimeter (**Port 8080**) featuring email OTP authentication, CSRF protection, token-bucket admission control, microsecond-tier typo normalization, and a two-level semantic cache.
 
-**Contents:** [Architecture](#1-architecture) · [Prerequisites](#2-prerequisites) · [Setup](#3-setup) · [Redis](#4-redis-stack) · [Build the Index](#5-build-the-vector-index) · [CPU SLM](#6-cpu-slm-tier-qwen-25-3b) · [GPU LLM](#7-gpu-llm-tier-vllm) · [Router](#8-complexity-router) · [Gateway](#9-gateway) · [Web App & OTP](#10-web-app--email-otp-sign-in) · [Tests](#11-tests--evaluation) · [Production Stack](#12-production-stack-orchestration) · [Reference](#13-reference) · [Troubleshooting](#14-troubleshooting) · [Structure](#15-project-structure) · [Quick Start](#16-quick-start)
+📖 **Engineering Manuals:** [complete_system_documentation.md](complete_system_documentation.md) (Complete Architecture) · [product_requirements_document.md](product_requirements_document.md) (PRD & Requirements) · [OPTIMIZATION_GUIDE.md](OPTIMIZATION_GUIDE.md) (CPU SLM Tuning)
 
 ---
 
-## 1. Architecture
+## 📑 Table of Contents
+1. [Architecture & Topology](#1-architecture--topology)
+2. [Prerequisites & System Sizing](#2-prerequisites--system-sizing)
+3. [Environment Configuration](#3-environment-configuration)
+4. [Redis Stack: Native User-Space Setup](#4-redis-stack-native-user-space-setup)
+5. [Starting from Pre-Built RDB Snapshot](#5-starting-from-pre-built-rdb-snapshot-226m-chunks)
+6. [Data Ingestion: DSpace Crawlers & Batch PDF Indexing](#6-data-ingestion-dspace-crawlers--batch-pdf-indexing)
+7. [CPU SLM Tier (Port 8082 - Qwen 2.5 3B)](#7-cpu-slm-tier-port-8082---qwen-25-3b)
+8. [GPU LLM Tier (Port 8000 - vLLM Qwen 2.5 7B)](#8-gpu-llm-tier-port-8000---vllm-qwen-25-7b)
+9. [Two-Tower Neural Complexity Router](#9-two-tower-neural-complexity-router)
+10. [Unified Gateway & Web Chat UI (Port 8080)](#10-unified-gateway--web-chat-ui-port-8080)
+11. [One-Shot Production Orchestration](#11-one-shot-production-orchestration)
+12. [Verification & Test Suites](#12-verification--test-suites)
+13. [Service Port Reference](#13-service-port-reference)
+14. [Troubleshooting Guide](#14-troubleshooting-guide)
+15. [Quick Start Cheat Sheet](#15-quick-start-cheat-sheet)
+
+---
+
+## 1. Architecture & Topology
+
+> [!IMPORTANT]
+> **Zero Docker Guarantee:** This system runs **100% bare-metal on the host OS** using native user-space binaries and systemd-compatible processes. No Docker, no container runtimes, and no external cloud API dependencies are required.
 
 ```
- Browser ─► AskIISc Unified Gateway & Web UI :8080 ── session · CSRF · email OTP · admission · L0/L1 cache · router
-                   │ easy (≤ α)                       │ hard (> α)
-                   ▼                                  ▼
-      CPU SLM :8082 (Qwen2.5-3B)           GPU LLM :8000 (vLLM, 7B)
-                   └──────────────┬───────────────────┘
-                                  ▼
-        Redis Stack :6379 ── index rag_documents_idx · HNSW · COSINE · 384-d
-                                  ▲
- Ingestion: DSpace crawler ─► PyMuPDF ─► cleaner ─► chunker (512/64) ─► all-MiniLM-L6-v2 ─► Redis
+ Browser / Client ─► AskIISc Unified Gateway & Web UI :8080
+                            │
+               ┌────────────┴────────────┐
+               ▼                         ▼
+      Email OTP Session Auth    Prompt Injection Fence [NFR-7]
+               │                         │
+               └────────────┬────────────┘
+                            ▼
+               Typo Normalizer (3.95 µs)
+                            │
+               ┌────────────┴────────────┐
+               ▼                         ▼
+      L0 Exact Cache (< 1ms)    L1 HNSW Semantic Cache (< 35ms)
+                            │ (Cache Miss)
+                            ▼
+               Admission Controller & Fair Token Bucket
+                            │
+               ┌────────────┴────────────┐
+               ▼                         ▼
+     Task A: Complexity Router  Task B: Dynamic RediSearch Retriever
+         (Two-Tower MLP 400-d)       (HNSW 384-d, 2.26M Chunks, EF=64)
+               │                         │
+               └────────────┬────────────┘
+                            ▼
+            Barrier Join & Document Slicing
+           ┌────────────────┴────────────────┐
+     Easy (P < 0.65)                   Hard (P >= 0.65)
+           ▼                                 ▼
+ CPU SLM :8082 (Qwen2.5-3B)        GPU LLM :8000 (vLLM Qwen2.5-7B)
+ (6 workers x 16 threads)          (NVIDIA A100 80GB, PagedAttention)
+           │                                 │
+           │                       (SLA Timeout / 5xx Error)
+           │                                 ▼
+           └──────────────┬──────────────────┘
+                          ▼
+            Anti-Pollution Shield [NFR-6]
+     (Blocks 0-chunk & refusal caching from L1 index)
+                          ▼
+                 Streaming SSE Response
 ```
 
-**Request flow:**
-1. The user opens the web app and signs in with an emailed 6-digit code.
-2. The web app forwards each question to the gateway's `POST /query`.
-3. The gateway applies rate and concurrency limits and checks its caches.
-4. The router scores the question with a trained MLP and sends it to the CPU or the GPU tier. If the GPU tier is busy, the question falls back to the CPU.
-5. The chosen model answers from the top-k chunks retrieved from Redis, and the answer streams back to the browser with its sources.
-
-**Reference corpus:** about 12,900 IISc theses → **2.26M chunks**. The snapshot is about 12 GB on disk and **about 43 GB in RAM**, roughly 19 KB of RAM per chunk.
+**Corpus Scale:** 12,900+ IISc theses $\to$ **2,261,664 chunks** indexed in RAM. Snapshot: **12.67 GB on disk** (`dump_final.rdb`), **~43.8 GB in RAM**.
 
 ---
 
-## 2. Prerequisites
+## 2. Prerequisites & System Sizing
 
-**Software:**
-- Linux (Ubuntu 22.04 tested; bare-metal host with zero container dependencies)
-- **Python 3.10–3.12** and Git
-- Optional:
-  - NVIDIA driver + CUDA 12.x, for the GPU tier
-  - `tmux`, for long scraping runs
-  - `jq`, to pretty-print JSON output
+### Software Requirements
+- **OS:** Linux (Ubuntu 20.04 / 22.04 LTS tested; bare-metal host).
+- **Python:** Python 3.10 to 3.12 (Miniconda / virtualenv recommended).
+- **NVIDIA Driver & CUDA 12.x:** Required for GPU tier (vLLM); optional if running CPU-only.
+- **Git & Build Essentials:** `gcc`, `g++`, `make`, `cmake`.
 
-| Setup | CPU | RAM | GPU |
-|---|---|---|---|
-| Minimal dev (few hundred docs) | 8+ cores | 16 GB | none |
-| Full corpus | 32+ cores | **64 GB+** | none for the CPU tier |
-| GPU tier (7B) | — | — | 1× ≥ 24 GB |
-| Router dataset generation | — | ~150 GB `/dev/shm` | 4× ≥ 32 GB free |
-| Reference deployment | 2× EPYC 7713 | 504 GB | 8× A100 40 GB |
+### Hardware Sizing
+
+| Component | Minimum Dev Spec | Recommended Production Spec |
+| :--- | :--- | :--- |
+| **Host RAM** | **64 GB RAM** *(Redis requires ~44 GB)* | **128 GB – 256 GB RAM** |
+| **CPU** | 8+ cores (x86_64 AVX2) | 32 to 64 cores with **AVX-512** (AMD EPYC / Intel Xeon) |
+| **GPU** | None *(runs 100% CPU SLM fallback)* | **1× NVIDIA A100 (40GB or 80GB)** or **RTX A5000 (24GB)** |
+| **Disk Storage** | 50 GB SSD | **250 GB+ NVMe PCIe Gen4 SSD** |
 
 ---
 
-## 3. Setup
+## 3. Environment Configuration
 
+### Step 1: Clone and Set Up Python Environment
 ```bash
-git clone https://github.com/rutujmanware/Onprem-RAG-gateway.git && cd Onprem-RAG-gateway
-make setup && source .venv/bin/activate        # creates .venv + installs requirements; activate in every terminal
+git clone https://github.com/rutujmanware/Onprem-RAG-gateway.git
+cd Onprem-RAG-gateway
+
+# Using Make:
+make setup
+source .venv/bin/activate
+
+# Or native venv:
+python3 -m venv .venv
+source .venv/bin/activate
+pip install --upgrade pip
+pip install -r requirements.txt
 pip install accelerate "huggingface_hub[cli]" pandas scikit-learn
-# CPU-only machine: install the CPU torch wheel first:  pip install torch --index-url https://download.pytorch.org/whl/cpu
-# GPU machine (GPU tier, dataset generation):          pip install vllm
-cp .env.example .env && chmod 600 .env
 ```
 
-The key `.env` values for the backend services are below. Sign-in settings go in the web app's own `app.env` (§10), so the `OIDC_*` entries in `.env.example` can stay at their defaults.
+### Step 2: Configure Environment Variables
+Copy `.env.example` to `.env` and set secure file permissions:
+```bash
+cp .env.example .env
+chmod 600 .env
+```
 
+Edit `.env` with your editor. Key settings (passwords must be set securely):
 ```env
-REDIS_URL=redis://:<YOUR_REDIS_PASSWORD>@localhost:6379/0    # no password: redis://localhost:6379/0
+# Network and Server
+HOST=0.0.0.0
+PORT=8080
+ENVIRONMENT=production
+LOG_LEVEL=INFO
+
+# Redis Stack Configuration
+REDIS_HOST=localhost
+REDIS_PORT=6379
+REDIS_DB=0
 REDIS_PASSWORD=<YOUR_REDIS_PASSWORD>
+REDIS_URL=redis://:<YOUR_REDIS_PASSWORD>@localhost:6379/0
 REDIS_INDEX_NAME=rag_documents_idx
+SEMANTIC_CACHE_TTL=86400
+
+# Model Service Endpoints
 SLM_BASE_URL=http://localhost:8082/v1
-SLM_MODEL_NAME=Qwen/Qwen2.5-3B-Instruct       # or a local path, e.g. models/slm/qwen2.5-3b-instruct
-CPU_NUM_THREADS=16                            # your PHYSICAL core count
+SLM_MODEL_NAME=models/slm_gguf/qwen2.5-3b-instruct-q4_k_m.gguf
+CPU_NUM_THREADS=16
+CPU_BATCH_THREADS=32
+
 VLLM_BASE_URL=http://localhost:8000/v1
-VLLM_MODEL_NAME=meta-llama/Llama-2-7b-chat-hf
+VLLM_MODEL_NAME=Qwen/Qwen2.5-7B-Instruct
+GPU_DEVICE=0
+
+# Router & Admission Control
 ROUTING_ALPHA=0.65
+COMPLEXITY_SCORER_PATH=gateway/router/models/scorer.onnx
 GLOBAL_CONCURRENCY_LIMIT=30
-PER_USER_CONCURRENCY_LIMIT=4
-RATE_LIMIT_RPS=5
-RATE_LIMIT_BURST=10
-# INTRA_COOKIES=JSESSIONID=...                # only if DSpace content needs a login
+PER_USER_CONCURRENCY_LIMIT=6
+RATE_LIMIT_BURST=60.0
+RATE_LIMIT_RPS=20.0
+
+# Session & Authentication
+SESSION_SECRET=<YOUR_RANDOM_64_CHAR_HEX_SECRET>
+COOKIE_SECURE=0
+ALLOWED_EMAIL_DOMAINS=iisc.ac.in
+OTP_MAX_PER_HOUR=10
+OTP_MAX_PER_IP_HOUR=1000
+
+# Retrieval Thresholds
+RETRIEVAL_MIN_SIMILARITY=0.52
+RETRIEVAL_SCORE_MARGIN=0.10
+RETRIEVAL_MAX_KNEE_DROP=0.06
+RETRIEVAL_EF_RUNTIME=64
 ```
 
-Load `.env` into your shell before running the crawler, ingest or dataset scripts: `set -a && source .env && set +a`
+Load `.env` into your active shell session:
+```bash
+set -a && source .env && set +a
+```
 
 ---
 
-## 4. Redis Stack
+## 4. Redis Stack: Native User-Space Setup
 
-The code uses RediSearch (`FT.*` commands), so you need **Redis Stack**, not plain Redis. The system runs Redis as a native user-space binary without needing root or Docker.
+The system requires **Redis Stack** for RediSearch vector indexes (`FT.*` commands). It runs as a native standalone binary without Docker or root privileges.
 
-**A. User-space binary.** Downloads for other OS builds are at <https://redis.io/downloads/>.
+### Step 1: Download & Extract Binary
 ```bash
+# Download official Redis Stack Server binary for Linux x86_64
 wget https://packages.redis.io/redis-stack/redis-stack-server-7.2.0-v9.jammy.x86_64.tar.gz
-tar -xzf redis-stack-server-7.2.0-v9.jammy.x86_64.tar.gz && mv redis-stack-server-7.2.0-v9* redis-stack-server-7.2.0-v9
-mkdir -p redis-stack-server-7.2.0-v9/var/db/redis-stack
-./redis-stack-server-7.2.0-v9/bin/redis-stack-server --dir ./redis-stack-server-7.2.0-v9/var/db/redis-stack \
-    --requirepass "<YOUR_REDIS_PASSWORD>" --daemonize yes
-export REDISCLI_AUTH='<YOUR_REDIS_PASSWORD>' && redis-cli ping        # → PONG
+tar -xzf redis-stack-server-7.2.0-v9.jammy.x86_64.tar.gz
+mv redis-stack-server-7.2.0-v9.jammy.x86_64 redis-stack-server-7.2.0-v9
 ```
 
-**B. Restore a pre-built snapshot (skip §5).** Snapshots are git-ignored. With Redis stopped, copy the snapshot to `redis-stack-server-7.2.0-v9/var/db/redis-stack/dump.rdb`. Then start Redis and wait for `loading:0`:
+### Step 2: Export Path and Credentials
+Add the Redis binary directory to your `$PATH` and export authenticated CLI credentials:
 ```bash
-watch -n 1 "redis-cli info Persistence | grep -E 'loading:|loading_loaded_perc'"
-```
+# 1. Export Redis binary directory to PATH (enables 'redis-stack-server' and 'redis-cli' commands directly)
+export PATH="$PWD/redis-stack-server-7.2.0-v9/bin:$PATH"
 
-Stop Redis and free its RAM with `make redis-down` or `redis-cli shutdown nosave`.
+# 2. Export Redis credentials for CLI and runtime scripts
+# Security Note: Setting REDISCLI_AUTH allows 'redis-cli' to authenticate automatically without passing '-a' on the command line (which prevents passwords from leaking in 'ps aux' or /proc)
+export REDIS_PASSWORD="<YOUR_REDIS_PASSWORD>"
+export REDISCLI_AUTH="<YOUR_REDIS_PASSWORD>"
+```
+*(Tip: Add `export PATH="$PWD/redis-stack-server-7.2.0-v9/bin:$PATH"` to your `~/.bashrc`)*
 
 ---
 
-## 5. Build the Vector Index
+## 5. Starting from Pre-Built RDB Snapshot (2.26M Chunks)
 
-The index `rag_documents_idx` is created automatically on the first ingest. Download the embedding model **first**:
-```bash
-python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')"
+The pre-indexed corpus is stored in a 12.67 GB snapshot file: **`redis_server_data/dump_final.rdb`**.
+
+### Snapshot Placement
+```text
+onprem-rag-gateway/
+├── redis_server_data/
+│   └── dump_final.rdb       <-- Keep the snapshot here (12.67 GB)
 ```
-> ⚠️ If the model can't load, the embedder falls back to hash-based vectors. Ingest still completes, but retrieval is meaningless.
 
-**Option 1: stream from IISc DSpace.** The crawler downloads each PDF, then extracts, chunks and indexes it, then deletes the PDF. It is resumable: papers already ingested are skipped. Run it inside `tmux`.
+### Starting Redis Stack with the Snapshot
+
+#### Via Make Shortcut:
 ```bash
-python -m pipeline.crawlers.stream_dspace "https://etd.iisc.ac.in/handle/2005/1" --max 10 --keep-pdfs   # smoke test
+make redis-up
+```
+
+#### Via Native Command:
+```bash
+# Uses exported PATH and REDIS_PASSWORD safely:
+redis-stack-server \
+    --dir ./redis_server_data \
+    --dbfilename dump_final.rdb \
+    --port 6379 \
+    --requirepass "$REDIS_PASSWORD" \
+    --maxmemory 48gb \
+    --maxmemory-policy noeviction \
+    --daemonize yes
+```
+
+### Monitoring the Loading Process (~45 Minutes)
+> [!NOTE]
+> Loading 2,261,664 384-dimensional dense vectors and HNSW graphs from a 12.67 GB RDB snapshot into RAM takes **35 to 50 minutes** depending on disk read throughput. While initializing, Redis will report `LOADING Redis is loading the dataset in memory`.
+
+#### Interactive Live Progress Monitor:
+```bash
+# Via Make:
+make redis-watch
+
+# Via Native Python Script:
+python scripts/track_redis.py
+```
+*(Displays a live terminal progress bar with percentage, loaded bytes, ETA in seconds, and automatically exits when loading hits 100%)*
+
+#### One-Shot Status Checks:
+```bash
+# Via Make:
+make redis-status
+
+# Via Native redis-cli (automatically authenticated via REDISCLI_AUTH, no '-a' needed):
+redis-cli info Persistence | grep -E "loading:|loading_loaded_perc:|loading_eta_seconds:"
+```
+
+#### Verifying Loaded Index:
+Once loading completes (`loading:0`):
+```bash
+# Verify total chunks loaded:
+redis-cli dbsize
+# -> (integer) 2261664
+
+# Verify RediSearch index schema:
+redis-cli FT.INFO rag_documents_idx | head -n 20
+
+# Test Redis connection:
+redis-cli ping
+# -> PONG
+```
+
+#### Stopping Redis:
+```bash
+# Via Make:
+make redis-down
+
+# Via Native redis-cli (authenticated via REDISCLI_AUTH, safe from ps inspection):
+redis-cli shutdown nosave
+```
+
+---
+
+## 6. Data Ingestion: DSpace Crawlers & Batch PDF Indexing
+
+If you are crawling fresh institutional publications or ingesting new PDFs instead of starting from the snapshot:
+
+### Pre-requisite: Embedding Model
+Download the offline sentence embedding weights:
+```bash
+python -c "from transformers import AutoTokenizer, AutoModel; AutoTokenizer.from_pretrained('sentence-transformers/all-MiniLM-L6-v2'); AutoModel.from_pretrained('sentence-transformers/all-MiniLM-L6-v2')"
+```
+
+### Option A: Streaming Ingestion directly from IISc DSpace
+The streaming crawler downloads each thesis, extracts layout-aware text, chunks it (512 tokens with 64 overlap), embeds it via `all-MiniLM-L6-v2`, indexes it into RediSearch, and deletes the PDF to preserve disk space:
+
+```bash
+# Smoke test (ingest 20 papers and preserve raw PDFs in data/raw_pdfs/):
+python -m pipeline.crawlers.stream_dspace "https://etd.iisc.ac.in/handle/2005/1" --max 20 --keep-pdfs
+
+# Full production ingestion (run inside tmux):
+tmux new -s dspace_crawl
 python -m pipeline.crawlers.stream_dspace "https://etd.iisc.ac.in/handle/2005/1" --unlimited --concurrency 3 --delay 1.0
 ```
 
-| Flag | Default | Meaning |
-|---|---|---|
-| `--max N` / `--unlimited` | all | Stop after N papers / crawl everything |
-| `--concurrency` | 1 | Parallel workers (keep ≤ 5 to avoid running out of RAM or an IP ban) |
-| `--delay` | 1.0 | Seconds between requests |
-| `--keep-pdfs` | off | Keep PDFs after ingest |
-| `--output-dir` | `data/raw_pdfs` | Where PDFs and metadata JSON go |
-| `--cookies`, `--cookies-file`, `--auth` | — | For intranet-only content |
+### Option B: Batch PDF Directory Ingestion
+Drop arbitrary research PDFs into `data/raw_pdfs/`:
 
-**Option 2: ingest your own PDFs.** Put them in `data/raw_pdfs/`, then run `make ingest-pdfs`.
-
-**Check retrieval:**
 ```bash
-redis-cli dbsize                                          # chunks stored
-make query Q="deep learning for semantic segmentation"    # = python -m pipeline.retriever "..." -k 5
+# Via Make:
+make ingest-pdfs
+
+# Via Native Python Command:
+python -m pipeline.batch_ingest_pdfs \
+    --pdf-dir data/raw_pdfs \
+    --index-name rag_documents_idx \
+    --vector-dim 384
 ```
 
 ---
 
-## 6. CPU SLM Tier (Qwen 2.5 3B)
+## 7. CPU SLM Tier (Port 8082 - Qwen 2.5 3B)
 
+The CPU SLM serves routine factual questions ($P(\text{hard}) < 0.65$) and acts as the zero-downtime fallback engine.
+
+### Model Weights
 ```bash
-huggingface-cli download Qwen/Qwen2.5-3B-Instruct --local-dir models/slm/qwen2.5-3b-instruct   # ~6 GB
-export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1      # zero-egress once downloaded
-
-make rag-answer Q="What is vermiculite and what are its primary uses?"     # end-to-end RAG, streamed
-python -m pipeline.rag_chain "..." -k 3 --temp 0.2 --max-tokens 160 [--no-stream | --json]
-
-make serve-slm        # OpenAI-compatible API on :8082  (= python -m pipeline.serve_cpu_slm --port 8082 --threads 16)
-curl -s http://localhost:8082/v1/chat/completions -H "Content-Type: application/json" \
-  -d '{"messages":[{"role":"user","content":"What is RAG?"}],"max_tokens":128}' | jq -r '.choices[0].message.content'
+# Download 4-bit medium quantized GGUF (2.0 GB):
+mkdir -p models/slm_gguf
+wget -O models/slm_gguf/qwen2.5-3b-instruct-q4_k_m.gguf \
+  https://huggingface.co/Qwen/Qwen2.5-3B-Instruct-GGUF/resolve/main/qwen2.5-3b-instruct-q4_k_m.gguf
 ```
-Reference speed: about **21 s end-to-end** for a 160-token answer at 48 threads ([OPTIMIZATION_GUIDE.md](OPTIMIZATION_GUIDE.md)). Low on disk? Download into `/dev/shm` and symlink it into `models/`.
+
+### Starting CPU SLM Server
+```bash
+# Via Make:
+make serve-slm
+
+# Via Native Command (6 parallel workers, 16 OpenMP threads each):
+python -m pipeline.serve_cpu_slm --port 8082 --workers 6 --threads 16
+```
+
+### Testing CPU SLM Endpoint
+```bash
+curl -s http://localhost:8082/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"messages":[{"role":"user","content":"What is vermiculite?"}],"max_tokens":64}' | jq .
+```
 
 ---
 
-## 7. GPU LLM Tier (vLLM)
+## 8. GPU LLM Tier (Port 8000 - vLLM Qwen 2.5 7B)
 
-This tier serves "hard" queries. Without a GPU, every query goes to the CPU tier.
+The GPU tier serves complex queries ($P(\text{hard}) \ge 0.65$) requiring cross-document synthesis.
+
+### Model Weights & Starting vLLM Server
 ```bash
-huggingface-cli download meta-llama/Llama-2-7b-chat-hf --local-dir models/llm_7b     # gated: accept the licence on HF
-python -m vllm.entrypoints.openai.api_server --model models/llm_7b --served-model-name meta-llama/Llama-2-7b-chat-hf \
-    --host 0.0.0.0 --port 8000 --max-model-len 4096 --gpu-memory-utilization 0.90
+# Download Qwen2.5-7B-Instruct:
+huggingface-cli download Qwen/Qwen2.5-7B-Instruct --local-dir models/llm_7b/qwen2.5-7b-instruct
+
+# Via Make:
+make serve-gpu
+
+# Via Native Command:
+CUDA_VISIBLE_DEVICES=0 python -m vllm.entrypoints.openai.api_server \
+    --model models/llm_7b/qwen2.5-7b-instruct \
+    --served-model-name "Qwen/Qwen2.5-7B-Instruct" \
+    --host 127.0.0.1 \
+    --port 8000 \
+    --gpu-memory-utilization 0.90 \
+    --max-model-len 8192 \
+    --dtype bfloat16
 ```
-Tuning options are in [configs/vllm_config.yaml](configs/vllm_config.yaml).
+
+### Testing GPU LLM Endpoint
+```bash
+curl -s http://localhost:8000/v1/models | jq .
+```
 
 ---
 
-## 8. Complexity Router
+## 9. Two-Tower Neural Complexity Router
 
-**1. Generate the dataset.** This needs Redis with data and 4 GPUs with ≥ 32 GB free each. `dataset_generator.py` asks Qwen2.5-72B (vLLM) for "easy" single-document questions and "hard" multi-chunk questions about sampled chunks. Edit the partition and conda paths in `run_slurm.sh`, then run `sbatch run_slurm.sh`. Off SLURM, run `python dataset_generator.py` instead. Output: `router_multichunk_training_dataset.{csv,jsonl}`.
+The Two-Tower MLP Router classifies queries in real time into easy ($< 0.65$) or hard ($\ge 0.65$) using a 400-dimensional hybrid representation (384 semantic + 16 structural features).
 
-**2. Train the MLP.** The model is MiniLM embedding (384) → 128 → 64 → 1, with BCE loss and class-balanced sampling.
+### Evaluation & Standalone Service
 ```bash
-mkdir -p gateway/router/mlp_router/data && cp router_multichunk_training_dataset.csv gateway/router/mlp_router/data/
-cd gateway/router/mlp_router && python train.py && python inference.py && cd -     # → best_router_model.pth
-```
+# Run complexity scoring evaluation:
+python scripts/eval_router_threshold.py
 
-**3. Tune α.** Run `python -m evaluation.benchmarks.alpha_sweep`, then set `ROUTING_ALPHA` in `.env` and `routing.alpha` in `configs/gateway_config.yaml`. A lower α sends more queries to the GPU.
+# Optional: Run router as standalone microservice on port 8090:
+# (Note: Gateway automatically runs the router in-process if 8090 is not active)
+make serve-router
+```
 
 ---
 
-## 9. Gateway
+## 10. Unified Gateway & Web Chat UI (Port 8080)
 
-Start Redis, the CPU SLM and (optionally) vLLM first. Keep the gateway internal (`127.0.0.1`): users go through the web app.
+The Gateway binds to **Port 8080** and serves the AskIISc Web Chat interface (`/`), session authentication, and API endpoints.
+
+### Starting Gateway
+
+#### Development Mode (with Live Code Reload):
 ```bash
-make dev                                   # uvicorn gateway.main:app --port 8080 --reload   (API docs: /docs)
+# Via Make:
+make dev
+
+# Via Native Uvicorn:
+uvicorn gateway.main:app --host 0.0.0.0 --port 8080 --reload
+```
+
+#### Production Mode (6 Uvicorn Workers):
+```bash
+# Via Make:
+make chat-up
+
+# Via Native Uvicorn:
+uvicorn gateway.main:app --host 0.0.0.0 --port 8080 --workers 6
+```
+
+### Testing In-Process Endpoints
+```bash
+# Check health:
 curl -s http://localhost:8080/healthz
-curl -s -X POST http://localhost:8080/query -H "Content-Type: application/json" \
-  -d '{"query": "What is vermiculite?", "max_tokens": 300}' | jq -r .answer        # add "stream": true for SSE
-```
-The gateway also offers an OpenAI-compatible `POST /v1/chat/completions`. Settings live in [configs/gateway_config.yaml](configs/gateway_config.yaml):
 
-| Section | Settings |
-|---|---|
-| `routing` | α 0.65, CPU fallback when the GPU is saturated |
-| `admission` | 30 global / 4 per-user concurrent requests, queue depth 100 |
-| `rate_limiting` | Token bucket refilling at 5 requests/s, burst 10 (over the limit → HTTP 429) |
-| `cache` | L0 exact cache (TTL 1 h), L1 semantic cache (similarity ≥ 0.88, TTL 2 h) |
+# Semantic search query:
+curl -s -X POST http://localhost:8080/query \
+  -H "Content-Type: application/json" \
+  -d '{"query": "What is vermiculite?", "max_tokens": 150}' | jq .
 
----
-
-## 10. Web App & Email OTP Sign-in
-
-The web app in `askiisc_chat/` serves the login page and the chat UI. `./app.sh` starts and stops it.
-
-**Sign-in flow:**
-1. The user enters an `@iisc.ac.in` address and clicks **Generate OTP**.
-2. A 6-digit code is emailed to that address.
-3. Entering the code starts an 8-hour session.
-
-Without a session, the chat returns 401. Clients outside `ALLOWED_CIDRS` get 403 on every page.
-
-**Built-in protections:**
-- Codes are stored only as HMAC hashes, valid for 10 minutes, and single-use.
-- A code is destroyed after 5 wrong tries.
-- Requests are limited to one code every 60 s, 5 codes per hour per address and 20 per hour per IP.
-- Mail is sent only to allowed domains.
-
-```bash
-cd askiisc_chat && pip install -r requirements.txt
-cp app.env.example app.env && chmod 600 app.env
-sed -i "s|^SESSION_SECRET=.*|SESSION_SECRET=$(python3 -c 'import secrets;print(secrets.token_hex(32))')|" app.env
-```
-
-Key `app.env` settings. Comments must stay on their own lines.
-```env
-BIND_HOST=127.0.0.1
-BIND_PORT=9000
-# client IP ranges allowed to open the page
-ALLOWED_CIDRS=127.0.0.0/8
-AUTH_MODE=otp
-REQUIRE_LOGIN=1
-ALLOWED_EMAIL_DOMAINS=iisc.ac.in
-# 1 = also accept dept addresses like @csa.iisc.ac.in
-ALLOW_SUBDOMAINS=0
-# set 1 when served over https
-COOKIE_SECURE=0
-BACKEND=gateway
-GATEWAY_URL=http://127.0.0.1:8080
-MAX_TOKENS=300
-
-# --- Email sender: Gmail for testing ---
-SMTP_HOST=smtp.gmail.com
-SMTP_PORT=587
-SMTP_STARTTLS=1
-SMTP_USER=<sender>@gmail.com
-SMTP_PASS=<16-char Gmail App Password>
-SMTP_FROM=<sender>@gmail.com
-OTP_DEV_LOG=0
-```
-
-- **Gmail (testing):** turn on 2-Step Verification for the sender account, then create an **App Password** (Google Account → Security → App passwords). The normal Gmail password won't work. Gmail is an external service with daily send limits, so use it for testing only.
-- **Production:** use the IISc internal relay, e.g. `SMTP_HOST=<relay>`, `SMTP_PORT=25`, `SMTP_FROM=askiisc-noreply@iisc.ac.in`, with `SMTP_USER` and `SMTP_PASS` empty.
-- **No mail server (local development only):** leave `SMTP_HOST` empty and set `OTP_DEV_LOG=1`. The code goes to `logs/app.log`, and `./app.sh code` shows it.
-
-```bash
-./app.sh start | stop | restart | status | logs | code      # PY=../.venv/bin/python ./app.sh start  to pick the interpreter
-```
-Open <http://127.0.0.1:8080> (or <http://127.0.0.1:9000> if running standalone app.py) and sign in. Add `?debug=1` to the URL to see routing details.
-
-**To open it to campus:**
-- Set `BIND_HOST` to the server's intranet IP and add the campus ranges to `ALLOWED_CIDRS`.
-- Serve it over HTTPS behind nginx, with `COOKIE_SECURE=1` and `TRUSTED_PROXIES=<nginx IP>`.
-- Multi-worker concurrency is fully supported: OTP state, brute-force locks, and rate limits are backed by atomic Lua scripts in Redis.
-
----
-
-## 11. Tests & Evaluation
-
-```bash
-make test                     # prompt-injection fence, rate limiter, L0 cache   (or: PYTHONPATH=. pytest -q tests/)
-make eval                     # alpha sweep + RAGAS (faithfulness, context recall)
-```
-- Other evaluation tools: `evaluation/benchmarks/load_test.py` (Locust load test) and `evaluation/judge/local_judge.py` (on-prem LLM judge).
-- Datasets: `evaluation/datasets/`.
-
----
-
-## 12. Production Stack Orchestration
-
-The entire production stack runs bare-metal without containerization using [`scripts/prod_stack.py`](scripts/prod_stack.py):
-- **Redis Stack (`port 6379`):** In-memory RediSearch vector database holding 2.26M document vectors.
-- **CPU SLM (`port 8082`):** Qwen 2.5 3B GGUF served across 6 parallel workers $\times$ 16 OpenMP threads.
-- **GPU LLM (`port 8000`):** Qwen 2.5 7B Instruct served directly on NVIDIA A100 GPU via vLLM.
-- **Institutional Gateway (`port 8080`):** Single-port perimeter with session authentication, CSRF protection, and embedded Two-Tower MLP Complexity Router.
-
-```bash
-make prod-up         # Start full production stack
-make prod-status     # Health & process status dashboard
-make prod-restart    # Graceful reload with zero downtime
-make prod-down       # Clean shutdown (preserves Redis database)
+# Administrative semantic cache statistics:
+curl -s http://localhost:8080/cache/stats | jq .
 ```
 
 ---
 
-## 13. Reference
+## 11. One-Shot Production Orchestration
 
-| Port | Service | Start with |
-|---|---|---|
-| 8080 | Unified Gateway & Web UI | `make prod-up` or `make dev` |
-| 8082 | CPU SLM (6 workers) | `make serve-slm` |
-| 8000 | GPU LLM (vLLM) | `make serve-gpu` |
-| 6379 | Redis Stack Server | `make redis-up` |
+The entire 4-tier stack can be managed using [`scripts/prod_stack.py`](scripts/prod_stack.py) or `make`:
 
-**Make targets:**
-- `setup`, `dev`, `prod-up`, `prod-down`, `prod-status`, `prod-restart`
-- `redis-up`, `redis-down`, `redis-status`, `redis-watch`
-- `ingest-pdfs`, `query Q=…`, `ask Q=…`, `rag-answer Q=…`
-- `test`, `test-intensive`, `clean`, `help`
-
-**Remote server:** reach the services through an SSH tunnel.
 ```bash
-ssh -L 8080:localhost:8080 -L 8082:localhost:8082 -L 8000:localhost:8000 user@server
-```
+# Start all 4 services (Redis, vLLM, CPU SLM, Gateway):
+make prod-up
+# Or natively:
+python scripts/prod_stack.py start
 
-**Redis checks:**
-```bash
-redis-cli dbsize                                    # number of chunks
-redis-cli info memory | grep used_memory_human      # RAM in use
-redis-cli FT.INFO rag_documents_idx | head          # index details
+# Check live health status of all tiers:
+make prod-status
+# Or natively:
+python scripts/prod_stack.py status
+
+# Graceful restart with zero downtime:
+make prod-restart
+# Or natively:
+python scripts/prod_stack.py restart
+
+# Stop services (preserves Redis Stack database in RAM):
+make prod-down
+# Or natively:
+python scripts/prod_stack.py stop
 ```
 
 ---
 
-## 14. Troubleshooting
+## 12. Verification & Test Suites
 
-| Symptom | Fix |
-|---|---|
-| `NOAUTH` / `unknown command 'FT.SEARCH'` | Add the password to `REDIS_URL` / `REDISCLI_AUTH`; make sure you're running **Redis Stack**, not plain Redis |
-| `LOADING …` or Redis killed while loading a snapshot | Wait for `loading:0`; the full corpus needs about 43 GB of free RAM |
-| Irrelevant results / `No matching chunks` | Embedding model didn't load (§5); re-ingest. Or check `REDIS_INDEX_NAME` |
-| SLM very slow | Set `CPU_NUM_THREADS` / `--threads` to your physical core count; keep max tokens around 160 |
-| `requires accelerate` / script ignores `.env` | `pip install accelerate` / run `set -a && source .env && set +a` |
-| Gateway 429 / can't reach a model | Raise the limits in `gateway_config.yaml` / check `SLM_BASE_URL` and `VLLM_BASE_URL` |
-| vLLM CUDA OOM on multi-GPU | `export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True VLLM_CUSTOM_ALL_REDUCE=0` |
-| Web app 403 "restricted to the IISc network" | Add your IP range to `ALLOWED_CIDRS`; behind a proxy, set `TRUSTED_PROXIES` |
-| `./app.sh start` refuses to start | `app.env` is missing or `SESSION_SECRET` is still `CHANGE_ME` |
-| OTP email never arrives | `./app.sh logs` → `otp mail failed`. Gmail `SMTPAuthenticationError` means you need an App Password. Also check spam |
-| "Demo mode: code is in the server log" | Set the `SMTP_*` values and `OTP_DEV_LOG=0` |
-| "email domain not allowed" | Add the domain to `ALLOWED_EMAIL_DOMAINS`, or set `ALLOW_SUBDOMAINS=1` |
-| Logged out after a restart / login loops | `SESSION_SECRET` changed, or `COOKIE_SECURE=1` while serving over http |
-| Scraper blocked (HTTP 429) | Lower `--concurrency`, raise `--delay`; it resumes where it stopped |
+The codebase includes an extensive suite of unit, security, and intensive end-to-end integration tests:
+
+### Running Full Pytest Suite (84 Tests):
+```bash
+# Via Make:
+make test
+
+# Via Native Pytest:
+pytest tests/ -v
+```
+
+### Running Intensive Full-Stack Verification (36 Checks):
+Verifies live MLP routing, CPU SLM TTFT, GPU vLLM throughput, Redis semantic cache exact and paraphrase hits, and output sanitization:
+```bash
+# Via Make:
+make test-intensive
+
+# Via Native Command:
+python tests/test_intensive_full_stack.py
+```
+
+### Resetting OTP Rate Limits during Testing:
+```bash
+# Clear limits for a specific user:
+python scripts/clear_otp_limits.py user@iisc.ac.in
+
+# Clear all rate limits:
+python scripts/clear_otp_limits.py --all
+# Or via Make:
+make otp-clear
+```
 
 ---
 
-## 15. Project Structure
+## 13. Service Port Reference
 
-```
-Onprem-RAG-gateway/
-├── askiisc_chat/          # web app: app.sh, app.env.example, askiisc/ (app, auth/OTP, config, gateway bridge), static/, tests/
-├── configs/               # gateway_config.yaml, slm_config.yaml, vllm_config.yaml
-├── gateway/               # FastAPI gateway: main.py, auth/, cache/ (L0/L1), queue/ (admission), router/ (+ mlp_router/), clients/
-├── pipeline/              # crawlers/, text_processing/, embeddings/, indexer, batch_ingest_pdfs, retriever,
-│                          # query_vector_db, slm_runner, rag_chain, serve_cpu_slm
-├── evaluation/            # benchmarks/, judge/, datasets/
-├── models/                # local weights (git-ignored)
-├── tests/                 # unit and security tests
-├── dataset_generator.py   # router dataset (Qwen2.5-72B via vLLM)
-├── run_slurm.sh           # SLURM job for dataset generation
-├── Makefile · requirements.txt · .env.example
-└── PROJECT_PROGRESS_AND_ARCHITECTURE.md · OPTIMIZATION_GUIDE.md
-```
-**Not in Git:**
-- secrets: `.env`, `askiisc_chat/app.env`
-- data: `data/`, `*.rdb` snapshots, router datasets, model weights
-- `redis-stack-server-*/`
+| Port | Service Component | Host Binding | Access Restriction |
+| :---: | :--- | :---: | :--- |
+| **`8080`** | **Unified Gateway & AskIISc Web UI** | `0.0.0.0` | **Public/Campus Facing**; Session Auth, CSRF, Token-Bucket Admission |
+| **`8082`** | **CPU SLM Daemon (Qwen 2.5 3B)** | `127.0.0.1` | **Internal Loopback Only**; 6 workers $\times$ 16 threads |
+| **`8000`** | **GPU LLM Engine (vLLM Qwen 2.5 7B)** | `127.0.0.1` | **Internal Loopback Only**; PagedAttention v2 on NVIDIA A100 |
+| **`6379`** | **Redis Stack Server (Vector DB & Cache)** | `127.0.0.1` | **Internal Loopback Only**; Protected by `REDIS_PASSWORD` |
 
 ---
 
-## 16. Quick Start
+## 14. Troubleshooting Guide
+
+| Issue / Symptom | Root Cause | Exact Remediation |
+| :--- | :--- | :--- |
+| **`NOAUTH Authentication required`** | `REDIS_PASSWORD` not supplied to CLI or script. | Run `export REDISCLI_AUTH="<YOUR_REDIS_PASSWORD>"`. Ensure `REDIS_URL` in `.env` has format `redis://:<PW>@localhost:6379/0`. |
+| **`LOADING Redis is loading the dataset in memory`** | Redis is actively reading `dump_final.rdb` into RAM. | **Do not terminate Redis.** Run `make redis-watch` to view live progress bar and ETA. Wait for `loading:0`. |
+| **`unknown command 'FT.SEARCH'`** | Plain Redis is running instead of Redis Stack. | Stop standard redis (`sudo systemctl stop redis`). Start native binary (`redis-stack-server` or `make redis-up`). |
+| **Zero chunks retrieved / out-of-domain refusal** | Similarity below 0.52 floor or index empty. | Check that `FT.INFO rag_documents_idx` shows `num_docs: 2261664`. Ensure `all-MiniLM-L6-v2` is installed. |
+| **Gateway returns 429 Too Many Requests** | Client token bucket capacity exhausted. | Wait 2 seconds for bucket refill (20 tokens/sec), or increase `RATE_LIMIT_BURST` and `RATE_LIMIT_RPS` in `.env`. |
+| **OTP Email not received** | SMTP credentials invalid or rate limit hit. | Run `python scripts/clear_otp_limits.py <your_email>`. Verify SMTP credentials with `python scripts/test_smtp.py <your_email>`. |
+| **vLLM CUDA Out-of-Memory** | GPU VRAM over-allocation. | Set `--gpu-memory-utilization 0.85` or decrease `--max-model-len 4096` in `Makefile` / `scripts/prod_stack.py`. |
+| **CSRF Error: 403 Forbidden** | Missing or mismatched CSRF cookie/header. | Ensure client passes `X-CSRF-Token` header matching the `csrftoken` cookie issued by `GET /me` or `GET /`. |
+
+---
+
+## 15. Quick Start Cheat Sheet
 
 ```bash
+# 1. Environment & Dependencies
 git clone https://github.com/rutujmanware/Onprem-RAG-gateway.git && cd Onprem-RAG-gateway
-make setup && source .venv/bin/activate && pip install accelerate "huggingface_hub[cli]"
-cp .env.example .env                                   # set REDIS_URL, SLM_MODEL_NAME, CPU_NUM_THREADS
-make redis-up                                          # Starts native user-space Redis Stack daemon
+make setup && source .venv/bin/activate
+cp .env.example .env && chmod 600 .env
 set -a && source .env && set +a
-python -m pipeline.crawlers.stream_dspace "https://etd.iisc.ac.in/handle/2005/1" --max 20
-make rag-answer Q="What methods are used to measure thermal conductivity of nanomaterials?"
-make serve-slm & make dev &                            # CPU SLM :8082, gateway :8080
-cd askiisc_chat && pip install -r requirements.txt && cp app.env.example app.env   # set SESSION_SECRET + SMTP_* (§10)
-./app.sh start                                         # http://127.0.0.1:9000 (or visit unified http://127.0.0.1:8080)
+
+# 2. Redis Binary & Path
+export PATH="$PWD/redis-stack-server-7.2.0-v9/bin:$PATH"
+export REDISCLI_AUTH="<YOUR_REDIS_PASSWORD>"
+
+# 3. Start Redis & Monitor Loading (~45 mins on first boot)
+make redis-up
+make redis-watch
+
+# 4. Verify Database Ready (authenticated via REDISCLI_AUTH, no plaintext password in ps)
+redis-cli dbsize       # Should output: 2261664
+
+# 5. Launch Full Production Stack (CPU SLM :8082, vLLM :8000, Gateway :8080)
+make prod-up
+make prod-status
+
+# 6. Verify System Health & Security
+make test-intensive
+
+# 7. Access Web Chat UI
+# Open in browser: http://localhost:8080/
 ```
