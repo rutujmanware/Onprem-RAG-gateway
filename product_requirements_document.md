@@ -139,20 +139,24 @@ graph TD
 
 
 ### Technology Stack
-* **Gateway Service:** FastAPI (Python) behind an ALB / API Gateway, containerized on ECS or EKS. Chosen over a raw Lambda-only design because the semantic-cache lookup benefits from a warm, long-lived embedding-model process rather than per-invocation cold starts.
-* **Embedding + Vector Store:** Lightweight sentence-embedding model (self-hosted) with `pgvector` (Postgres) or FAISS-backed index. Chosen over a managed vector DB (e.g., Pinecone) to stay within student-tier budget while supporting per-tenant namespacing.
-* **Primary Model:** Hosted LLM API (e.g., OpenAI, Anthropic).
-* **Fallback Model:** Small open-weight model ($\le 8\text{B}$) served via vLLM with continuous batching, hosted on a GPU/CPU instance sized to free-tier limits.
-* **Observability:** Prometheus + Grafana + OpenTelemetry Collector (reusing course lab infrastructure) for per-request tracing of hit/miss, latency, and routing.
-* **Load/Attack Generation:** Locust for workload generation; custom Python red-team harness scripting poisoning, leakage, and denial-of-wallet probes.
+
+
+| Category | Tech Stack & Components |
+| :--- | :--- |
+| **Core Gateway & API** | **Python 3.x** • **FastAPI** + **Uvicorn** (Async ASGI) • **Pydantic** • **HTTPX** |
+| **AI / ML & LLM Tier** | **PyTorch** • **Hugging Face** (`transformers`, `accelerate`) • **Sentence-Transformers** • **Scikit-Learn** • **NumPy** • **Pandas** • **ONNX Runtime** • **vLLM** & custom CPU/GPU runners |
+| **Vector DB & Cache** | **Redis Stack** (`redis`, `hiredis` with HNSW/KNN vector search & JSON cache) • **PyYAML** • **python-dotenv** |
+| **Security & Auth** | **Python-JOSE** • **PyJWT** (OIDC/JWT auth) • **Cryptography** |
+| **Parsing & Crawling** | **PyMuPDF (`fitz`)** • **BeautifulSoup4** • **Crawl4AI** |
+| **Testing & Eval** | **RAGAS** • **Locust** (Load testing) • **Pytest** + **Pytest-Asyncio** |
+| **Infra & Deploy** | **Docker** & **Docker Compose** • **Systemd** / Bash runbooks (Non-sudo/user-space execution) |
 
 ### Key Design Decisions
-
 | Decision | Alternative Rejected | Reason |
 | :--- | :--- | :--- |
-| **Self-hosted embedding + `pgvector` for cache index** | Managed vector DB (Pinecone / Weaviate Cloud) | Avoids recurring managed-service cost against a fixed student credit budget; `pgvector` is sufficient at the evaluated scale ($\le 10,000$ cached entries) and keeps per-tenant namespace isolation under direct control for red-team experiments. |
+| **Dual-Tier Dynamic Dispatch (CPU SLM vs. GPU LLM Tier)** | Single monolithic GPU routing for all incoming queries | GPUs are scarce institutional HPC resources. Simple factual queries (70–80% of volume) execute on local CPU SLMs (Qwen 2.5 3B) with zero GPU egress, eliminating GPU queue starvation and head-of-line blocking. |
+| **Redis Stack for Vector DB & Semantic Cache** | Managed Vector DBs (Pinecone/Weaviate) or separate cache/vector systems | Centralizes dense vector indexing (HNSW/KNN across 2.2M+ chunks) and multi-level semantic caching in one in-memory instance, delivering sub-50ms vector search, sub-4ms cache hits, and zero managed-service subscription costs. |
 | **Synchronous in-path fallback state machine** | Async queue + eventual reroute | Fallback must complete within the client's request lifetime (NFR-2); an async design trades away the latency guarantee this project evaluates. |
-| **ECS/EKS-hosted gateway (warm process)** | Pure Lambda-per-request gateway | The embedding model and vector index need a warm, resident process to hit the NFR-1 latency target ($p99 \le 50\text{ ms}$); Lambda cold starts would dominate the cache-hit path. |
 
 ---
 
@@ -228,8 +232,7 @@ Track C  |---[Locust Generator]---[Baseline/Config Exps]---[Cost Model/Plots]---
 
 ### Minimum Viable Product (MVP) vs. Stretch Goals
 * **MVP:** Configurations C0 and C2, FR-1/FR-2/FR-4 implemented and tested, NFR-1/NFR-2/NFR-3 validated, and cache-poisoning red-team test (FR-6/NFR-6) demonstrated end-to-end.
-* **Stretch Goals:** Configuration C3 (quantized-model comparison), full denial-of-wallet mitigation (NFR-7), and the live public-facing dashboard (FR-8).
-
+* **Stretch Goals:** Configuration C3 (quantized-model comparison).
 ---
 
 ## 9. References
