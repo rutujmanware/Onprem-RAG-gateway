@@ -1,0 +1,166 @@
+{
+  "vector_analysis": [
+    {
+      "category": "Exact Duplicate",
+      "q1": "What is vermiculite and what are its primary uses?",
+      "q2": "What is vermiculite and what are its primary uses?",
+      "cosine_sim": 1.0,
+      "naive_status": "HIT (>=0.90)",
+      "guard_status": "SAFE HIT"
+    },
+    {
+      "category": "True Paraphrase (Vocabulary)",
+      "q1": "What is vermiculite and what are its primary uses?",
+      "q2": "Can you explain what vermiculite is and its main applications?",
+      "cosine_sim": 0.9373,
+      "naive_status": "HIT (>=0.90)",
+      "guard_status": "SAFE HIT"
+    },
+    {
+      "category": "True Paraphrase (Syntax/Word Order)",
+      "q1": "Explain the onset of Rayleigh Taylor instability in magnetized fluids.",
+      "q2": "In magnetized fluids, how does Rayleigh Taylor instability begin?",
+      "cosine_sim": 0.9682,
+      "naive_status": "HIT (>=0.90)",
+      "guard_status": "SAFE HIT"
+    },
+    {
+      "category": "Year Shift (2023 vs 2024)",
+      "q1": "What are the IISc thesis submission guidelines in 2023?",
+      "q2": "What are the IISc thesis submission guidelines in 2024?",
+      "cosine_sim": 0.9947,
+      "naive_status": "FALSE HIT (>0.90)",
+      "guard_status": "REJECTED (Numerical / Year mismatch)"
+    },
+    {
+      "category": "Year Shift (Cutoffs 2023 vs 2024)",
+      "q1": "What was the admissions cutoff for M.Tech CSE in 2023?",
+      "q2": "What was the admissions cutoff for M.Tech CSE in 2024?",
+      "cosine_sim": 0.9929,
+      "naive_status": "FALSE HIT (>0.90)",
+      "guard_status": "REJECTED (Numerical / Year mismatch)"
+    },
+    {
+      "category": "Year Shift (Research survey 2021 vs 2024)",
+      "q1": "Overview of clean energy research published at IISc in 2021",
+      "q2": "Overview of clean energy research published at IISc in 2024",
+      "cosine_sim": 0.9858,
+      "naive_status": "FALSE HIT (>0.90)",
+      "guard_status": "REJECTED (Numerical / Year mismatch)"
+    },
+    {
+      "category": "Quantity Shift (5 vs 50)",
+      "q1": "Fluid flow rate measured at 5 liters per second",
+      "q2": "Fluid flow rate measured at 50 liters per second",
+      "cosine_sim": 0.8393,
+      "naive_status": "MISS (<0.90)",
+      "guard_status": "REJECTED (Numerical / Year mismatch)"
+    },
+    {
+      "category": "Frequency Shift (100 MHz vs 500 MHz)",
+      "q1": "Resonance frequency observed at 100 MHz in quartz crystal",
+      "q2": "Resonance frequency observed at 500 MHz in quartz crystal",
+      "cosine_sim": 0.9348,
+      "naive_status": "FALSE HIT (>0.90)",
+      "guard_status": "REJECTED (Numerical / Year mismatch)"
+    },
+    {
+      "category": "Polarity Reversal (Negation)",
+      "q1": "Why does magnetohydrodynamic flow stabilize under magnetic shear?",
+      "q2": "Why does magnetohydrodynamic flow NOT stabilize under magnetic shear?",
+      "cosine_sim": 0.988,
+      "naive_status": "FALSE HIT (>0.90)",
+      "guard_status": "REJECTED (Polarity / Negation mismatch)"
+    },
+    {
+      "category": "Cross-Domain (MHD vs Vermiculite)",
+      "q1": "How does Rayleigh-Taylor instability develop in magnetohydrodynamics?",
+      "q2": "What is vermiculite and what are its primary uses?",
+      "cosine_sim": -0.0571,
+      "naive_status": "MISS (<0.90)",
+      "guard_status": "SAFE MISS"
+    },
+    {
+      "category": "Cross-Domain (Quantum vs Fluid)",
+      "q1": "Feynman diagrams in quantum electrodynamics perturbation theory",
+      "q2": "Stability criteria for stratified incompressible fluid flows",
+      "cosine_sim": 0.0197,
+      "naive_status": "MISS (<0.90)",
+      "guard_status": "SAFE MISS"
+    }
+  ],
+  "gateway_eval": [
+    {
+      "id": "CPU_Cold_2023",
+      "query": "What are the thesis guidelines for vermiculite beneficiation in 2023?",
+      "cached": false,
+      "tier": "cpu_slm",
+      "latency": 6.0775,
+      "similarity": "N/A"
+    },
+    {
+      "id": "CPU_Exact_2023",
+      "query": "What are the thesis guidelines for vermiculite beneficiation in 2023?",
+      "cached": true,
+      "tier": "semantic_cache",
+      "latency": 0.0238,
+      "similarity": 1.0
+    },
+    {
+      "id": "CPU_Paraphrase_2023",
+      "query": "Can you describe the vermiculite beneficiation guidelines published in 2023?",
+      "cached": true,
+      "tier": "semantic_cache",
+      "latency": 0.0229,
+      "similarity": 0.923
+    },
+    {
+      "id": "CPU_YearShift_2024",
+      "query": "What are the thesis guidelines for vermiculite beneficiation in 2024?",
+      "cached": false,
+      "tier": "cpu_slm",
+      "latency": 2.0802,
+      "similarity": "N/A (Miss)"
+    },
+    {
+      "id": "CPU_Exact_2024",
+      "query": "What are the thesis guidelines for vermiculite beneficiation in 2024?",
+      "cached": true,
+      "tier": "semantic_cache",
+      "latency": 0.0288,
+      "similarity": 1.0
+    },
+    {
+      "id": "GPU_Cold_2023",
+      "query": "Synthesize and compare the mathematical stability proofs of magnetic shear vs Coriolis force in accretion disks published in 2023.",
+      "cached": false,
+      "tier": "gpu_vllm",
+      "latency": 10.7153,
+      "similarity": "N/A"
+    },
+    {
+      "id": "GPU_Paraphrase_2023",
+      "query": "Compare the mathematical derivations for accretion disk stability between Coriolis force and magnetic shear in 2023.",
+      "cached": true,
+      "tier": "semantic_cache",
+      "latency": 0.068,
+      "similarity": 0.9187
+    },
+    {
+      "id": "GPU_YearShift_2024",
+      "query": "Synthesize and compare the mathematical stability proofs of magnetic shear vs Coriolis force in accretion disks published in 2024.",
+      "cached": false,
+      "tier": "gpu_vllm",
+      "latency": 4.3233,
+      "similarity": "N/A (Miss)"
+    },
+    {
+      "id": "GPU_Exact_2024",
+      "query": "Synthesize and compare the mathematical stability proofs of magnetic shear vs Coriolis force in accretion disks published in 2024.",
+      "cached": true,
+      "tier": "semantic_cache",
+      "latency": 0.0336,
+      "similarity": 1.0
+    }
+  ]
+}

@@ -1,0 +1,28 @@
+{
+  "scenario": "100_uncached_cold_queries",
+  "concurrency": 10,
+  "total_requests": 100,
+  "successes": 100,
+  "failures": 0,
+  "cache_hit_rate_perc": 0.0,
+  "wall_time_seconds": 50.15,
+  "rps": 1.99,
+  "latency_percentiles_ms": {
+    "min": 3122.86,
+    "p50": 4602.55,
+    "p90": 5500.31,
+    "p95": 9282.59,
+    "p99": 9565.97,
+    "max": 9901.82,
+    "mean": 4863.67
+  },
+  "retrieval_latency_ms": {
+    "mean": 404.33,
+    "p95": 739.0
+  },
+  "routing_breakdown": {
+    "cpu_slm": 0,
+    "gpu_vllm": 100,
+    "other": 0
+  }
+}
