@@ -17,7 +17,10 @@ logger = logging.getLogger(__name__)
 
 class RedisDocumentIndexer:
     def __init__(self, redis_url=None, index_name="rag_documents_idx", vector_dim=384):
-        self.redis_url = redis_url or os.getenv("REDIS_URL", "redis://localhost:6379/0")
+        _redis_pw = os.getenv("REDIS_PASSWORD", "")
+        _pw_str = f":{_redis_pw}@" if _redis_pw else ""
+        _default_redis_url = f"redis://{_pw_str}{os.getenv('REDIS_HOST', 'localhost')}:{os.getenv('REDIS_PORT', '6379')}/0"
+        self.redis_url = redis_url or os.getenv("REDIS_URL") or _default_redis_url
         self.index_name = index_name
         self.vector_dim = vector_dim
         self.cleaner = TextCleaner()

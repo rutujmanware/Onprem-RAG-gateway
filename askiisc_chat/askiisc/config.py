@@ -22,7 +22,10 @@ def _f(name, default):
     return type(default)(os.environ.get(name, default))
 
 # --- Redis (RediSearch vector index; needs Redis Stack / redis-search module) ---
-REDIS_URL        = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
+_redis_pw        = os.environ.get("REDIS_PASSWORD", "")
+_pw_str          = f":{_redis_pw}@" if _redis_pw else ""
+_default_redis_url = f"redis://{_pw_str}{os.environ.get('REDIS_HOST', 'localhost')}:{os.environ.get('REDIS_PORT', '6379')}/0"
+REDIS_URL        = os.environ.get("REDIS_URL", _default_redis_url)
 INDEX_NAME       = os.environ.get("INDEX_NAME", "idx:chunks")
 F_TEXT           = os.environ.get("F_TEXT", "text")          # chunk text field
 F_VECTOR         = os.environ.get("F_VECTOR", "embedding")   # vector field (FLOAT32 blob)
@@ -41,11 +44,11 @@ EMBED_DIM        = _f("EMBED_DIM", 384)
 EMBED_QUERY_PREFIX = os.environ.get("EMBED_QUERY_PREFIX", "")  # e.g. bge: "Represent this sentence for searching relevant passages: "
 
 # --- Models (OpenAI-compatible /v1/chat/completions: vLLM, llama.cpp server, Ollama) ---
-SLM_URL          = os.environ.get("SLM_URL", "http://localhost:8002/v1")
-SLM_MODEL        = os.environ.get("SLM_MODEL", "Qwen/Qwen2.5-1.5B-Instruct")
+SLM_URL          = os.environ.get("SLM_BASE_URL", os.environ.get("SLM_URL", "http://localhost:8082/v1"))
+SLM_MODEL        = os.environ.get("SLM_MODEL_NAME", os.environ.get("SLM_MODEL", "models/slm_gguf/qwen2.5-3b-instruct-q4_k_m.gguf"))
 SLM_KEY          = os.environ.get("SLM_KEY", "intranet-token")
-LLM_URL          = os.environ.get("LLM_URL", "http://localhost:8000/v1")
-LLM_MODEL        = os.environ.get("LLM_MODEL", "Qwen/Qwen2.5-7B-Instruct")
+LLM_URL          = os.environ.get("VLLM_BASE_URL", os.environ.get("LLM_URL", "http://localhost:8000/v1"))
+LLM_MODEL        = os.environ.get("VLLM_MODEL_NAME", os.environ.get("LLM_MODEL", "Qwen/Qwen2.5-7B-Instruct"))
 LLM_KEY          = os.environ.get("LLM_KEY", "intranet-token")
 MAX_TOKENS       = _f("MAX_TOKENS", 2048)
 TEMPERATURE      = _f("TEMPERATURE", 0.2)
@@ -116,7 +119,7 @@ CHUNKS_FILE       = os.environ.get("CHUNKS_FILE", "data/chunks.npz")
 # --- Answering backend ---
 # "own"     = this app embeds the question, searches Redis and calls the SLM/LLM servers itself (needs the Redis field names below to match).
 # "gateway" = forward the question to the team gateway (gateway/main.py POST /query), which does routing, retrieval and generation.
-BACKEND          = os.environ.get("BACKEND", "own")
+BACKEND          = os.environ.get("BACKEND", "gateway")
 GATEWAY_URL      = os.environ.get("GATEWAY_URL", "http://127.0.0.1:8080")
 GATEWAY_TIMEOUT  = _f("GATEWAY_TIMEOUT", 600.0)     # CPU SLM prefill + generation can take minutes
 GATEWAY_DEBUG    = os.environ.get("GATEWAY_DEBUG", "0") == "1"   # log the first raw events from the gateway (use on first runs)

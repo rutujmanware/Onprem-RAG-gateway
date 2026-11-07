@@ -16,16 +16,18 @@ import json
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
-from dotenv import load_dotenv
-load_dotenv()
-import httpx
-
 ROOT_DIR = Path(__file__).resolve().parent.parent
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
+from dotenv import load_dotenv
+load_dotenv(ROOT_DIR / ".env")
+import httpx
+
 # Endpoints (Normalized to remove trailing /v1 for root health endpoints)
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+_redis_pw = os.getenv("REDIS_PASSWORD")
+_pw_str = f":{_redis_pw}@" if _redis_pw else ""
+REDIS_URL = os.getenv("REDIS_URL", f"redis://{_pw_str}{os.getenv('REDIS_HOST', 'localhost')}:{os.getenv('REDIS_PORT', '6379')}/0")
 GATEWAY_URL = os.getenv("GATEWAY_URL", "http://127.0.0.1:8080").rstrip("/")
 VLLM_BASE = os.getenv("VLLM_BASE_URL", "http://127.0.0.1:8000").rstrip("/").rsplit("/v1", 1)[0]
 SLM_BASE = os.getenv("SLM_BASE_URL", "http://127.0.0.1:8082").rstrip("/").rsplit("/v1", 1)[0]

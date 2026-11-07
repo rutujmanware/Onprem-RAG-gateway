@@ -319,7 +319,7 @@ class RedisSemanticCache:
             query_vec = self.embedder.embed_query(query)
             vec_bytes = np.array(query_vec, dtype=np.float32).tobytes()
 
-            search_query = "*=>[KNN 1 @vector $vec AS score]"
+            search_query = "*=>[KNN 1 @vector $vec EF_RUNTIME 64 AS score]"
             res = self.sync_client.execute_command(
                 "FT.SEARCH", self.index_name,
                 search_query,
@@ -409,7 +409,7 @@ class RedisSemanticCache:
             query_vec = await loop.run_in_executor(None, self.embedder.embed_query, query)
             vec_bytes = np.array(query_vec, dtype=np.float32).tobytes()
 
-            search_query = "*=>[KNN 1 @vector $vec AS score]"
+            search_query = "*=>[KNN 1 @vector $vec EF_RUNTIME 64 AS score]"
             res = await self.async_client.execute_command(
                 "FT.SEARCH", self.index_name,
                 search_query,
@@ -700,7 +700,7 @@ class RedisSemanticCache:
             query_vec = self.embedder.embed_query(query)
             vec_bytes = np.array(query_vec, dtype=np.float32).tobytes()
 
-            search_query = "*=>[KNN 50 @vector $vec AS score]"
+            search_query = "*=>[KNN 50 @vector $vec EF_RUNTIME 64 AS score]"
             res = self.sync_client.execute_command(
                 "FT.SEARCH", self.index_name,
                 search_query,
@@ -779,7 +779,7 @@ class RedisSemanticCache:
             query_vec = await loop.run_in_executor(None, self.embedder.embed_query, query)
             vec_bytes = np.array(query_vec, dtype=np.float32).tobytes()
 
-            search_query = "*=>[KNN 50 @vector $vec AS score]"
+            search_query = "*=>[KNN 50 @vector $vec EF_RUNTIME 64 AS score]"
             res = await self.async_client.execute_command(
                 "FT.SEARCH", self.index_name,
                 search_query,

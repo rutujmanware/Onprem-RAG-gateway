@@ -1,5 +1,5 @@
 # AskIISc on a shared department GPU server - NO sudo
-Everything lives in `$HOME/askiisc`, runs as you, uses high ports. Use this instead of RUNBOOK.md (which needs root/docker/systemd/ufw).
+Everything lives in `$HOME/askiisc`, runs as you, uses high ports. Use this instead of RUNBOOK.md (which uses systemd/ufw service units).
 Process manager: `deploy/user/askiisc.sh`.  Settings: `~/askiisc/askiisc.env` (template: `deploy/user/askiisc.env.example`).
 
 ## 0. Look before you leap (shared machine!)

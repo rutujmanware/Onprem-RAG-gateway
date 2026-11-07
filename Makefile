@@ -27,9 +27,9 @@ help:
 	@echo "  make redis-down     - Stop Redis Stack daemon"
 	@echo "  make redis-status   - Check Redis loading / persistence status (one-shot)"
 	@echo "  make redis-watch    - Live interactive monitor of 12GB dataset loading with progress bar & ETA"
-	@echo "  make up             - Start full docker-compose stack (Redis, SLM, vLLM, Gateway)"
-	@echo "  make down           - Stop all docker services"
-	@echo "  make logs           - Tail docker service logs"
+	@echo "  make up             - Start production on-prem stack (Redis, SLM, vLLM, Gateway)"
+	@echo "  make down           - Stop all background compute services"
+	@echo "  make logs           - Tail gateway service logs"
 	@echo "  make ingest-pdfs    - Extract, clean, chunk, embed, and index all PDFs in data/raw_pdfs/"
 	@echo "  make query Q=\"...\"  - Perform semantic search query against the Redis vector index"
 	@echo "  make ask Q=\"...\"    - Query the running Gateway with clean formatted answer output"
@@ -119,17 +119,12 @@ redis-status:
 redis-watch:
 	@$(PYTHON) scripts/track_redis.py
 
-up:
-	docker run -d --name onprem-rag-redis \
-		-p 6379:6379 -p 8001:8001 \
-		-v redis_data:/data \
-		redis/redis-stack:7.2.0-v9 || docker start onprem-rag-redis
+up: prod-up
 
-down:
-	docker stop onprem-rag-redis || true
+down: prod-down
 
 logs:
-	docker logs -f onprem-rag-redis
+	tail -n 100 -f logs/gateway.log
 
 ingest-pdfs:
 	$(PYTHON) -m pipeline.batch_ingest_pdfs --pdf-dir data/raw_pdfs

@@ -210,6 +210,7 @@ async def queue_stats(admission: AdmissionController = Depends(get_admission_con
 @app.post("/v1/chat/completions", dependencies=[Depends(require_internal_or_auth)], include_in_schema=False)
 async def chat_completions(
     req: ChatCompletionRequest,
+    request: Request,
     user: UserIdentity = Depends(require_iisc_user),
     cache: RedisSemanticCache = Depends(get_semantic_cache),
     scorer: ComplexityScorer = Depends(get_complexity_scorer),
@@ -221,20 +222,40 @@ async def chat_completions(
     if not req.messages:
         raise HTTPException(status_code=400, detail="Messages list cannot be empty")
 
-    query = req.messages[-1].content.strip()
-    if not query or len(query) < 2:
+    raw_query = req.messages[-1].content.strip()
+    if not raw_query or len(raw_query) < 2:
         raise HTTPException(status_code=400, detail="Query message must contain at least 2 non-whitespace characters")
     # VULN-04: Validate prompt against adversarial injection & jailbreak patterns
     try:
-        sanitize_and_fence_prompt(query)
+        sanitize_and_fence_prompt(raw_query)
     except PromptInjectionAlert as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+    from pipeline.text_processing.typo_normalizer import TypoNormalizer
+    query = TypoNormalizer.get_instance().normalize(raw_query)
+
     t0 = time.time()
+
+    # Identify caller for token-bucket and queue accounting
+    client_host = request.client.host if request.client else ""
+    xff = request.headers.get("x-forwarded-for")
+    client_id = client_host or "anonymous"
+
+    internal_user = request.headers.get("x-internal-user", "").strip()
+    if internal_user and client_host in ("127.0.0.1", "::1", "localhost", "testclient") and not xff:
+        client_id = internal_user
+    elif "session" in request.scope:
+        u = request.session.get("user")
+        if u and isinstance(u, dict) and u.get("email"):
+            client_id = u["email"]
+    elif user and getattr(user, "email", None):
+        client_id = user.email
 
     # Step 0: Semantic Vector Cache Lookup
     try:
         hit = await cache.alookup(query)
+        if hit is None and query != raw_query:
+            hit = await cache.alookup(raw_query)
     except Exception:
         hit = None
 
@@ -313,57 +334,63 @@ async def chat_completions(
     decision = dispatcher.decide(score)
 
     if req.stream:
+        await admission.acquire(client_id)
         rag = RAGQAPipeline()
         cmpl_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
         created_ts = int(time.time())
 
         def sse_chat_generator():
-            full_ans = []
-            collected_chunks = []
-            for event in rag.answer_query_stream(
-                query,
-                max_new_tokens=req.max_tokens,
-                temperature=req.temperature or 0.2,
-            ):
-                if event.get("type") == "token":
-                    delta_text = event.get("delta", "")
-                    full_ans.append(delta_text)
-                    chunk = {
-                        "id": cmpl_id,
-                        "object": "chat.completion.chunk",
-                        "created": created_ts,
-                        "model": "qwen2.5-3b-instruct-cpu" if decision.target_tier != ModelTier.GPU_LLM else "qwen2.5-7b-instruct-gpu",
-                        "choices": [{
-                            "index": 0,
-                            "delta": {"content": delta_text},
-                            "finish_reason": None,
-                        }],
-                    }
-                    yield f"data: {json.dumps(chunk)}\n\n"
-                elif event.get("type") == "chunks":
-                    collected_chunks = event.get("chunks", [])
-                elif event.get("type") == "done":
-                    final_chunk = {
-                        "id": cmpl_id,
-                        "object": "chat.completion.chunk",
-                        "created": created_ts,
-                        "model": "qwen2.5-3b-instruct-cpu" if decision.target_tier != ModelTier.GPU_LLM else "qwen2.5-7b-instruct-gpu",
-                        "choices": [{
-                            "index": 0,
-                            "delta": {},
-                            "finish_reason": "stop",
-                        }],
-                    }
-                    yield f"data: {json.dumps(final_chunk)}\n\n"
+            try:
+                full_ans = []
+                collected_chunks = []
+                for event in rag.answer_query_stream(
+                    query,
+                    max_new_tokens=req.max_tokens,
+                    temperature=req.temperature or 0.2,
+                ):
+                    if event.get("type") == "token":
+                        delta_text = event.get("delta", "")
+                        full_ans.append(delta_text)
+                        chunk = {
+                            "id": cmpl_id,
+                            "object": "chat.completion.chunk",
+                            "created": created_ts,
+                            "model": "qwen2.5-3b-instruct-cpu" if decision.target_tier != ModelTier.GPU_LLM else "qwen2.5-7b-instruct-gpu",
+                            "choices": [{
+                                "index": 0,
+                                "delta": {"content": delta_text},
+                                "finish_reason": None,
+                            }],
+                        }
+                        yield f"data: {json.dumps(chunk)}\n\n"
+                    elif event.get("type") == "chunks":
+                        collected_chunks = event.get("chunks", [])
+                    elif event.get("type") == "done":
+                        final_chunk = {
+                            "id": cmpl_id,
+                            "object": "chat.completion.chunk",
+                            "created": created_ts,
+                            "model": "qwen2.5-3b-instruct-cpu" if decision.target_tier != ModelTier.GPU_LLM else "qwen2.5-7b-instruct-gpu",
+                            "choices": [{
+                                "index": 0,
+                                "delta": {},
+                                "finish_reason": "stop",
+                            }],
+                        }
+                        yield f"data: {json.dumps(final_chunk)}\n\n"
 
-            # Save generated completion to cache only when document chunks were retrieved
-            complete_text = "".join(full_ans)
-            if complete_text and collected_chunks:
-                try:
-                    cache.store(query, {"answer": complete_text, "chunks": collected_chunks})
-                except Exception:
-                    pass
-            yield "data: [DONE]\n\n"
+                # Save generated completion to cache only when document chunks were retrieved
+                complete_text = "".join(full_ans)
+                if complete_text and collected_chunks:
+                    try:
+                        cache.store(query, {"answer": complete_text, "chunks": collected_chunks})
+                        if query != raw_query:
+                            cache.store(raw_query, {"answer": complete_text, "chunks": collected_chunks})
+                    except Exception:
+                        pass
+                yield "data: [DONE]\n\n"
+            finally:
+                admission.release()
 
         return StreamingResponse(
             sse_chat_generator(),
@@ -375,125 +402,131 @@ async def chat_completions(
             },
         )
 
-    # Step 2: Route Enforcement for Hard Queries -> GPU LLM Tier (Qwen 2.5 7B)
-    if decision.target_tier == ModelTier.GPU_LLM:
-        gpu_max_tokens = req.max_tokens if (req.max_tokens is not None and req.max_tokens > 0) else 2048
-        vllm_up = await vllm.check_health()
-        if vllm_up:
+    # Cold non-streaming generation: guarded by admission slot
+    async with admission.slot(client_id):
+        # Step 2: Route Enforcement for Hard Queries -> GPU LLM Tier (Qwen 2.5 7B)
+        if decision.target_tier == ModelTier.GPU_LLM:
+            gpu_max_tokens = req.max_tokens if (req.max_tokens is not None and req.max_tokens > 0) else 2048
+            vllm_up = await vllm.check_health()
+            if vllm_up:
+                try:
+                    resp = await vllm.generate_chat(
+                        [{"role": m.role, "content": m.content} for m in req.messages],
+                        max_tokens=gpu_max_tokens,
+                        temperature=req.temperature or 0.2,
+                    )
+                    resp["router_meta"] = {
+                        "score": round(score, 4),
+                        "tier": decision.target_tier.value,
+                        "route": "hard",
+                        "reason": decision.reason,
+                        "routing_time_seconds": round(time.time() - t0, 4),
+                    }
+                    resp["user"] = user.email
+                    ans_text = resp["choices"][0]["message"]["content"]
+                    await cache.astore(query, {"answer": ans_text})
+                    return resp
+                except Exception:
+                    pass
+
+            # In-process GPU LLM fallback
             try:
-                resp = await vllm.generate_chat(
+                from pipeline.gpu_llm_runner import GPULLMEngine
+                engine = GPULLMEngine.get_instance()
+                gpu_res = engine.generate_chat(
                     [{"role": m.role, "content": m.content} for m in req.messages],
-                    max_tokens=gpu_max_tokens,
+                    max_new_tokens=gpu_max_tokens,
+                    temperature=req.temperature or 0.2,
+                )
+                ans_text = gpu_res["text"]
+                await cache.astore(query, {"answer": ans_text})
+                if query != raw_query:
+                    await cache.astore(raw_query, {"answer": ans_text})
+                return {
+                    "id": f"chatcmpl-hard-{uuid.uuid4().hex[:8]}",
+                    "object": "chat.completion",
+                    "model": "Qwen/Qwen2.5-7B-Instruct",
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": ans_text},
+                        "finish_reason": "stop",
+                    }],
+                    "usage": {
+                        "prompt_tokens": -1,
+                        "completion_tokens": gpu_res["num_tokens"],
+                        "total_tokens": gpu_res["num_tokens"],
+                    },
+                    "router_meta": {
+                        "score": round(score, 4),
+                        "tier": decision.target_tier.value,
+                        "route": "hard",
+                        "reason": decision.reason,
+                        "routing_time_seconds": round(time.time() - t0, 4),
+                    },
+                    "user": user.email,
+                }
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"GPU LLM generation failed: {str(e)}")
+
+        # Step 3: Easy Queries -> CPU SLM Tier (Qwen 2.5 3B)
+        slm_max_tokens = req.max_tokens if (req.max_tokens is not None and req.max_tokens > 0) else 160
+        slm_up = await slm.check_health()
+        if slm_up:
+            try:
+                resp = await slm.generate_chat(
+                    [{"role": m.role, "content": m.content} for m in req.messages],
+                    max_tokens=slm_max_tokens,
                     temperature=req.temperature or 0.2,
                 )
                 resp["router_meta"] = {
                     "score": round(score, 4),
                     "tier": decision.target_tier.value,
-                    "route": "hard",
+                    "route": "easy",
                     "reason": decision.reason,
                     "routing_time_seconds": round(time.time() - t0, 4),
                 }
-                resp["user"] = user.email
                 ans_text = resp["choices"][0]["message"]["content"]
                 await cache.astore(query, {"answer": ans_text})
+                if query != raw_query:
+                    await cache.astore(raw_query, {"answer": ans_text})
                 return resp
             except Exception:
                 pass
 
-        # In-process GPU LLM fallback
-        try:
-            from pipeline.gpu_llm_runner import GPULLMEngine
-            engine = GPULLMEngine.get_instance()
-            gpu_res = engine.generate_chat(
-                [{"role": m.role, "content": m.content} for m in req.messages],
-                max_new_tokens=gpu_max_tokens,
-                temperature=req.temperature or 0.2,
-            )
-            ans_text = gpu_res["text"]
-            await cache.astore(query, {"answer": ans_text})
-            return {
-                "id": f"chatcmpl-hard-{uuid.uuid4().hex[:8]}",
-                "object": "chat.completion",
-                "model": "Qwen/Qwen2.5-7B-Instruct",
-                "choices": [{
-                    "index": 0,
-                    "message": {"role": "assistant", "content": ans_text},
-                    "finish_reason": "stop",
-                }],
-                "usage": {
-                    "prompt_tokens": -1,
-                    "completion_tokens": gpu_res["num_tokens"],
-                    "total_tokens": gpu_res["num_tokens"],
+        # Fallback attempt: In-process RAG QA Pipeline
+        rag = RAGQAPipeline()
+        rag_res = await run_in_threadpool(
+            rag.answer_query,
+            query,
+            max_new_tokens=slm_max_tokens,
+            temperature=req.temperature or 0.2,
+        )
+        ans_text = rag_res.get("answer", "")
+        retrieved_chunks = rag_res.get("chunks", [])
+        if retrieved_chunks:
+            await cache.astore(query, {"answer": ans_text, "chunks": retrieved_chunks})
+        return {
+            "id": f"chatcmpl-slm-{uuid.uuid4().hex[:8]}",
+            "object": "chat.completion",
+            "model": "qwen2.5-3b-instruct-cpu",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": ans_text,
                 },
-                "router_meta": {
-                    "score": round(score, 4),
-                    "tier": decision.target_tier.value,
-                    "route": "hard",
-                    "reason": decision.reason,
-                    "routing_time_seconds": round(time.time() - t0, 4),
-                },
-                "user": user.email,
-            }
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"GPU LLM generation failed: {str(e)}")
-
-    # Step 3: Easy Queries -> CPU SLM Tier (Qwen 2.5 3B)
-    slm_max_tokens = req.max_tokens if (req.max_tokens is not None and req.max_tokens > 0) else 160
-    slm_up = await slm.check_health()
-    if slm_up:
-        try:
-            resp = await slm.generate_chat(
-                [{"role": m.role, "content": m.content} for m in req.messages],
-                max_tokens=slm_max_tokens,
-                temperature=req.temperature or 0.2,
-            )
-            resp["router_meta"] = {
+                "finish_reason": "stop",
+            }],
+            "router_meta": {
                 "score": round(score, 4),
                 "tier": decision.target_tier.value,
                 "route": "easy",
                 "reason": decision.reason,
+                "chunks_retrieved": len(rag_res.get("chunks", [])),
                 "routing_time_seconds": round(time.time() - t0, 4),
-            }
-            ans_text = resp["choices"][0]["message"]["content"]
-            await cache.astore(query, {"answer": ans_text})
-            return resp
-        except Exception:
-            pass
-
-    # Fallback attempt: In-process RAG QA Pipeline
-    rag = RAGQAPipeline()
-    rag_res = await run_in_threadpool(
-        rag.answer_query,
-        query,
-        max_new_tokens=slm_max_tokens,
-        temperature=req.temperature or 0.2,
-    )
-    ans_text = rag_res.get("answer", "")
-    retrieved_chunks = rag_res.get("chunks", [])
-    if retrieved_chunks:
-        await cache.astore(query, {"answer": ans_text, "chunks": retrieved_chunks})
-    return {
-        "id": f"chatcmpl-slm-{uuid.uuid4().hex[:8]}",
-        "object": "chat.completion",
-        "model": "qwen2.5-3b-instruct-cpu",
-        "choices": [{
-            "index": 0,
-            "message": {
-                "role": "assistant",
-                "content": ans_text,
             },
-            "finish_reason": "stop",
-        }],
-        "router_meta": {
-            "score": round(score, 4),
-            "tier": decision.target_tier.value,
-            "route": "easy",
-            "reason": decision.reason,
-            "chunks_retrieved": len(rag_res.get("chunks", [])),
-            "routing_time_seconds": round(time.time() - t0, 4),
-        },
-        "user": user.email,
-    }
+            "user": user.email,
+        }
 
 
 @app.post("/query", dependencies=[Depends(require_internal_or_auth)], include_in_schema=False)
@@ -506,14 +539,17 @@ async def query_endpoint(
     vllm: VLLMClient = Depends(get_vllm_client),
     admission: AdmissionController = Depends(get_admission_controller),
 ):
-    query = req.query.strip()
-    if len(query) < 2:
+    raw_query = req.query.strip()
+    if len(raw_query) < 2:
         raise HTTPException(status_code=400, detail="Query must contain at least 2 non-whitespace characters")
     # VULN-04: Validate prompt against adversarial injection & jailbreak patterns
     try:
-        sanitize_and_fence_prompt(query)
+        sanitize_and_fence_prompt(raw_query)
     except PromptInjectionAlert as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+    from pipeline.text_processing.typo_normalizer import TypoNormalizer
+    query = TypoNormalizer.get_instance().normalize(raw_query)
 
     t0 = time.time()
 
@@ -536,6 +572,8 @@ async def query_endpoint(
     if not req.bypass_cache:
         try:
             hit = await cache.alookup(query)
+            if hit is None and query != raw_query:
+                hit = await cache.alookup(raw_query)
         except Exception:
             hit = None
 
@@ -585,6 +623,9 @@ async def query_endpoint(
         cached_resp["cached"] = True
         cached_resp["cache_hit"] = True
         cached_resp["badge"] = "Cached answer"
+        cached_resp["query"] = raw_query
+        if query != raw_query:
+            cached_resp["normalized_query"] = query
         cached_resp["provenance"] = {
             "status": "cached",
             "cached_at": cached_resp.get("cached_at", time.time()),
@@ -627,13 +668,17 @@ async def query_endpoint(
                 if full_text and collected_chunks:
                     try:
                         cache_payload = {
-                            "query": query,
+                            "query": raw_query,
                             "answer": full_text,
                             "route": route_info.get("route", "easy"),
                             "target_tier": route_info.get("target_tier", "cpu_slm"),
                             "chunks": collected_chunks,
                         }
+                        if query != raw_query:
+                            cache_payload["normalized_query"] = query
                         cache.store(query, cache_payload)
+                        if query != raw_query:
+                            cache.store(raw_query, cache_payload)
                     except Exception:
                         pass
                 yield "data: [DONE]\n\n"
@@ -681,8 +726,8 @@ async def query_endpoint(
 
         if not chunks:
             refusal_text = "No specific institutional repository theses were found on this topic."
-            return {
-                "query": query,
+            res = {
+                "query": raw_query,
                 "answer": refusal_text,
                 "route": "hard" if is_hard else "easy",
                 "target_tier": "gpu_vllm" if is_hard else "cpu_slm",
@@ -695,6 +740,9 @@ async def query_endpoint(
                     "routing_time_seconds": round(time.time() - t0, 4),
                 },
             }
+            if query != raw_query:
+                res["normalized_query"] = query
+            return res
 
         if decision.target_tier == ModelTier.GPU_LLM:
             gpu_max_tokens = req.max_tokens if (req.max_tokens is not None and req.max_tokens > 0) else 2048
@@ -710,7 +758,7 @@ async def query_endpoint(
                     )
                     answer_text = resp["choices"][0]["message"]["content"]
                     res = {
-                        "query": query,
+                        "query": raw_query,
                         "answer": answer_text,
                         "route": "hard",
                         "target_tier": "gpu_vllm",
@@ -723,8 +771,12 @@ async def query_endpoint(
                             "routing_time_seconds": round(time.time() - t0, 4),
                         },
                     }
+                    if query != raw_query:
+                        res["normalized_query"] = query
                     if not req.bypass_cache and chunks:
                         await cache.astore(query, res)
+                        if query != raw_query:
+                            await cache.astore(raw_query, res)
                     return res
                 except Exception:
                     pass
@@ -740,10 +792,15 @@ async def query_endpoint(
             )
             if "chunks" in res:
                 res["chunks"] = sanitize_chunks(res["chunks"])
+            res["query"] = raw_query
+            if query != raw_query:
+                res["normalized_query"] = query
             res["cached"] = False
             res["routing_time_seconds"] = round(time.time() - t0, 4)
             if not req.bypass_cache and res.get("chunks"):
                 await cache.astore(query, res)
+                if query != raw_query:
+                    await cache.astore(raw_query, res)
             return res
 
         # Route: Easy -> CPU SLM
@@ -760,6 +817,9 @@ async def query_endpoint(
         )
         if "chunks" in res:
             res["chunks"] = sanitize_chunks(res["chunks"])
+        res["query"] = raw_query
+        if query != raw_query:
+            res["normalized_query"] = query
         res["route"] = "easy"
         res["target_tier"] = "cpu_slm"
         res["score"] = round(score, 4)
@@ -767,6 +827,8 @@ async def query_endpoint(
         res["routing_time_seconds"] = round(time.time() - t0, 4)
         if not req.bypass_cache and res.get("chunks"):
             await cache.astore(query, res)
+            if query != raw_query:
+                await cache.astore(raw_query, res)
         return res
 
 

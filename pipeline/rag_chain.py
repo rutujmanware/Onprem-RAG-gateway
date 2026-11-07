@@ -108,6 +108,8 @@ class RAGQAPipeline:
         """Execute full RAG flow: Route -> Retrieve -> Ground -> Generate.
         Uses parallel fan-out (concurrent routing & candidate retrieval) when not precomputed.
         """
+        from pipeline.text_processing.typo_normalizer import TypoNormalizer
+        query = TypoNormalizer.get_instance().normalize(query)
         k = top_k or self.top_k
         t_start = time.time()
 
@@ -378,6 +380,8 @@ class RAGQAPipeline:
         chunks: Optional[List[Dict[str, Any]]] = None,
     ):
         """Streaming version of RAG flow. Yields events: metadata first, then token chunks, then summary."""
+        from pipeline.text_processing.typo_normalizer import TypoNormalizer
+        query = TypoNormalizer.get_instance().normalize(query)
         k = top_k or self.top_k
         t_start = time.time()
 

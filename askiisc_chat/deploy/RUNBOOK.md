@@ -4,7 +4,7 @@ Replace <PLACEHOLDERS>. Run on the SERVER unless marked LAPTOP.
 
 ## 0. Know your box
     lsb_release -a; nvidia-smi; lscpu | grep -E "Model name|^CPU\(s\)|Thread|Core"; free -h; df -h /opt
-    python3 --version; docker --version; ip -4 addr | grep inet
+    python3 --version; ip -4 addr | grep inet
     curl -sI --max-time 5 https://pypi.org | head -1        # no reply = server is offline: use the offline notes
 vLLM wants Python 3.10-3.12. The 7B settings assume 24 GB VRAM and an RTX 4090; other GPUs need different flags.
 
@@ -27,22 +27,26 @@ Server:
 
 ## 3. Redis Stack in RAM (plain Redis has NO vector search)
     export REDIS_PW=$(openssl rand -hex 24); echo $REDIS_PW      # save it; goes into REDIS_URL
-    docker run -d --name askiisc-redis --restart unless-stopped -p 127.0.0.1:6379:6379 \
-      -v /opt/askiisc/redis-data:/data \
-      -e REDIS_ARGS="--requirepass $REDIS_PW --maxmemory 8gb --maxmemory-policy noeviction --save 300 1 --save 60 1000" \
-      redis/redis-stack-server:latest
-Size --maxmemory from your laptop: `redis-cli INFO memory` (used_memory_human) x ~1.5. `noeviction` stops Redis deleting thesis chunks under memory pressure.
-Cache instance (unused until the cache is built; evicting is fine for a cache):
-    docker run -d --name askiisc-cache --restart unless-stopped -p 127.0.0.1:6380:6379 \
-      -e REDIS_ARGS="--requirepass $REDIS_PW --maxmemory 1gb --maxmemory-policy allkeys-lru" redis/redis-stack-server:latest
-Offline server: on laptop `docker pull redis/redis-stack-server:latest && docker save ... | gzip > r.tgz`; server `docker load < r.tgz`.
+    # Native bare-metal user-space binary:
+    wget https://packages.redis.io/redis-stack/redis-stack-server-7.2.0-v9.jammy.x86_64.tar.gz
+    tar -xzf redis-stack-server-7.2.0-v9.jammy.x86_64.tar.gz -C /opt/askiisc/
+    ln -sf /opt/askiisc/redis-stack-server-7.2.0-v9.jammy.x86_64 /opt/askiisc/redis-stack
+
+    # Start Redis Stack native daemon:
+    /opt/askiisc/redis-stack/bin/redis-stack-server \
+      --port 6379 \
+      --requirepass $REDIS_PW \
+      --dir /opt/askiisc/redis-data \
+      --maxmemory 48gb \
+      --maxmemory-policy noeviction \
+      --daemonize yes
 
 Load the data (laptop dump):
-    docker stop askiisc-redis
+    redis-cli -p 6379 -a $REDIS_PW shutdown
     sudo cp /tmp/dump.rdb /opt/askiisc/redis-data/dump.rdb
-    sudo chown -R $(docker inspect -f '{{.Config.User}}' askiisc-redis | sed 's/^$/999/'):0 /opt/askiisc/redis-data   # if Redis can't read it, check: docker logs askiisc-redis
-    docker start askiisc-redis
-    docker exec askiisc-redis redis-cli -a $REDIS_PW DBSIZE ; docker exec askiisc-redis redis-cli -a $REDIS_PW FT._LIST
+    sudo chown askiisc:askiisc /opt/askiisc/redis-data/dump.rdb
+    /opt/askiisc/redis-stack/bin/redis-stack-server --port 6379 --requirepass $REDIS_PW --dir /opt/askiisc/redis-data --daemonize yes
+    redis-cli -a $REDIS_PW DBSIZE ; redis-cli -a $REDIS_PW FT._LIST
 Do NOT enable --appendonly before loading: Redis then ignores dump.rdb and starts empty.
 Alternative: keep your ingestion script and point it at the server through a tunnel: `ssh -L 6379:127.0.0.1:6379 <you>@<server>`.
 
@@ -73,11 +77,11 @@ Do not load embargoed theses while ACCESS_TIERS=0.
     cd /opt/askiisc/llama.cpp && sudo -u askiisc cmake -B build && sudo -u askiisc cmake --build build --config Release -j"$(nproc)" --target llama-server
 Foreground test:
     sudo -u askiisc bash -c 'set -a; . /etc/askiisc/askiisc.env; set +a
-      /opt/askiisc/llama.cpp/build/bin/llama-server -m $SLM_MODEL_PATH --alias $SLM_MODEL --host 127.0.0.1 --port 8002 -c $SLM_CTX --parallel 2 -t $SLM_THREADS'
+      /opt/askiisc/llama.cpp/build/bin/llama-server -m $SLM_MODEL_PATH --alias $SLM_MODEL --host 127.0.0.1 --port 8082 -c $SLM_CTX --parallel 2 -t $SLM_THREADS'
 Another shell:
-    curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8002/v1/models                       # 401 = key enforced
-    curl -s http://127.0.0.1:8002/v1/chat/completions -H "Authorization: Bearer <SLM_KEY>" -H 'Content-Type: application/json' \
-      -d '{"model":"Qwen/Qwen2.5-1.5B-Instruct","messages":[{"role":"user","content":"Say hi"}],"logprobs":true,"max_tokens":8}'
+    curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8082/v1/models                       # 401 = key enforced
+    curl -s http://127.0.0.1:8082/v1/chat/completions -H "Authorization: Bearer <SLM_KEY>" -H 'Content-Type: application/json' \
+      -d '{"model":"Qwen/Qwen2.5-3B-Instruct","messages":[{"role":"user","content":"Say hi"}],"logprobs":true,"max_tokens":8}'
 If the reply has no "logprobs", the escalate-on-low-confidence feature silently never triggers: set CASCADE=0 or upgrade llama.cpp. Ctrl-C when done.
 
 ## 8. 7B on GPU (vLLM)
@@ -100,7 +104,7 @@ OOM / won't start: lower --max-model-len (16384) or --gpu-memory-utilization (0.
     sudo ufw allow OpenSSH            # tighten to your admin IP later
     sudo ufw allow from <ALLOWED_CIDR> to any port 9000 proto tcp
     sudo ufw default deny incoming && sudo ufw enable
-Redis/vLLM/llama.cpp listen on 127.0.0.1 only; docker publishes only to 127.0.0.1 (docker bypasses ufw for ports published on other addresses, so never publish -p 6379:6379).
+Redis/vLLM/llama.cpp listen on 127.0.0.1 only (internal loopback only, never exposed directly to external networks).
 
 ## 11. Acceptance test (from a campus laptop)
     curl -s http://<BIND_HOST>:9000/health          # redis/slm/llm all true, router_model_loaded true

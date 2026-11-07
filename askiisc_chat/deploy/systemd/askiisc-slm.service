@@ -6,7 +6,7 @@ After=network.target
 User=askiisc
 EnvironmentFile=/etc/askiisc/askiisc.env
 ExecStart=/opt/askiisc/llama.cpp/build/bin/llama-server -m ${SLM_MODEL_PATH} --alias ${SLM_MODEL} \
-  --host 127.0.0.1 --port 8002 -c ${SLM_CTX} --parallel 2 -t ${SLM_THREADS}
+  --host 127.0.0.1 --port 8082 -c ${SLM_CTX} --parallel 2 -t ${SLM_THREADS}
 Restart=on-failure
 RestartSec=5
 

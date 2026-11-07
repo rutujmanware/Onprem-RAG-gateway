@@ -22,7 +22,10 @@ except ImportError:
 
 import redis
 
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+_redis_pw = os.getenv("REDIS_PASSWORD", "")
+_pw_str = f":{_redis_pw}@" if _redis_pw else ""
+_default_redis_url = f"redis://{_pw_str}{os.getenv('REDIS_HOST', 'localhost')}:{os.getenv('REDIS_PORT', '6379')}/0"
+REDIS_URL = os.getenv("REDIS_URL") or _default_redis_url
 
 def main():
     if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):

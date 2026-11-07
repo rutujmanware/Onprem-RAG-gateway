@@ -1,6 +1,6 @@
 [Unit]
 Description=AskIISc gateway (FastAPI: router, retrieval, chat UI)
-After=network.target askiisc-vllm.service askiisc-slm.service docker.service
+After=network.target askiisc-vllm.service askiisc-slm.service
 Wants=askiisc-vllm.service askiisc-slm.service
 
 [Service]

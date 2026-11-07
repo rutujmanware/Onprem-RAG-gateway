@@ -34,7 +34,11 @@ logger = logging.getLogger("gateway.admission")
 class TokenBucketLimiter:
     """Thread-safe and async-safe token bucket rate limiter per client/user."""
 
-    def __init__(self, capacity: float = 60.0, refill_rate: float = 20.0):
+    def __init__(self, capacity: Optional[float] = None, refill_rate: Optional[float] = None):
+        if capacity is None:
+            capacity = float(os.getenv("RATE_LIMIT_BURST", "60.0"))
+        if refill_rate is None:
+            refill_rate = float(os.getenv("RATE_LIMIT_RPS", "20.0"))
         self.capacity = float(capacity)
         self.refill_rate = float(refill_rate)
         self._tokens: Dict[str, float] = {}
@@ -74,17 +78,17 @@ class AdmissionController:
         queue_timeout_seconds: Optional[float] = None,
         rate_limiter: Optional[TokenBucketLimiter] = None,
     ):
-        total_global_cap = int(os.getenv("GATEWAY_MAX_ACTIVE_INFERENCES", "42"))
+        total_global_cap = int(os.getenv("GLOBAL_CONCURRENCY_LIMIT", os.getenv("GATEWAY_MAX_ACTIVE_INFERENCES", "30")))
         num_workers = int(os.getenv("GATEWAY_WORKERS", os.getenv("UVICORN_WORKERS", "6")))
         default_worker_cap = max(1, total_global_cap // num_workers)
         self.global_cap = global_concurrency_cap or default_worker_cap
 
-        total_queue_depth = int(os.getenv("GATEWAY_MAX_QUEUE_DEPTH", "120"))
+        total_queue_depth = int(os.getenv("MAX_QUEUE_DEPTH", os.getenv("GATEWAY_MAX_QUEUE_DEPTH", "120")))
         default_worker_queue = max(1, total_queue_depth // num_workers)
         self.max_queue_depth = max_queue_depth or default_worker_queue
 
-        self.per_user_cap = per_user_concurrency_cap or int(os.getenv("GATEWAY_PER_USER_CAP", "6"))
-        self.queue_timeout = queue_timeout_seconds or float(os.getenv("GATEWAY_QUEUE_TIMEOUT_SECS", "30.0"))
+        self.per_user_cap = per_user_concurrency_cap or int(os.getenv("PER_USER_CONCURRENCY_LIMIT", os.getenv("GATEWAY_PER_USER_CAP", "6")))
+        self.queue_timeout = queue_timeout_seconds or float(os.getenv("QUEUE_TIMEOUT_SECONDS", os.getenv("GATEWAY_QUEUE_TIMEOUT_SECS", "30.0")))
 
         self.global_sem = asyncio.Semaphore(self.global_cap)
         self.rate_limiter = rate_limiter or TokenBucketLimiter()

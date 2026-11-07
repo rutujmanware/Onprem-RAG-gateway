@@ -4,22 +4,22 @@ Chat UI → FastAPI gateway → [embed query → Redis KNN → MLP easy/hard →
 
 ## Host it on the server
 **No sudo (shared department server): use `deploy/RUNBOOK_NOSUDO.md` + `deploy/user/askiisc.sh`; `RETRIEVER_BACKEND=npz` loads chunks from one file into RAM (no Redis module needed; export with `deploy/export_chunks.py`).**
-With root/Docker: See `deploy/RUNBOOK.md` (step-by-step commands), `deploy/systemd/*.service`, `deploy/askiisc.env.example`, `deploy/redis_index.py` (create/backfill/check index + embedder contract).
+With root: See `deploy/RUNBOOK.md` (step-by-step commands), `deploy/systemd/*.service`, `deploy/askiisc.env.example`, `deploy/redis_index.py` (create/backfill/check index + embedder contract).
 Auth is a separate workstream: interim = network gate only (`REQUIRE_LOGIN=0`, `ACCESS_TIERS=0`). **With ACCESS_TIERS=0 every chunk is visible to everyone who passes the network gate: load no embargoed/restricted theses until auth exists.** The CPU SLM only receives `SLM_TOP_K` (default 2) chunks; the 7B gets `TOP_K`.
 
 ## Run (development)
 ```bash
 pip install -r requirements.txt
 export HF_HUB_OFFLINE=1 DO_NOT_TRACK=1
-export REDIS_URL=redis://<redis-ip>:6379  INDEX_NAME=idx:chunks
-export SLM_URL=http://<laptop-ip>:8002/v1 LLM_URL=http://<gpu-ip>:8000/v1 BIND_HOST=<intranet-ip>
-python -m askiisc.app          # open http://<intranet-ip>:9000
+export REDIS_URL=redis://<redis-ip>:6379  INDEX_NAME=rag_documents_idx
+export SLM_URL=http://<laptop-ip>:8082/v1 LLM_URL=http://<gpu-ip>:8000/v1 BIND_HOST=<intranet-ip>
+python -m askiisc.app          # open http://<intranet-ip>:9000 (or use unified Gateway at :8080)
 ```
-Model servers: any OpenAI-compatible endpoint. 7B: `vllm serve Qwen/Qwen2.5-7B-Instruct --quantization fp8 --kv-cache-dtype fp8 --max-model-len 32768 --gpu-memory-utilization 0.92 --max-num-seqs 32 --enable-prefix-caching`. SLM: vLLM, or `llama-server -m qwen2.5-1.5b-instruct-q4_k_m.gguf --port 8002` on a CPU laptop.
+Model servers: any OpenAI-compatible endpoint. 7B: `vllm serve Qwen/Qwen2.5-7B-Instruct --quantization fp8 --kv-cache-dtype fp8 --max-model-len 32768 --gpu-memory-utilization 0.92 --max-num-seqs 32 --enable-prefix-caching`. SLM: vLLM, or `llama-server -m qwen2.5-3b-instruct-q4_k_m.gguf --port 8082` on CPU.
 
 ## Sign-in: email one-time code (default, `AUTH_MODE=otp`) and `REQUIRE_LOGIN=1`
 No chat, no thesis list, nothing without a session: `/chat` and `/theses` return 401. Flow: user enters IISc email -> "Generate OTP" -> 6-digit code emailed -> verify -> 8h session cookie.
-Protections: code stored only as an HMAC hash, valid 10 min, single use, destroyed after 5 wrong tries, 60 s resend gap, 5 codes/hour per mailbox, 20/hour per client IP, `+tag`/case aliases normalised, mail sent ONLY to allowed domains, identical error for wrong/expired/locked codes, CR/LF header injection blocked, SMTP failure leaves no live code.
+Protections: code stored only as an HMAC hash, valid 3 min (180s), single use, destroyed after 5 wrong tries, 60 s resend gap, 10 codes/hour per mailbox, 1000/hour per client IP, `+tag`/case aliases normalised, mail sent ONLY to allowed domains, identical error for wrong/expired/locked codes, CR/LF header injection blocked, SMTP failure leaves no live code.
 
 **You must set (server):**
 ```
@@ -28,7 +28,7 @@ SESSION_SECRET=<long random>  ALLOWED_CIDRS=<IISc ranges>  ALLOWED_EMAIL_DOMAINS
 ```
 - Ask the Computer Centre for an **internal relay** that accepts mail from the server IP. Using smtp.office365.com means external egress plus a mailbox password on the server.
 - **Check your real address format.** Default accepts only `@iisc.ac.in`. If people use `@csa.iisc.ac.in` etc., set `ALLOW_SUBDOMAINS=1` (or list each domain). Wrong value = nobody can log in, or the wrong people can.
-- Single process only (OTP state is in memory). Behind >1 worker, move it to Redis with TTL keys.
+- Multi-worker concurrency: OTP state and rate limits are backed by atomic Lua scripts in Redis (distributed multi-process safe; no in-memory bottlenecks).
 - Weakness vs Microsoft SSO: an OTP proves someone can READ that mailbox, not that they are a current member. Forwarding rules, shared/role mailboxes and unrevoked alumni/ex-staff addresses all pass. Keep `AUTH_MODE=entra` as the stronger option (the Entra code is still here).
 
 ## Access control (two tiers; only matters if REQUIRE_LOGIN=0 or you restrict theses further)

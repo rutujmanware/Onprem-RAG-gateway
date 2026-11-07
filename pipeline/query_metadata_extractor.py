@@ -164,7 +164,8 @@ class QueryMetadataExtractor:
         if not query or not query.strip():
             return ExtractedMetadata(clean_query="")
 
-        raw_query = query.strip()
+        from pipeline.text_processing.typo_normalizer import TypoNormalizer
+        raw_query = TypoNormalizer.get_instance().normalize(query.strip())
         filters: Dict[str, Any] = {}
         spans_to_remove: List[Tuple[int, int]] = []
         extracted_spans: Dict[str, str] = {}

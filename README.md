@@ -4,24 +4,21 @@ A zero-egress Retrieval-Augmented Generation (RAG) system for IISc. Theses and p
 
 📖 More detail: [PROJECT_PROGRESS_AND_ARCHITECTURE.md](PROJECT_PROGRESS_AND_ARCHITECTURE.md) (design, benchmarks) · [OPTIMIZATION_GUIDE.md](OPTIMIZATION_GUIDE.md) (CPU SLM tuning)
 
-**Contents:** [Architecture](#1-architecture) · [Prerequisites](#2-prerequisites) · [Setup](#3-setup) · [Redis](#4-redis-stack) · [Build the Index](#5-build-the-vector-index) · [CPU SLM](#6-cpu-slm-tier-qwen-25-3b) · [GPU LLM](#7-gpu-llm-tier-vllm) · [Router](#8-complexity-router) · [Gateway](#9-gateway) · [Web App & OTP](#10-web-app--email-otp-sign-in) · [Tests](#11-tests--evaluation) · [Docker](#12-docker-compose) · [Reference](#13-reference) · [Troubleshooting](#14-troubleshooting) · [Structure](#15-project-structure) · [Quick Start](#16-quick-start)
+**Contents:** [Architecture](#1-architecture) · [Prerequisites](#2-prerequisites) · [Setup](#3-setup) · [Redis](#4-redis-stack) · [Build the Index](#5-build-the-vector-index) · [CPU SLM](#6-cpu-slm-tier-qwen-25-3b) · [GPU LLM](#7-gpu-llm-tier-vllm) · [Router](#8-complexity-router) · [Gateway](#9-gateway) · [Web App & OTP](#10-web-app--email-otp-sign-in) · [Tests](#11-tests--evaluation) · [Production Stack](#12-production-stack-orchestration) · [Reference](#13-reference) · [Troubleshooting](#14-troubleshooting) · [Structure](#15-project-structure) · [Quick Start](#16-quick-start)
 
 ---
 
 ## 1. Architecture
 
 ```
- Browser ─► AskIISc Web App :9000 ── network gate · email OTP sign-in · session · chat UI
-                  │ POST /query (SSE)
-                  ▼
-            Gateway :8080 ── admission control · L0 exact + L1 semantic cache · MLP complexity router
-              easy (≤ α) │                         │ hard (> α)
-                         ▼                         ▼
-            CPU SLM :8082 (Qwen2.5-3B)      GPU LLM :8000 (vLLM, 7B)
-                         └──────────┬──────────────┘
-                                    ▼
-            Redis Stack :6379 ── index rag_documents_idx · HNSW · COSINE · 384-d
-                                    ▲
+ Browser ─► AskIISc Unified Gateway & Web UI :8080 ── session · CSRF · email OTP · admission · L0/L1 cache · router
+                   │ easy (≤ α)                       │ hard (> α)
+                   ▼                                  ▼
+      CPU SLM :8082 (Qwen2.5-3B)           GPU LLM :8000 (vLLM, 7B)
+                   └──────────────┬───────────────────┘
+                                  ▼
+        Redis Stack :6379 ── index rag_documents_idx · HNSW · COSINE · 384-d
+                                  ▲
  Ingestion: DSpace crawler ─► PyMuPDF ─► cleaner ─► chunker (512/64) ─► all-MiniLM-L6-v2 ─► Redis
 ```
 
@@ -39,11 +36,10 @@ A zero-egress Retrieval-Augmented Generation (RAG) system for IISc. Theses and p
 ## 2. Prerequisites
 
 **Software:**
-- Linux (Ubuntu 22.04 tested; macOS works for CPU-only development)
+- Linux (Ubuntu 22.04 tested; bare-metal host with zero container dependencies)
 - **Python 3.10–3.12** and Git
 - Optional:
-  - Docker + Compose v2, to run Redis
-  - NVIDIA driver + CUDA 12.x + nvidia-container-toolkit, for the GPU tier
+  - NVIDIA driver + CUDA 12.x, for the GPU tier
   - `tmux`, for long scraping runs
   - `jq`, to pretty-print JSON output
 
@@ -93,15 +89,9 @@ Load `.env` into your shell before running the crawler, ingest or dataset script
 
 ## 4. Redis Stack
 
-The code uses RediSearch (`FT.*` commands), so you need **Redis Stack**, not plain Redis. Pick one option.
+The code uses RediSearch (`FT.*` commands), so you need **Redis Stack**, not plain Redis. The system runs Redis as a native user-space binary without needing root or Docker.
 
-**A. Docker.** This also gives you the RedisInsight UI at <http://localhost:8001>. `make up`, `make down` and `make logs` manage the same container without a password.
-```bash
-docker run -d --name onprem-rag-redis -p 6379:6379 -p 8001:8001 -v redis_data:/data \
-  -e REDIS_ARGS="--requirepass <YOUR_REDIS_PASSWORD> --save 60 1 --appendonly yes" redis/redis-stack:7.2.0-v9
-```
-
-**B. User-space binary.** No sudo or Docker needed. Downloads for other OS builds are at <https://redis.io/downloads/>.
+**A. User-space binary.** Downloads for other OS builds are at <https://redis.io/downloads/>.
 ```bash
 wget https://packages.redis.io/redis-stack/redis-stack-server-7.2.0-v9.jammy.x86_64.tar.gz
 tar -xzf redis-stack-server-7.2.0-v9.jammy.x86_64.tar.gz && mv redis-stack-server-7.2.0-v9* redis-stack-server-7.2.0-v9
@@ -111,12 +101,12 @@ mkdir -p redis-stack-server-7.2.0-v9/var/db/redis-stack
 export REDISCLI_AUTH='<YOUR_REDIS_PASSWORD>' && redis-cli ping        # → PONG
 ```
 
-**C. Restore a pre-built snapshot (skip §5).** Snapshots are git-ignored. With Redis stopped, copy the snapshot to `redis-stack-server-7.2.0-v9/var/db/redis-stack/dump.rdb`. For Docker, copy it to `/data/dump.rdb` and remove `/data/appendonlydir` first. Then start Redis and wait for `loading:0`:
+**B. Restore a pre-built snapshot (skip §5).** Snapshots are git-ignored. With Redis stopped, copy the snapshot to `redis-stack-server-7.2.0-v9/var/db/redis-stack/dump.rdb`. Then start Redis and wait for `loading:0`:
 ```bash
 watch -n 1 "redis-cli info Persistence | grep -E 'loading:|loading_loaded_perc'"
 ```
 
-Stop Redis and free its RAM with `redis-cli shutdown nosave`, or `docker stop onprem-rag-redis`.
+Stop Redis and free its RAM with `make redis-down` or `redis-cli shutdown nosave`.
 
 ---
 
@@ -273,12 +263,12 @@ OTP_DEV_LOG=0
 ```bash
 ./app.sh start | stop | restart | status | logs | code      # PY=../.venv/bin/python ./app.sh start  to pick the interpreter
 ```
-Open <http://127.0.0.1:9000> and sign in. Add `?debug=1` to the URL to see routing details.
+Open <http://127.0.0.1:8080> (or <http://127.0.0.1:9000> if running standalone app.py) and sign in. Add `?debug=1` to the URL to see routing details.
 
 **To open it to campus:**
 - Set `BIND_HOST` to the server's intranet IP and add the campus ranges to `ALLOWED_CIDRS`.
 - Serve it over HTTPS behind nginx, with `COOKIE_SECURE=1` and `TRUSTED_PROXIES=<nginx IP>`.
-- Run a single process, because OTP state is held in memory.
+- Multi-worker concurrency is fully supported: OTP state, brute-force locks, and rate limits are backed by atomic Lua scripts in Redis.
 
 ---
 
@@ -293,17 +283,19 @@ make eval                     # alpha sweep + RAGAS (faithfulness, context recal
 
 ---
 
-## 12. Docker Compose
+## 12. Production Stack Orchestration
 
-[docker-compose.yml](docker-compose.yml) runs `redis`, `cpu-slm` (llama.cpp), `vllm` and `gateway` on the network `rag-internal`.
-- Inside the network, set `.env` to use service names: `REDIS_URL=redis://redis:6379/0`, `SLM_BASE_URL=http://cpu-slm:8080/v1`, `VLLM_BASE_URL=http://vllm:8000/v1`.
-- The CPU SLM needs a GGUF file at `models/slm_gguf/model.gguf`, e.g. from `Qwen/Qwen2.5-3B-Instruct-GGUF`, symlinked to that name.
-- The vLLM service needs the 7B weights in `models/llm_7b/`, started with `command: ["--model", "/models/llm_7b", "--max-model-len", "4096"]`.
+The entire production stack runs bare-metal without containerization using [`scripts/prod_stack.py`](scripts/prod_stack.py):
+- **Redis Stack (`port 6379`):** In-memory RediSearch vector database holding 2.26M document vectors.
+- **CPU SLM (`port 8082`):** Qwen 2.5 3B GGUF served across 6 parallel workers $\times$ 16 OpenMP threads.
+- **GPU LLM (`port 8000`):** Qwen 2.5 7B Instruct served directly on NVIDIA A100 GPU via vLLM.
+- **Institutional Gateway (`port 8080`):** Single-port perimeter with session authentication, CSRF protection, and embedded Two-Tower MLP Complexity Router.
 
 ```bash
-docker compose up -d --build                 # full stack   (CPU-only: docker compose up -d redis cpu-slm gateway)
-docker compose logs -f gateway
-docker compose down
+make prod-up         # Start full production stack
+make prod-status     # Health & process status dashboard
+make prod-restart    # Graceful reload with zero downtime
+make prod-down       # Clean shutdown (preserves Redis database)
 ```
 
 ---
@@ -312,22 +304,20 @@ docker compose down
 
 | Port | Service | Start with |
 |---|---|---|
-| 9000 | Web app (login + chat) | `./app.sh start` |
-| 8080 | Gateway | `make dev` |
-| 8082 | CPU SLM | `make serve-slm` |
-| 8000 | GPU LLM (vLLM) | `python -m vllm.entrypoints.openai.api_server …` |
-| 6379 / 8001 | Redis Stack / RedisInsight | Docker or `redis-stack-server` |
+| 8080 | Unified Gateway & Web UI | `make prod-up` or `make dev` |
+| 8082 | CPU SLM (6 workers) | `make serve-slm` |
+| 8000 | GPU LLM (vLLM) | `make serve-gpu` |
+| 6379 | Redis Stack Server | `make redis-up` |
 
 **Make targets:**
-- `setup`, `dev`, `serve-slm`
-- `up`, `down`, `logs` (Redis in Docker)
-- `redis-up`, `redis-down`, `redis-status` (Redis binary)
-- `ingest-pdfs`, `query Q=…`, `rag-answer Q=…`
-- `test`, `eval`, `clean`, `help`
+- `setup`, `dev`, `prod-up`, `prod-down`, `prod-status`, `prod-restart`
+- `redis-up`, `redis-down`, `redis-status`, `redis-watch`
+- `ingest-pdfs`, `query Q=…`, `ask Q=…`, `rag-answer Q=…`
+- `test`, `test-intensive`, `clean`, `help`
 
 **Remote server:** reach the services through an SSH tunnel.
 ```bash
-ssh -L 9000:localhost:9000 -L 8080:localhost:8080 -L 8001:localhost:8001 user@server
+ssh -L 8080:localhost:8080 -L 8082:localhost:8082 -L 8000:localhost:8000 user@server
 ```
 
 **Redis checks:**
@@ -374,7 +364,7 @@ Onprem-RAG-gateway/
 ├── tests/                 # unit and security tests
 ├── dataset_generator.py   # router dataset (Qwen2.5-72B via vLLM)
 ├── run_slurm.sh           # SLURM job for dataset generation
-├── docker-compose.yml · Dockerfile · Makefile · requirements.txt · .env.example
+├── Makefile · requirements.txt · .env.example
 └── PROJECT_PROGRESS_AND_ARCHITECTURE.md · OPTIMIZATION_GUIDE.md
 ```
 **Not in Git:**
@@ -390,11 +380,11 @@ Onprem-RAG-gateway/
 git clone https://github.com/rutujmanware/Onprem-RAG-gateway.git && cd Onprem-RAG-gateway
 make setup && source .venv/bin/activate && pip install accelerate "huggingface_hub[cli]"
 cp .env.example .env                                   # set REDIS_URL, SLM_MODEL_NAME, CPU_NUM_THREADS
-docker run -d --name onprem-rag-redis -p 6379:6379 -p 8001:8001 redis/redis-stack:7.2.0-v9
+make redis-up                                          # Starts native user-space Redis Stack daemon
 set -a && source .env && set +a
 python -m pipeline.crawlers.stream_dspace "https://etd.iisc.ac.in/handle/2005/1" --max 20
 make rag-answer Q="What methods are used to measure thermal conductivity of nanomaterials?"
 make serve-slm & make dev &                            # CPU SLM :8082, gateway :8080
 cd askiisc_chat && pip install -r requirements.txt && cp app.env.example app.env   # set SESSION_SECRET + SMTP_* (§10)
-./app.sh start                                         # http://127.0.0.1:9000 → sign in with your @iisc.ac.in email
+./app.sh start                                         # http://127.0.0.1:9000 (or visit unified http://127.0.0.1:8080)
 ```

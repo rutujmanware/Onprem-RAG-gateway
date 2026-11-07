@@ -842,8 +842,6 @@ onprem-rag-gateway/
 │   └── test_rate_limiting.py            # Token bucket admission limiter tests
 ├── .env.example                          # Sanitized environment variable template
 ├── .gitignore                            # Comprehensive git exclusion rules
-├── docker-compose.yml                    # Multi-container orchestration spec
-├── Dockerfile                            # Gateway container image definition
 ├── Makefile                              # Centralized operational automation targets
 ├── PROJECT_PROGRESS_AND_ARCHITECTURE.md  # Master engineering changelog & architecture log
 ├── README.md                             # Repository overview and quickstart guide

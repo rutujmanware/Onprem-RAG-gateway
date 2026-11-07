@@ -21,7 +21,7 @@ retrieval:
 
 cpu_affinity:
   workers: 6                                      # 6 parallel SLM workers
-  num_threads: 16                                 # 16 PyTorch threads per worker (4 x 16 = 64 CPU cores)
+  num_threads: 16                                 # 16 PyTorch threads per worker (6 x 16 = 96 threads across workers)
   num_threads_batch: 32                           # Prefill batch matrix multiplication thread allocation
   omp_wait_policy: "PASSIVE"
   numa_node: 0

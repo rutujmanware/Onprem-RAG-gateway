@@ -129,7 +129,10 @@ class RedisChunkRetriever:
         dynamic: Optional[bool] = None,
         enable_metadata_filter: Optional[bool] = None,
     ):
-        self.redis_url = redis_url or os.getenv("REDIS_URL", "redis://localhost:6379/0")
+        _redis_pw = os.getenv("REDIS_PASSWORD", "")
+        _pw_str = f":{_redis_pw}@" if _redis_pw else ""
+        _default_redis_url = f"redis://{_pw_str}{os.getenv('REDIS_HOST', 'localhost')}:{os.getenv('REDIS_PORT', '6379')}/0"
+        self.redis_url = redis_url or os.getenv("REDIS_URL") or _default_redis_url
         self.index_name = index_name or os.getenv("REDIS_INDEX_NAME", "rag_documents_idx")
         self.vector_dim = vector_dim
         # Force CPU device for embedding to avoid any GPU/CUDA context driver crashes
@@ -611,6 +614,9 @@ class RedisChunkRetriever:
         if not redis:
             raise RuntimeError("The 'redis' package is not installed. Run: pip install redis")
 
+        from pipeline.text_processing.typo_normalizer import TypoNormalizer
+        query = TypoNormalizer.get_instance().normalize(query)
+
         if top_k is not None:
             top_k = min(max(1, int(top_k)), 50)
         use_dynamic = self.dynamic if dynamic is None else dynamic
@@ -710,6 +716,9 @@ class RedisChunkRetriever:
         """Asynchronous retrieval with automated query metadata extraction & hybrid fallback."""
         if not aioredis:
             raise RuntimeError("The 'redis' package is not installed. Run: pip install redis")
+
+        from pipeline.text_processing.typo_normalizer import TypoNormalizer
+        query = TypoNormalizer.get_instance().normalize(query)
 
         if top_k is not None:
             top_k = min(max(1, int(top_k)), 50)
@@ -931,7 +940,7 @@ def main():
     parser.add_argument("--static", action="store_true", help="Disable dynamic filtering and retrieve static top-k")
     parser.add_argument("--no-meta-filter", action="store_true", help="Disable automated query metadata extraction")
     parser.add_argument("--index", default=os.getenv("REDIS_INDEX_NAME", "rag_documents_idx"), help="RediSearch index name")
-    parser.add_argument("--redis-url", default=os.getenv("REDIS_URL", "redis://localhost:6379/0"), help="Redis URL")
+    parser.add_argument("--redis-url", default=None, help="Redis URL (defaults to REDIS_URL or host/port/pw config)")
 
     args = parser.parse_args()
 

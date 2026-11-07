@@ -62,7 +62,6 @@ auth:
   enforce_domain: "iisc.ac.in"
   allowed_domains:
     - "@iisc.ac.in"
-    - "@gmail.com"
   allow_subdomains: true
   otp:
     code_length: 6
