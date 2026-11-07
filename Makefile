@@ -1,4 +1,4 @@
-.PHONY: help setup dev prod-up prod-down prod-status prod-restart chat-up chat-down chat-restart chat-status chat-logs chat-code test-smtp cache-stats cache-clear queue-stats redis-up redis-down redis-status redis-watch up down logs ingest-pdfs query ask rag-answer serve-slm serve-gpu serve-router generate-dataset eval load-test load-test-cold test test-intensive clean
+.PHONY: help setup download-models dev prod-up prod-down prod-status prod-restart chat-up chat-down chat-restart chat-status chat-logs chat-code test-smtp cache-stats cache-clear queue-stats redis-up redis-down redis-status redis-watch up down logs ingest-pdfs query ask rag-answer serve-slm serve-gpu serve-router generate-dataset eval load-test load-test-cold test test-intensive clean
 
 -include .env
 export
@@ -12,6 +12,7 @@ MODEL_7B_PATH ?= models/llm_7b/qwen2.5-7b-instruct
 help:
 	@echo "Available commands:"
 	@echo "  make setup          - Create virtualenv and install dependencies"
+	@echo "  make download-models - Download AI models to models/ (Embeddings, CPU SLM, GPU 7B)"
 	@echo "  make dev            - Run Gateway service locally on port 8080 with live reload"
 	@echo "  make prod-up        - Start production stack (Gateway 6 workers, CPU SLM 6x16, vLLM, Redis)"
 	@echo "  make prod-status    - Display status and health of all production services"
@@ -47,6 +48,9 @@ setup:
 	./$(VENV)/bin/pip install --upgrade pip
 	./$(VENV)/bin/pip install -r requirements.txt
 	@echo "Setup complete. Activate with: source $(VENV)/bin/activate"
+
+download-models:
+	$(PYTHON) scripts/download_models.py
 
 dev:
 	uvicorn gateway.main:app --host 0.0.0.0 --port 8080 --reload
@@ -158,7 +162,7 @@ eval:
 	$(PYTHON) scripts/eval_router_threshold.py
 
 load-test:
-	PYTHONPATH=. $(PYTHON) -m evaluation.benchmarks.load_test
+	PYTHONPATH=. $(PYTHON) -m scripts.load_test
 
 load-test-cold:
 	PYTHONPATH=. $(PYTHON) scripts/run_100_uncached_load_test.py

@@ -36,7 +36,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="AskIISc chat", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=STATIC), name="static")
 app.add_middleware(SessionMiddleware, secret_key=C.SESSION_SECRET or secrets.token_urlsafe(32),  # random per-start if unset: sessions die on restart
-                   https_only=C.COOKIE_SECURE, same_site="lax", max_age=C.SESSION_TTL, session_cookie="askiisc_session")
+                   https_only=C.COOKIE_SECURE, same_site="strict", max_age=C.SESSION_TTL, session_cookie="askiisc_session")
 
 @app.middleware("http")
 async def network_gate(request: Request, call_next):

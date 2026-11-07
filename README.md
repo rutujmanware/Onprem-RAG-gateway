@@ -29,6 +29,13 @@ You must activate the Python environment every time you open a new terminal befo
 source .venv/bin/activate
 ```
 
+### Download Required AI Models
+Automatically provision and download all required local offline models (Dense Embedder, 3B CPU SLM GGUF, and 7B GPU weights) into their designated locations under `models/`:
+```bash
+make download-models
+```
+*(You can also download specific models individually: `python scripts/download_models.py --embeddings`, `--slm`, or `--gpu-llm`).*
+
 ### Configure the Environment Variables
 1. Copy the template to create your local `.env` file:
    ```bash
@@ -128,7 +135,6 @@ onprem-rag-gateway/
 ├── configs/            # YAML configuration files (gateway, SLM, vLLM)
 ├── data/               # Vector features, augmentations, and historical archives
 ├── docs/               # Technical specs & CPU SLM optimization guides
-├── evaluation/         # Concurrency load testing benchmarks
 ├── gateway/            # FastAPI gateway, auth, cache, rate limits, and MLP router
 ├── logs/               # Application, cluster, and dataset generation logs
 ├── models/             # Local embedding models, 7B GPU weights, and 3B SLM GGUFs

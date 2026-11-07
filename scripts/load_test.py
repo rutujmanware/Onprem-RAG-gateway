@@ -30,7 +30,7 @@ import aiohttp
 import numpy as np
 import psutil
 
-ROOT_DIR = Path(__file__).resolve().parent.parent.parent
+ROOT_DIR = Path(__file__).resolve().parent.parent
 GATEWAY_URL = os.getenv("GATEWAY_URL", "http://127.0.0.1:8080")
 LOGS_DIR = ROOT_DIR / "logs"
 RESULTS_FILE = LOGS_DIR / "load_test_results.json"

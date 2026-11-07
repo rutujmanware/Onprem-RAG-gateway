@@ -169,7 +169,7 @@ Maintain this section as new features are developed:
 - [x] **Milestone 5:** CPU SLM optimization (streaming, 48-thread tuning, concise prompt budgeting).
 - [ ] **Milestone 6:** End-to-end Gateway integration test (connecting Gateway port 8080 to CPU SLM port 8082).
 - [ ] **Milestone 7:** Router classification training & threshold $\alpha$ optimization on `router_multichunk_training_dataset.jsonl`.
-- [ ] **Milestone 8:** Multi-user load testing (`evaluation/benchmarks/load_test.py`) proving GPU queue avoidance under 30+ concurrent campus users.
+- [ ] **Milestone 8:** Multi-user load testing (`scripts/load_test.py`) proving GPU queue avoidance under 30+ concurrent campus users.
 
 ---
 
@@ -309,7 +309,7 @@ curl -X POST http://localhost:8080/v1/chat/completions \
 
 - [x] **Milestone 6:** End-to-end Gateway integration test (connecting Gateway port 8080 to CPU SLM tier with hardcoded 7B deferred routing).
 - [x] **Milestone 7:** Router classification training & Two-Tower neural architecture on 102k balanced samples.
-- [ ] **Milestone 8:** Multi-user load testing (`evaluation/benchmarks/load_test.py`) proving GPU queue avoidance under 30+ concurrent campus users.
+- [ ] **Milestone 8:** Multi-user load testing (`scripts/load_test.py`) proving GPU queue avoidance under 30+ concurrent campus users.
 - [ ] **Milestone 9:** Dual-tier caching implementation (integrating L0 Exact Match & L1 Semantic Cache into the live gateway pipeline).
 
 
@@ -2057,7 +2057,7 @@ This dual-port setup exposed internal documentation and schemas to the campus ne
 ## 22. High-Concurrency Heavy Load Testing & CPU Architecture Scaling
 
 ### 22.1 Load Test Methodology & Baseline Bottlenecks
-We implemented an asynchronous benchmarking suite ([`evaluation/benchmarks/load_test.py`](evaluation/benchmarks/load_test.py)) evaluating the gateway under 5 distinct workload regimes across concurrency levels $C \in [1, 100]$:
+We implemented an asynchronous benchmarking suite ([`scripts/load_test.py`](scripts/load_test.py)) evaluating the gateway under 5 distinct workload regimes across concurrency levels $C \in [1, 100]$:
 1. **Semantic Cache Stress Test** ($C = 10, 25, 50, 100$)
 2. **CPU SLM Scaling** ($C = 1, 2, 4, 8$)
 3. **GPU vLLM Continuous Batching** ($C = 1, 4, 8, 16$)
@@ -2690,7 +2690,7 @@ sequenceDiagram
 ### 28.5 Comprehensive Concurrency Scaling & Extreme Cold Load Test Results
 
 Following the deployment of parallel fan-out and in-memory document slicing, two stress benchmarks were executed:
-1. **Multi-Scenario Concurrency Scaling Benchmark (`evaluation/benchmarks/load_test.py` - 948 requests):**
+1. **Multi-Scenario Concurrency Scaling Benchmark (`scripts/load_test.py` - 948 requests):**
    - **Mixed Campus Traffic (C=30 concurrent users, 100 requests):** Surged to **367.3 RPS** with a median latency of **45.8 ms** (a 16.9x speedup over the 21.67 RPS baseline) and **0 dropped requests (100% success)**.
    - **Pure Vector Cache Scaling (C=100 users, 400 requests):** Scaled up to **838.15 RPS** with median latency of **74.65 ms** (a 25.6x throughput increase).
    - **GPU vLLM Batching (C=16 users, 32 requests):** Reached **214.31 RPS** with median latency of **46.23 ms**.

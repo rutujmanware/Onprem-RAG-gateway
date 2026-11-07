@@ -16,6 +16,7 @@ transformers>=4.44.0
 accelerate>=0.30.0
 tokenizers>=0.19.0
 sentence-transformers>=3.0.0
+huggingface-hub>=0.20.0
 
 # --- Neural Complexity Router & Data Science ---
 numpy>=1.26.0
