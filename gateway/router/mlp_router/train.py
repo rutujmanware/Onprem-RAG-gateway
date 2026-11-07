@@ -72,7 +72,7 @@ def train():
     cache_path = os.path.join(BASE_DIR, "data/hybrid_query_features_102k.pt")
     if os.path.exists(cache_path):
         print(f"Loading precomputed hybrid features from {cache_path}...")
-        X = torch.load(cache_path, map_location="cpu").numpy()
+        X = torch.load(cache_path, map_location="cpu", weights_only=True).numpy()
     else:
         print("1/2: Generating dense text embeddings using all-MiniLM-L6-v2 on GPU...")
         local_model_path = os.path.join(BASE_DIR, "models/embeddings/all-MiniLM-L6-v2")
@@ -184,7 +184,7 @@ def train():
 
     # Load best checkpoint for final evaluation
     print(f"\nTraining Complete! Loading best checkpoint (Macro F1 = {best_val_f1:.4f}) for evaluation...")
-    net.load_state_dict(torch.load(best_model_paths[0], map_location=device))
+    net.load_state_dict(torch.load(best_model_paths[0], map_location=device, weights_only=True))
     net.eval()
 
     val_probs = []
