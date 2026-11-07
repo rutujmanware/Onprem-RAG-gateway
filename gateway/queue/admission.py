@@ -42,10 +42,8 @@ class TokenBucketLimiter:
         self._lock = asyncio.Lock()
 
     async def acquire(self, client_id: str, cost: float = 1.0) -> bool:
-        # Loopback and internal frontend proxy are exempted from per-IP rate limit
-        if client_id in ("127.0.0.1", "localhost", "internal", "::1"):
-            return True
-
+        # VULN-03 Fix: Rate limit every client/user account fairly.
+        # Do not allow unconditional rate limit bypass for loopback or web chat traffic.
         async with self._lock:
             now = time.time()
             if client_id not in self._tokens:

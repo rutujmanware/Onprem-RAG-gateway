@@ -105,6 +105,45 @@ def _key() -> bytes:
 class OtpStore:
     """Distributed OTP store backed by Redis (with fallback to in-memory for unit tests / single-process).
     Codes are stored strictly as HMAC-SHA256 hashes. Shared across all Gateway workers via Redis."""
+
+    LUA_VERIFY_SCRIPT = """
+local raw = redis.call('GET', KEYS[1])
+if not raw then
+    return -1
+end
+local status, data = pcall(cjson.decode, raw)
+if not status or type(data) ~= 'table' then
+    redis.call('DEL', KEYS[1])
+    return -1
+end
+local now = tonumber(ARGV[3])
+if now > tonumber(data['exp'] or 0) then
+    redis.call('DEL', KEYS[1])
+    return -2
+end
+
+local tries = tonumber(data['tries'] or 0) + 1
+data['tries'] = tries
+
+if ARGV[1] ~= '' and data['h'] == ARGV[1] then
+    redis.call('DEL', KEYS[1])
+    return 1
+end
+
+if tries >= tonumber(ARGV[2]) then
+    redis.call('DEL', KEYS[1])
+    return 0
+else
+    local ttl = redis.call('TTL', KEYS[1])
+    if ttl > 0 then
+        redis.call('SET', KEYS[1], cjson.encode(data), 'EX', ttl)
+    else
+        redis.call('DEL', KEYS[1])
+    end
+    return 0
+end
+"""
+
     def __init__(self, clock=time.time, redis_client=None):
         self.clock = clock
         self.rec = {}
@@ -118,8 +157,8 @@ class OtpStore:
         return hmac.new(_key(), f"{email}:{code}".encode(), hashlib.sha256).hexdigest()
 
     def _get_redis(self):
-        # When synthetic/mock clock is injected (e.g. in test suites), use in-memory store
-        if self.clock is not time.time:
+        # When synthetic/mock clock is injected without an explicit redis_client, use in-memory store
+        if self.clock is not time.time and self._redis is None:
             return None
         if not self._redis_checked:
             self._redis_checked = True
@@ -127,8 +166,13 @@ class OtpStore:
                 try:
                     import redis
                     redis_url = getattr(C, "REDIS_URL", None) or os.getenv("REDIS_URL")
-                    if not redis_url:
-                        pw = getattr(C, "REDIS_PASSWORD", None) or os.getenv("REDIS_PASSWORD")
+                    pw = getattr(C, "REDIS_PASSWORD", None) or os.getenv("REDIS_PASSWORD")
+                    if redis_url and pw and "@" not in redis_url:
+                        from urllib.parse import urlparse, urlunparse
+                        parsed = urlparse(redis_url)
+                        netloc = f":{pw}@{parsed.hostname}:{parsed.port or 6379}"
+                        redis_url = urlunparse((parsed.scheme, netloc, parsed.path, parsed.params, parsed.query, parsed.fragment))
+                    elif not redis_url:
                         pw_str = f":{pw}@" if pw else ""
                         host = os.getenv("REDIS_HOST", "localhost")
                         port = os.getenv("REDIS_PORT", "6379")
@@ -228,53 +272,82 @@ class OtpStore:
         with self.lock:
             self.rec.pop(email, None)
 
+    def check_verify_rate_limit(self, ip: str, email: str):
+        """Strict rate limit on OTP verification attempts: max 10 attempts per minute per IP, max 10 per email."""
+        r = self._get_redis()
+        now = self.clock()
+        if r is not None:
+            try:
+                # 1. IP rate limit: max 10 attempts per minute
+                r.zremrangebyscore(f"auth:rate:verify:ip:{ip}", 0, now - 60)
+                if r.zcard(f"auth:rate:verify:ip:{ip}") >= 10:
+                    raise RateLimited("Too many verification attempts from this IP address. Please wait 60 seconds.")
+
+                # 2. Email rate limit: max 10 attempts per minute
+                r.zremrangebyscore(f"auth:rate:verify:email:{email}", 0, now - 60)
+                if r.zcard(f"auth:rate:verify:email:{email}") >= 10:
+                    raise RateLimited("Too many verification attempts for this account. Please wait 60 seconds.")
+
+                token = f"{now}:{secrets.token_hex(4)}"
+                r.zadd(f"auth:rate:verify:ip:{ip}", {token: now})
+                r.expire(f"auth:rate:verify:ip:{ip}", 60)
+                r.zadd(f"auth:rate:verify:email:{email}", {token: now})
+                r.expire(f"auth:rate:verify:email:{email}", 60)
+                return
+            except RateLimited:
+                raise
+            except Exception as e:
+                logger.warning("Redis verify rate limit check failed, falling back to memory: %s", e)
+
+        # In-memory fallback
+        with self.lock:
+            recent_ip = [t for t in self.by_ip.get(f"v:{ip}", []) if now - t < 60]
+            if len(recent_ip) >= 10:
+                raise RateLimited("Too many verification attempts from this IP address. Please wait 60 seconds.")
+            recent_ip.append(now)
+            self.by_ip[f"v:{ip}"] = recent_ip
+
+            recent_em = [t for t in self.by_email.get(f"v:{email}", []) if now - t < 60]
+            if len(recent_em) >= 10:
+                raise RateLimited("Too many verification attempts for this account. Please wait 60 seconds.")
+            recent_em.append(now)
+            self.by_email[f"v:{email}"] = recent_em
+
     def verify(self, email: str, code: str) -> bool:
         r = self._get_redis()
         now = self.clock()
 
         if r is not None:
             try:
-                raw = r.get(f"auth:otp:{email}")
-                if not raw:
+                candidate_hash = self._h(email, code) if (code and re.fullmatch(r"\d{6}", code)) else ""
+                res = r.eval(self.LUA_VERIFY_SCRIPT, 1, f"auth:otp:{email}", candidate_hash, C.OTP_MAX_TRIES, now)
+                res = int(res)
+                if res == 1:
                     with self.lock:
                         self.rec.pop(email, None)
+                    return True
+                elif res == 0:
+                    with self.lock:
+                        if email in self.rec:
+                            self.rec[email]["tries"] = self.rec[email].get("tries", 0) + 1
+                            if self.rec[email]["tries"] >= C.OTP_MAX_TRIES:
+                                self.rec.pop(email, None)
                     return False
-                try:
-                    data = json.loads(raw)
-                except Exception:
-                    r.delete(f"auth:otp:{email}")
-                    with self.lock:
-                        self.rec.pop(email, None)
-                    return False
-
-                if now > data.get("exp", 0):
-                    r.delete(f"auth:otp:{email}")
-                    with self.lock:
-                        self.rec.pop(email, None)
-                    return False
-
-                data["tries"] = data.get("tries", 0) + 1
-                ok = bool(re.fullmatch(r"\d{6}", code or "")) and hmac.compare_digest(data["h"], self._h(email, code))
-                if ok or data["tries"] >= C.OTP_MAX_TRIES:
-                    r.delete(f"auth:otp:{email}")
-                    with self.lock:
-                        self.rec.pop(email, None)
                 else:
-                    remaining = max(1, int(data["exp"] - now))
-                    r.set(f"auth:otp:{email}", json.dumps(data), ex=remaining)
+                    # -1 (not found / corrupt) or -2 (expired)
                     with self.lock:
-                        self.rec[email] = data
-                return ok
+                        self.rec.pop(email, None)
+                    return False
             except Exception as e:
                 logger.warning("Redis verify failed, falling back to memory: %s", e)
 
-        # In-memory fallback
+        # In-memory fallback (thread-safe within single process via self.lock)
         with self.lock:
             rec = self.rec.get(email)
-            if not rec or now > rec["exp"]:
+            if not rec or now > rec.get("exp", 0):
                 self.rec.pop(email, None)
                 return False
-            rec["tries"] += 1
+            rec["tries"] = rec.get("tries", 0) + 1
             ok = bool(re.fullmatch(r"\d{6}", code or "")) and hmac.compare_digest(rec["h"], self._h(email, code))
             if ok or rec["tries"] >= C.OTP_MAX_TRIES:
                 self.rec.pop(email, None)

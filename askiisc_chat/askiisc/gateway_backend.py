@@ -42,7 +42,7 @@ def token_text(d: dict) -> str:
         if isinstance(v, str): return v
     return ""
 
-async def stream_via_gateway(query: str, tier: str):
+async def stream_via_gateway(query: str, tier: str, user_email: str = ""):
     """Async generator of SSE strings for the browser."""
     t0 = time.perf_counter(); st = {"route": None, "meta": False, "tokens": 0, "raw": 0}
 
@@ -80,11 +80,19 @@ async def stream_via_gateway(query: str, tier: str):
         return out
 
     try:
+        fwd_headers = {"X-Internal-User": user_email} if user_email else {}
         async with httpx.AsyncClient(timeout=httpx.Timeout(C.GATEWAY_TIMEOUT, connect=5)) as cl:
-            async with cl.stream("POST", f"{C.GATEWAY_URL}/query", json={"query": query, "stream": True, "max_tokens": C.MAX_TOKENS}) as r:
+            async with cl.stream("POST", f"{C.GATEWAY_URL}/query", json={"query": query, "stream": True, "max_tokens": C.MAX_TOKENS}, headers=fwd_headers) as r:
                 if r.status_code != 200:
-                    log.warning("gateway HTTP %s: %r", r.status_code, (await r.aread())[:200])
-                    yield sse("error", {"msg": f"The answering service returned an error (HTTP {r.status_code})."}); return
+                    raw_err = await r.aread()
+                    log.warning("gateway HTTP %s: %r", r.status_code, raw_err[:200])
+                    try:
+                        err_json = json.loads(raw_err)
+                        err_msg = err_json.get("detail") or err_json.get("error") or f"Error (HTTP {r.status_code})"
+                    except Exception:
+                        err_msg = f"The answering service returned an error (HTTP {r.status_code})."
+                    yield sse("error", {"msg": err_msg})
+                    return
                 if "event-stream" not in r.headers.get("content-type", ""):     # gateway answered with one JSON document instead of a stream
                     d = json.loads(await r.aread())
                     if C.GATEWAY_DEBUG: log.warning("gateway raw JSON: %s", json.dumps(d)[:300])

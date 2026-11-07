@@ -554,6 +554,8 @@ class RedisChunkRetriever:
         filter_dict: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
         """Run single KNN RediSearch vector query with optional metadata filter."""
+        # VULN-06: Defensive bound clamp on vector search k
+        k = min(max(1, int(k)), 50)
         query_vec = self.embedder.embed_query(text)
         vec_bytes = np.array(query_vec, dtype=np.float32).tobytes()
         base_filter = self._build_filter_expression(filter_dict)
@@ -576,7 +578,10 @@ class RedisChunkRetriever:
         filter_dict: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
         """Asynchronous single KNN RediSearch vector query with optional metadata filter."""
-        query_vec = self.embedder.embed_query(text)
+        # VULN-06: Defensive bound clamp on vector search k
+        k = min(max(1, int(k)), 50)
+        loop = asyncio.get_running_loop()
+        query_vec = await loop.run_in_executor(None, self.embedder.embed_query, text)
         vec_bytes = np.array(query_vec, dtype=np.float32).tobytes()
         base_filter = self._build_filter_expression(filter_dict)
         search_query = f"({base_filter})=>[KNN {k} @vector $vec EF_RUNTIME {self.ef_runtime} AS score]"
@@ -606,6 +611,8 @@ class RedisChunkRetriever:
         if not redis:
             raise RuntimeError("The 'redis' package is not installed. Run: pip install redis")
 
+        if top_k is not None:
+            top_k = min(max(1, int(top_k)), 50)
         use_dynamic = self.dynamic if dynamic is None else dynamic
         fetch_k = max(top_k or 0, 30) if use_dynamic else (top_k or 10)
         use_meta = self.enable_metadata_filter if enable_metadata_filter is None else enable_metadata_filter
@@ -704,6 +711,8 @@ class RedisChunkRetriever:
         if not aioredis:
             raise RuntimeError("The 'redis' package is not installed. Run: pip install redis")
 
+        if top_k is not None:
+            top_k = min(max(1, int(top_k)), 50)
         use_dynamic = self.dynamic if dynamic is None else dynamic
         fetch_k = max(top_k or 0, 30) if use_dynamic else (top_k or 10)
         use_meta = self.enable_metadata_filter if enable_metadata_filter is None else enable_metadata_filter

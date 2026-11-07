@@ -5,6 +5,7 @@ import os
 import sys
 import time
 import uuid
+import secrets
 from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional
 from pathlib import Path
@@ -38,6 +39,7 @@ from gateway.clients.cpu_slm_client import CPUSLMClient
 from gateway.clients.vllm_client import VLLMClient
 from pipeline.rag_chain import RAGQAPipeline
 from pipeline.retriever import sanitize_chunks
+from pipeline.sanitizer import sanitize_and_fence_prompt, PromptInjectionAlert
 
 logger = logging.getLogger("gateway.main")
 
@@ -86,14 +88,11 @@ def require_internal_or_auth(request: Request):
     xff = request.headers.get("x-forwarded-for")
 
     # Direct loopback without external forwarder
+    # Security note (VULN-01 fix): Never trust client-supplied X-Forwarded-For headers
+    # to authenticate loopback access (CWE-290). Only direct local socket connections
+    # without forwarding headers are permitted unauthenticated loopback access.
     if not xff and client_host in ("127.0.0.1", "::1", "localhost", "testclient"):
         return True
-
-    # If forwarded, check if the forwarded client IP is loopback
-    if xff:
-        client_ip = xff.split(",")[0].strip()
-        if client_ip in ("127.0.0.1", "::1", "localhost"):
-            return True
 
     # Allow authenticated web session
     if "session" in request.scope:
@@ -101,39 +100,61 @@ def require_internal_or_auth(request: Request):
         if user and user.get("exp", 0) > time.time():
             return True
 
-    # Allow admin API key
+    # Allow admin API key (VULN-08: constant-time comparison prevents timing side-channels)
     if ADMIN_KEY:
         auth_hdr = request.headers.get("X-Admin-Key") or request.headers.get("Authorization", "").replace("Bearer ", "").strip()
-        if auth_hdr == ADMIN_KEY:
+        if auth_hdr and secrets.compare_digest(auth_hdr, ADMIN_KEY):
             return True
 
     raise HTTPException(status_code=404, detail="Not Found")
 
+# Session Security (VULN-02 Remediation):
+# Enforce high-entropy cryptographic session secret. Never allow known weak or fallback keys.
+SESSION_SECRET = os.getenv("SESSION_SECRET", "").strip()
+KNOWN_INSECURE_SECRETS = {
+    "e7b4c91a3f8d2e5b6a7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a",
+    "CHANGE_ME",
+    "secret",
+    "test-secret",
+    "supersecret",
+}
+
+if not SESSION_SECRET or SESSION_SECRET in KNOWN_INSECURE_SECRETS or len(SESSION_SECRET) < 32:
+    if os.getenv("ENVIRONMENT", "").lower() in ("production", "prod"):
+        raise RuntimeError(
+            "FATAL: Insecure or missing SESSION_SECRET in production. "
+            "Generate a secure 256-bit key using: python3 -c 'import secrets; print(secrets.token_hex(32))'"
+        )
+    logger.warning(
+        "SESSION_SECRET is unset or uses an insecure default. Generating an ephemeral high-entropy random key."
+    )
+    SESSION_SECRET = secrets.token_hex(32)
+
 from starlette.middleware.sessions import SessionMiddleware
 app.add_middleware(
     SessionMiddleware,
-    secret_key=os.getenv("SESSION_SECRET", "e7b4c91a3f8d2e5b6a7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a"),
-    https_only=os.getenv("COOKIE_SECURE", "0") == "1",
-    same_site="lax",
+    secret_key=SESSION_SECRET,
+    https_only=os.getenv("COOKIE_SECURE", "1") == "1",
+    same_site="strict",
     max_age=int(os.getenv("SESSION_TTL", str(8 * 3600))),
     session_cookie="askiisc_session",
 )
 
 class ChatMessage(BaseModel):
-    role: str
-    content: str
+    role: str = Field(..., max_length=50)
+    content: str = Field(..., min_length=1, max_length=4000)
 
 class ChatCompletionRequest(BaseModel):
-    messages: List[ChatMessage]
-    temperature: Optional[float] = 0.2
-    max_tokens: Optional[int] = None
+    messages: List[ChatMessage] = Field(..., min_length=1, max_length=50)
+    temperature: Optional[float] = Field(default=0.2, ge=0.0, le=2.0)
+    max_tokens: Optional[int] = Field(default=None, ge=1, le=8192)
     stream: Optional[bool] = False
 
 class DirectQueryRequest(BaseModel):
-    query: str
-    top_k: Optional[int] = None
-    temperature: Optional[float] = 0.2
-    max_tokens: Optional[int] = 2048
+    query: str = Field(..., min_length=2, max_length=1500)
+    top_k: Optional[int] = Field(default=None, ge=1, le=50)
+    temperature: Optional[float] = Field(default=0.2, ge=0.0, le=2.0)
+    max_tokens: Optional[int] = Field(default=2048, ge=1, le=8192)
     stream: Optional[bool] = False
     bypass_cache: Optional[bool] = False
 
@@ -153,6 +174,23 @@ async def cache_stats(cache: RedisSemanticCache = Depends(get_semantic_cache)):
         "similarity_threshold": cache.similarity_threshold,
         "vector_dim": cache.vector_dim,
         "cached_queries_count": count,
+    }
+
+class CachePurgeRequest(BaseModel):
+    query: str = Field(..., min_length=2, max_length=1500)
+    threshold: Optional[float] = Field(default=0.85, ge=0.5, le=1.0)
+
+@app.post("/cache/purge", dependencies=[Depends(require_internal_or_auth)], include_in_schema=False)
+async def cache_purge_query(
+    req: CachePurgeRequest,
+    cache: RedisSemanticCache = Depends(get_semantic_cache),
+):
+    purged = await cache.apurge(req.query, threshold=req.threshold or 0.85)
+    return {
+        "status": "ok",
+        "purged_count": purged,
+        "query": req.query,
+        "threshold": req.threshold or 0.85,
     }
 
 @app.post("/cache/clear", dependencies=[Depends(require_internal_or_auth)], include_in_schema=False)
@@ -184,6 +222,14 @@ async def chat_completions(
         raise HTTPException(status_code=400, detail="Messages list cannot be empty")
 
     query = req.messages[-1].content.strip()
+    if not query or len(query) < 2:
+        raise HTTPException(status_code=400, detail="Query message must contain at least 2 non-whitespace characters")
+    # VULN-04: Validate prompt against adversarial injection & jailbreak patterns
+    try:
+        sanitize_and_fence_prompt(query)
+    except PromptInjectionAlert as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
     t0 = time.time()
 
     # Step 0: Semantic Vector Cache Lookup
@@ -273,6 +319,7 @@ async def chat_completions(
 
         def sse_chat_generator():
             full_ans = []
+            collected_chunks = []
             for event in rag.answer_query_stream(
                 query,
                 max_new_tokens=req.max_tokens,
@@ -293,6 +340,8 @@ async def chat_completions(
                         }],
                     }
                     yield f"data: {json.dumps(chunk)}\n\n"
+                elif event.get("type") == "chunks":
+                    collected_chunks = event.get("chunks", [])
                 elif event.get("type") == "done":
                     final_chunk = {
                         "id": cmpl_id,
@@ -307,11 +356,11 @@ async def chat_completions(
                     }
                     yield f"data: {json.dumps(final_chunk)}\n\n"
 
-            # Save generated completion to cache
+            # Save generated completion to cache only when document chunks were retrieved
             complete_text = "".join(full_ans)
-            if complete_text:
+            if complete_text and collected_chunks:
                 try:
-                    cache.store(query, {"answer": complete_text})
+                    cache.store(query, {"answer": complete_text, "chunks": collected_chunks})
                 except Exception:
                     pass
             yield "data: [DONE]\n\n"
@@ -420,7 +469,9 @@ async def chat_completions(
         temperature=req.temperature or 0.2,
     )
     ans_text = rag_res.get("answer", "")
-    await cache.astore(query, {"answer": ans_text, "chunks": rag_res.get("chunks", [])})
+    retrieved_chunks = rag_res.get("chunks", [])
+    if retrieved_chunks:
+        await cache.astore(query, {"answer": ans_text, "chunks": retrieved_chunks})
     return {
         "id": f"chatcmpl-slm-{uuid.uuid4().hex[:8]}",
         "object": "chat.completion",
@@ -456,11 +507,26 @@ async def query_endpoint(
     admission: AdmissionController = Depends(get_admission_controller),
 ):
     query = req.query.strip()
+    if len(query) < 2:
+        raise HTTPException(status_code=400, detail="Query must contain at least 2 non-whitespace characters")
+    # VULN-04: Validate prompt against adversarial injection & jailbreak patterns
+    try:
+        sanitize_and_fence_prompt(query)
+    except PromptInjectionAlert as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
     t0 = time.time()
 
     # Identify caller for token-bucket and queue accounting
-    client_id = request.client.host if request.client else "anonymous"
-    if "session" in request.scope:
+    client_host = request.client.host if request.client else ""
+    xff = request.headers.get("x-forwarded-for")
+    client_id = client_host or "anonymous"
+
+    # VULN-03: If forwarded by internal web chat proxy over direct loopback, attribute to the user
+    internal_user = request.headers.get("x-internal-user", "").strip()
+    if internal_user and client_host in ("127.0.0.1", "::1", "localhost", "testclient") and not xff:
+        client_id = internal_user
+    elif "session" in request.scope:
         u = request.session.get("user")
         if u and isinstance(u, dict) and u.get("email"):
             client_id = u["email"]
@@ -487,7 +553,7 @@ async def query_endpoint(
         if req.stream:
             def cached_stream():
                 # Yield cache hit notification event
-                yield f"data: {json.dumps({'type': 'cache', 'status': 'HIT', 'similarity': sim, 'matched_prompt': matched_prompt})}\n\n"
+                yield f"data: {json.dumps({'type': 'cache', 'status': 'HIT', 'similarity': sim, 'matched_prompt': matched_prompt, 'badge': 'Cached answer', 'cached_at': cached_resp.get('cached_at', time.time())})}\n\n"
                 # Yield route event
                 yield f"data: {json.dumps({'type': 'route', 'route': cached_resp.get('route', 'cached'), 'target_tier': 'semantic_cache', 'probability_hard': 0.0})}\n\n"
                 # Yield chunks event
@@ -518,6 +584,13 @@ async def query_endpoint(
             cached_resp["chunks"] = sanitize_chunks(cached_resp["chunks"])
         cached_resp["cached"] = True
         cached_resp["cache_hit"] = True
+        cached_resp["badge"] = "Cached answer"
+        cached_resp["provenance"] = {
+            "status": "cached",
+            "cached_at": cached_resp.get("cached_at", time.time()),
+            "similarity": sim,
+            "model_version": cached_resp.get("model_version", "institution-rag-v1"),
+        }
         cached_resp["similarity"] = sim
         cached_resp["matched_prompt"] = matched_prompt
         cached_resp["routing_time_seconds"] = round(time.time() - t0, 4)
@@ -550,7 +623,8 @@ async def query_endpoint(
                     yield f"data: {json.dumps(event)}\n\n"
 
                 full_text = "".join(collected_answer)
-                if full_text:
+                # Only cache responses when document chunks were successfully retrieved
+                if full_text and collected_chunks:
                     try:
                         cache_payload = {
                             "query": query,
@@ -640,8 +714,7 @@ async def query_endpoint(
                                 "routing_time_seconds": round(time.time() - t0, 4),
                             },
                         }
-                        if not req.bypass_cache:
-                            await cache.astore(query, res)
+                        # Do NOT cache fallback response when no documents were retrieved
                         return res
                     except Exception:
                         pass
@@ -684,7 +757,7 @@ async def query_endpoint(
                             "routing_time_seconds": round(time.time() - t0, 4),
                         },
                     }
-                    if not req.bypass_cache:
+                    if not req.bypass_cache and chunks:
                         await cache.astore(query, res)
                     return res
                 except Exception:
@@ -703,7 +776,7 @@ async def query_endpoint(
                 res["chunks"] = sanitize_chunks(res["chunks"])
             res["cached"] = False
             res["routing_time_seconds"] = round(time.time() - t0, 4)
-            if not req.bypass_cache:
+            if not req.bypass_cache and res.get("chunks"):
                 await cache.astore(query, res)
             return res
 
@@ -726,10 +799,9 @@ async def query_endpoint(
         res["score"] = round(score, 4)
         res["cached"] = False
         res["routing_time_seconds"] = round(time.time() - t0, 4)
-        if not req.bypass_cache:
+        if not req.bypass_cache and res.get("chunks"):
             await cache.astore(query, res)
         return res
-    return res
 
 
 # ---------------------------------------------------------------------------
@@ -758,10 +830,48 @@ if STATIC_DIR.exists():
         code: str = Field(max_length=16)
 
     class ChatRequest(BaseModel):
-        message: str
-        history: Optional[List[Dict[str, Any]]] = []
-        thesis_id: Optional[str] = None
-        force: Optional[str] = None
+        message: str = Field(..., min_length=1, max_length=1500)
+        history: Optional[List[Dict[str, Any]]] = Field(default=[], max_length=50)
+        thesis_id: Optional[str] = Field(default=None, max_length=100)
+        force: Optional[str] = Field(default=None, max_length=20)
+
+    CSRF_COOKIE_NAME = "csrftoken"
+    CSRF_HEADER_NAME = "x-csrf-token"
+
+    def generate_csrf_token() -> str:
+        return secrets.token_urlsafe(32)
+
+    def set_csrf_cookie(response: Any, token: str):
+        response.set_cookie(
+            key=CSRF_COOKIE_NAME,
+            value=token,
+            max_age=int(os.getenv("SESSION_TTL", str(8 * 3600))),
+            httponly=False,
+            samesite="strict",
+            secure=os.getenv("COOKIE_SECURE", "1") == "1",
+            path="/",
+        )
+
+    def verify_csrf_token(request: Request):
+        """Verify CSRF token for state-changing browser requests (Double Submit Cookie)."""
+        if request.method in ("GET", "HEAD", "OPTIONS"):
+            return
+        auth_header = request.headers.get("authorization", "")
+        if auth_header.startswith("Bearer "):
+            return
+
+        csrf_cookie = request.cookies.get(CSRF_COOKIE_NAME)
+        csrf_header = request.headers.get(CSRF_HEADER_NAME)
+
+        # If a valid session user is logged in or a csrf cookie was issued, require matching header
+        u = get_current_web_user(request)
+        if u or csrf_cookie:
+            if not csrf_cookie or not csrf_header or not secrets.compare_digest(csrf_cookie, csrf_header):
+                logger.warning("CSRF check failed: cookie=%s, header=%s", bool(csrf_cookie), bool(csrf_header))
+                raise HTTPException(
+                    status_code=403,
+                    detail="CSRF token missing or invalid. Please refresh the page.",
+                )
 
     def get_current_web_user(request: Request):
         u = request.session.get("user")
@@ -769,23 +879,31 @@ if STATIC_DIR.exists():
 
     @app.get("/", include_in_schema=False)
     @app.get("/index.html", include_in_schema=False)
-    async def serve_index():
-        return FileResponse(STATIC_DIR / "index.html")
+    async def serve_index(request: Request):
+        response = FileResponse(STATIC_DIR / "index.html")
+        csrf_token = request.cookies.get(CSRF_COOKIE_NAME) or generate_csrf_token()
+        set_csrf_cookie(response, csrf_token)
+        return response
 
     @app.get("/me", include_in_schema=False)
     async def me(request: Request):
         u = get_current_web_user(request)
-        return {
+        csrf_token = request.cookies.get(CSRF_COOKIE_NAME) or generate_csrf_token()
+        response = JSONResponse({
             "tier": "internal" if u else "public",
             "name": u.get("name") if u else None,
             "email": u.get("email") if u else None,
             "login_required": True,
             "auth_mode": "otp",
             "backend": "gateway",
-        }
+            "debug_enabled": os.getenv("DEBUG_UI", "0") == "1",
+            "csrf_token": csrf_token,
+        })
+        set_csrf_cookie(response, csrf_token)
+        return response
 
-    @app.post("/auth/otp/request", include_in_schema=False)
-    @app.post("/auth/otp/resend", include_in_schema=False)
+    @app.post("/auth/otp/request", dependencies=[Depends(verify_csrf_token)], include_in_schema=False)
+    @app.post("/auth/otp/resend", dependencies=[Depends(verify_csrf_token)], include_in_schema=False)
     async def otp_request(body: OtpReq, request: Request):
         try:
             email = auth.normalize_email(body.email)
@@ -814,12 +932,18 @@ if STATIC_DIR.exists():
             "resend_in": int(C.OTP_RESEND_SECS),
         }
 
-    @app.post("/auth/otp/verify", include_in_schema=False)
+    @app.post("/auth/otp/verify", dependencies=[Depends(verify_csrf_token)], include_in_schema=False)
     async def otp_verify(body: OtpVerify, request: Request):
         try:
             email = auth.normalize_email(body.email)
         except auth.AuthError:
             return JSONResponse({"error": "Invalid or expired code."}, status_code=401)
+        client_ip = auth.client_ip(request) or "127.0.0.1"
+        try:
+            auth.otp_store.check_verify_rate_limit(client_ip, email)
+        except auth.RateLimited as e:
+            return JSONResponse({"error": str(e)}, status_code=429)
+
         if not auth.otp_store.verify(email, body.code.strip()):
             return JSONResponse({"error": "Invalid or expired code."}, status_code=401)
         request.session.clear()
@@ -832,7 +956,7 @@ if STATIC_DIR.exists():
         }
         return {"ok": True}
 
-    @app.post("/auth/logout", include_in_schema=False)
+    @app.post("/auth/logout", dependencies=[Depends(verify_csrf_token)], include_in_schema=False)
     async def logout(request: Request):
         request.session.clear()
         return {"ok": True}
@@ -841,7 +965,7 @@ if STATIC_DIR.exists():
     async def theses():
         return []
 
-    @app.post("/chat", include_in_schema=False)
+    @app.post("/chat", dependencies=[Depends(verify_csrf_token)], include_in_schema=False)
     async def chat_frontend(req: ChatRequest, request: Request):
         u = get_current_web_user(request)
         if not u:
@@ -849,8 +973,17 @@ if STATIC_DIR.exists():
                 {"error": "Sign in with your IISc email to use AskIISc."},
                 status_code=401,
             )
+        # VULN-04: Validate prompt against adversarial injection & jailbreak patterns
+        try:
+            sanitize_and_fence_prompt(req.message)
+        except PromptInjectionAlert:
+            return JSONResponse(
+                {"error": "Adversarial prompt injection detected. Your query contains prohibited system override patterns."},
+                status_code=400,
+            )
+        user_email = u.get("email", "")
         return StreamingResponse(
-            stream_via_gateway(req.message, "internal"),
+            stream_via_gateway(req.message, "internal", user_email=user_email),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",

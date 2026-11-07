@@ -1,6 +1,8 @@
 import asyncio
+import pytest
 from gateway.cache.redis_semantic_cache import RedisSemanticCache
 
+@pytest.mark.asyncio
 async def test_semantic_cache():
     cache = RedisSemanticCache.get_instance()
     query = "What is the primary function of vermiculite in industry?"

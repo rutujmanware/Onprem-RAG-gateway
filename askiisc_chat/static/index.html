@@ -7,6 +7,7 @@
   <link rel="stylesheet" href="/static/vendor/katex.min.css">
   <script src="/static/vendor/katex.min.js"></script>
   <script src="/static/vendor/marked.min.js"></script>
+  <script src="/static/vendor/purify.min.js"></script>
   <style>
     :root {
       --bg: #fafaf8;
@@ -340,7 +341,58 @@
     const $ = s => document.querySelector(s);
     const log = $('#log');
     let history = [];
-    const DEBUG = new URLSearchParams(location.search).has('debug');
+    // Gated via server /me response; disabled in production to prevent information disclosure
+    let DEBUG = false;
+
+    // -------------------------------------------------------------------------
+    // CSRF Token Helper (Double-submit cookie pattern)
+    // -------------------------------------------------------------------------
+    function getCsrfToken() {
+      const match = document.cookie.match(/(?:^|;\s*)csrftoken=([^;]+)/);
+      return match ? decodeURIComponent(match[1]) : (window.__csrf_token || '');
+    }
+
+    // -------------------------------------------------------------------------
+    // HTML Sanitizer (Zero-dependency defense against stored & reflected XSS)
+    // -------------------------------------------------------------------------
+    function escapeHTML(str) {
+      return String(str || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    }
+
+    function sanitizeHTML(dirty) {
+      if (!dirty) return '';
+      const doc = new DOMParser().parseFromString(dirty, 'text/html');
+      const blockedTags = new Set([
+        'SCRIPT', 'STYLE', 'IFRAME', 'OBJECT', 'EMBED', 'BASE', 'META',
+        'FORM', 'INPUT', 'BUTTON', 'TEXTAREA', 'SELECT', 'SVG', 'LINK', 'APPLET'
+      ]);
+      const walker = doc.createTreeWalker(doc.body, NodeFilter.SHOW_ELEMENT);
+      const toRemove = [];
+      while (walker.nextNode()) {
+        const node = walker.currentNode;
+        if (blockedTags.has(node.tagName)) {
+          toRemove.push(node);
+          continue;
+        }
+        for (const attr of Array.from(node.attributes)) {
+          const name = attr.name.toLowerCase();
+          const val = attr.value.trim().toLowerCase();
+          // Strip inline event handlers
+          if (name.startsWith('on')) {
+            node.removeAttribute(attr.name);
+          }
+          // Strip dangerous pseudo-protocol URLs
+          if ((name === 'href' || name === 'src' || name === 'action') &&
+              (val.startsWith('javascript:') || val.startsWith('vbscript:') || val.startsWith('data:text/html'))) {
+            node.removeAttribute(attr.name);
+          }
+        }
+      }
+      for (const node of toRemove) {
+        node.remove();
+      }
+      return doc.body.innerHTML;
+    }
 
     // -------------------------------------------------------------------------
     // LaTeX & Markdown Formatter
@@ -408,6 +460,17 @@
           .replace(/\n/g, '<br>');
       }
 
+      // Step 3.5: Sanitize Markdown HTML output with DOMPurify (with robust native fallback)
+      if (window.DOMPurify && typeof window.DOMPurify.sanitize === 'function') {
+        html = window.DOMPurify.sanitize(html, {
+          USE_PROFILES: { html: true },
+          FORBID_TAGS: ['script', 'style', 'iframe', 'object', 'embed', 'base', 'meta', 'link', 'form', 'input'],
+          FORBID_ATTR: ['onerror', 'onload', 'onclick', 'onmouseover', 'onfocus', 'onblur']
+        });
+      } else {
+        html = sanitizeHTML(html);
+      }
+
       // Step 4: Restore KaTeX HTML Blocks
       html = html.replace(/%%MATH_BLOCK_(\d+)%%/g, (m, idx) => {
         return mathBlocks[Number(idx)] || '';
@@ -469,9 +532,12 @@
     }
 
     async function post(u, b) {
+      const headers = { 'Content-Type': 'application/json' };
+      const csrf = getCsrfToken();
+      if (csrf) headers['X-CSRF-Token'] = csrf;
       const r = await fetch(u, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: headers,
         body: JSON.stringify(b)
       });
       let d = {};
@@ -624,6 +690,8 @@
     });
 
     fetch('/me').then(r => r.json()).then(m => {
+      DEBUG = Boolean(m.debug_enabled);
+      window.__csrf_token = m.csrf_token || '';
       if (m.backend === 'gateway') {
         $('#thesis').parentElement.style.display = 'none';
         $('#force').parentElement.style.display = 'none';
@@ -633,11 +701,14 @@
         $('#who').textContent = 'Sign-in required';
       } else {
         showGate(false);
-        $('#who').innerHTML = m.email ? `Signed in: ${m.email} · <a href="#" id="lo">sign out</a>` : 'Open access';
+        $('#who').innerHTML = m.email ? `Signed in: ${escapeHTML(m.email)} · <a href="#" id="lo">sign out</a>` : 'Open access';
         const lo = $('#lo');
         if (lo) lo.onclick = async e => {
           e.preventDefault();
-          await fetch('/auth/logout', { method: 'POST' });
+          const csrf = getCsrfToken();
+          const headers = {};
+          if (csrf) headers['X-CSRF-Token'] = csrf;
+          await fetch('/auth/logout', { method: 'POST', headers: headers });
           location.reload();
         };
       }
@@ -701,9 +772,12 @@
       };
 
       try {
+        const headers = { 'Content-Type': 'application/json' };
+        const csrf = getCsrfToken();
+        if (csrf) headers['X-CSRF-Token'] = csrf;
         const r = await fetch('/chat', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: headers,
           body: JSON.stringify({
             message: q,
             history,
@@ -712,9 +786,15 @@
           })
         });
 
-        if (r.status === 401) {
-          body.textContent = 'Your session has expired. Please sign in again.';
-          showGate(true);
+        if (!r.ok) {
+          let errData = {};
+          try { errData = await r.json(); } catch (_) {}
+          const errMsg = errData.detail || errData.error || errData.msg || `Server error (HTTP ${r.status})`;
+          body.textContent = errMsg;
+          body.style.color = 'crimson';
+          if (r.status === 401) {
+            showGate(true);
+          }
           $('#go').disabled = false;
           return;
         }
@@ -738,7 +818,7 @@
             const { event: ev, data: d } = evObj;
 
             if (ev === 'meta') {
-              head.innerHTML = d.route ? `<span class="badge ${d.route}">${d.route === 'slm' ? 'SLM' : d.route === 'cache' ? 'Cached answer' : 'LLM'}</span>` : '';
+              head.innerHTML = d.route ? `<span class="badge ${escapeHTML(d.route)}">${d.route === 'slm' ? 'SLM' : d.route === 'cache' ? 'Cached answer' : 'LLM'}</span>` : '';
               if (DEBUG && d.s != null) head.innerHTML += `<span class="badge" style="color:var(--mut)">P(hard)=${d.s} / α=${d.alpha}</span>`;
               if (d.citations) showSources(d.citations);
             }
@@ -799,6 +879,9 @@
         if (text) {
           body.innerHTML = renderMathAndMarkdown(text);
           history.push({ role: 'user', content: q }, { role: 'assistant', content: text });
+          if (history.length > 20) {
+            history = history.slice(-20);
+          }
         }
       } catch (err) {
         body.textContent = 'Network connection error: ' + err;

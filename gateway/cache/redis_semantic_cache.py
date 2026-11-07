@@ -56,7 +56,7 @@ DEFAULT_REDIS_URL = os.getenv(
 DEFAULT_INDEX_NAME = os.getenv("REDIS_CACHE_INDEX_NAME", "semantic_cache_idx")
 DEFAULT_KEY_PREFIX = os.getenv("REDIS_CACHE_KEY_PREFIX", "semcache:")
 DEFAULT_SIMILARITY_THRESHOLD = float(os.getenv("SEMANTIC_CACHE_THRESHOLD", "0.90"))
-DEFAULT_TTL_SECONDS = int(os.getenv("SEMANTIC_CACHE_TTL", str(7 * 24 * 3600)))  # 7 days
+DEFAULT_TTL_SECONDS = int(os.getenv("SEMANTIC_CACHE_TTL", str(24 * 3600)))  # 24 hours (86,400s)
 
 
 class RedisSemanticCache:
@@ -112,6 +112,17 @@ class RedisSemanticCache:
 
     @property
     def async_client(self) -> aioredis.Redis:
+        current_loop = None
+        try:
+            import asyncio
+            current_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+
+        if self._async_redis is not None and current_loop is not None:
+            if getattr(self, "_async_redis_loop", None) is not current_loop:
+                self._async_redis = None
+
         if self._async_redis is None:
             if not aioredis:
                 raise RuntimeError("Package 'redis.asyncio' is not installed.")
@@ -120,6 +131,7 @@ class RedisSemanticCache:
                 decode_responses=False,
                 socket_timeout=5.0,
             )
+            self._async_redis_loop = current_loop
         return self._async_redis
 
     def init_index(self) -> bool:
@@ -216,14 +228,23 @@ class RedisSemanticCache:
         "could not find any information",
         "information is not available",
         "retrieval failed",
+        # Fallback / unretrieved documents phrases
+        "no specific institutional repository",
+        "no institutional repository theses were found",
+        "no theses were found on this topic",
+        "based on general academic knowledge",
+        "based on general technical knowledge",
+        "no documents directly cover this topic",
+        "no relevant documents were found in the knowledge base",
+        "no specific institutional repository documents",
     )
 
     @classmethod
     def is_cacheable_response(cls, response: Any) -> Tuple[bool, str]:
         """Determine whether an answer payload should be saved to or retrieved from cache.
 
-        Refusals, insufficient data notices, retrieval failures, and empty answers
-        must NOT be cached to avoid poisoning future queries and blocking newly ingested data.
+        Refusals, insufficient data notices, retrieval failures, zero retrieved documents/chunks,
+        and empty answers must NOT be cached to avoid poisoning future queries and blocking newly ingested data.
         """
         if not response:
             return False, "Empty response payload"
@@ -231,6 +252,18 @@ class RedisSemanticCache:
         if isinstance(response, dict):
             if response.get("error"):
                 return False, f"Response contains error: {response.get('error')}"
+
+            # Document retrieval verification: if chunks key is present, verify at least one chunk exists
+            chunks = response.get("chunks")
+            if chunks is not None and len(chunks) == 0:
+                return False, "No document chunks were retrieved from knowledge base"
+
+            if response.get("num_chunks") == 0:
+                return False, "Zero document chunks retrieved from knowledge base"
+
+            if "citations" in response and len(response.get("citations") or []) == 0:
+                return False, "Zero document citations retrieved from knowledge base"
+
             ans = str(response.get("answer") or response.get("content") or "").strip()
         elif isinstance(response, str):
             ans = response.strip()
@@ -243,7 +276,7 @@ class RedisSemanticCache:
         ans_lower = ans.lower()
         for phrase in cls.INSUFFICIENT_DATA_PHRASES:
             if phrase in ans_lower:
-                return False, f"Response indicates insufficient data / refusal: '{phrase}'"
+                return False, f"Response indicates insufficient data / unretrieved documents: '{phrase}'"
 
         return True, "Cacheable"
 
@@ -263,13 +296,22 @@ class RedisSemanticCache:
             raw_exact = self.sync_client.get(exact_key)
             if raw_exact:
                 exact_data = json.loads(raw_exact.decode("utf-8") if isinstance(raw_exact, bytes) else raw_exact)
-                return {
-                    "cached": True,
-                    "similarity": 1.0,
-                    "matched_prompt": exact_data.get("prompt", query),
-                    "response": exact_data.get("response", {}),
-                    "fast_exact": True,
-                }
+                exact_resp = exact_data.get("response", {})
+                cacheable, cache_reason = self.is_cacheable_response(exact_resp)
+                if not cacheable:
+                    logger.info("Exact match found but rejected as uncacheable: %s", cache_reason)
+                    try:
+                        self.sync_client.delete(exact_key)
+                    except Exception:
+                        pass
+                else:
+                    return {
+                        "cached": True,
+                        "similarity": 1.0,
+                        "matched_prompt": exact_data.get("prompt", query),
+                        "response": exact_resp,
+                        "fast_exact": True,
+                    }
         except Exception:
             pass
 
@@ -341,13 +383,22 @@ class RedisSemanticCache:
             raw_exact = await self.async_client.get(exact_key)
             if raw_exact:
                 exact_data = json.loads(raw_exact.decode("utf-8") if isinstance(raw_exact, bytes) else raw_exact)
-                return {
-                    "cached": True,
-                    "similarity": 1.0,
-                    "matched_prompt": exact_data.get("prompt", query),
-                    "response": exact_data.get("response", {}),
-                    "fast_exact": True,
-                }
+                exact_resp = exact_data.get("response", {})
+                cacheable, cache_reason = self.is_cacheable_response(exact_resp)
+                if not cacheable:
+                    logger.info("Async exact match found but rejected as uncacheable: %s", cache_reason)
+                    try:
+                        await self.async_client.delete(exact_key)
+                    except Exception:
+                        pass
+                else:
+                    return {
+                        "cached": True,
+                        "similarity": 1.0,
+                        "matched_prompt": exact_data.get("prompt", query),
+                        "response": exact_resp,
+                        "fast_exact": True,
+                    }
         except Exception:
             pass
 
@@ -418,6 +469,10 @@ class RedisSemanticCache:
             logger.info("Semantic cache STORE bypassed for query '%s': %s", query, cache_reason)
             return False
 
+        if isinstance(response, dict):
+            response.setdefault("cached_at", time.time())
+            response.setdefault("model_version", response.get("target_tier", "institution-rag-v1"))
+
         self.init_index()
         ttl = ttl_seconds or self.ttl_seconds
 
@@ -463,6 +518,10 @@ class RedisSemanticCache:
         if not cacheable:
             logger.info("Async semantic cache ASTORE bypassed for query '%s': %s", query, cache_reason)
             return False
+
+        if isinstance(response, dict):
+            response.setdefault("cached_at", time.time())
+            response.setdefault("model_version", response.get("target_tier", "institution-rag-v1"))
 
         await self.ainit_index()
         ttl = ttl_seconds or self.ttl_seconds
@@ -550,7 +609,7 @@ class RedisSemanticCache:
             return False
 
     def purge_uncacheable_entries(self) -> int:
-        """Scan all cached entries in Redis and delete any containing insufficient data or errors."""
+        """Scan all cached entries in Redis and delete any containing insufficient data, unretrieved docs, or errors."""
         purged = 0
         try:
             keys = self.sync_client.keys(f"{self.key_prefix}*")
@@ -558,17 +617,27 @@ class RedisSemanticCache:
                 try:
                     k_type = self.sync_client.type(k)
                     k_type_str = k_type.decode("utf-8") if isinstance(k_type, bytes) else str(k_type)
-                    if k_type_str != "hash":
-                        continue
-                    raw_resp = self.sync_client.hget(k, "response")
-                    if not raw_resp:
-                        continue
-                    resp_str = raw_resp.decode("utf-8", errors="replace") if isinstance(raw_resp, bytes) else str(raw_resp)
-                    resp_data = json.loads(resp_str)
-                    cacheable, _ = self.is_cacheable_response(resp_data)
-                    if not cacheable:
-                        self.sync_client.delete(k)
-                        purged += 1
+                    if k_type_str == "hash":
+                        raw_resp = self.sync_client.hget(k, "response")
+                        if not raw_resp:
+                            continue
+                        resp_str = raw_resp.decode("utf-8", errors="replace") if isinstance(raw_resp, bytes) else str(raw_resp)
+                        resp_data = json.loads(resp_str)
+                        cacheable, _ = self.is_cacheable_response(resp_data)
+                        if not cacheable:
+                            self.sync_client.delete(k)
+                            purged += 1
+                    elif k_type_str == "string":
+                        raw_val = self.sync_client.get(k)
+                        if not raw_val:
+                            continue
+                        val_str = raw_val.decode("utf-8", errors="replace") if isinstance(raw_val, bytes) else str(raw_val)
+                        val_data = json.loads(val_str)
+                        resp_data = val_data.get("response", {}) if isinstance(val_data, dict) else val_data
+                        cacheable, _ = self.is_cacheable_response(resp_data)
+                        if not cacheable:
+                            self.sync_client.delete(k)
+                            purged += 1
                 except Exception:
                     continue
             logger.info("Purged %d uncacheable / insufficient data entries from Redis.", purged)
@@ -585,23 +654,188 @@ class RedisSemanticCache:
                 try:
                     k_type = await self.async_client.type(k)
                     k_type_str = k_type.decode("utf-8") if isinstance(k_type, bytes) else str(k_type)
-                    if k_type_str != "hash":
-                        continue
-                    raw_resp = await self.async_client.hget(k, "response")
-                    if not raw_resp:
-                        continue
-                    resp_str = raw_resp.decode("utf-8", errors="replace") if isinstance(raw_resp, bytes) else str(raw_resp)
-                    resp_data = json.loads(resp_str)
-                    cacheable, _ = self.is_cacheable_response(resp_data)
-                    if not cacheable:
-                        await self.async_client.delete(k)
-                        purged += 1
+                    if k_type_str == "hash":
+                        raw_resp = await self.async_client.hget(k, "response")
+                        if not raw_resp:
+                            continue
+                        resp_str = raw_resp.decode("utf-8", errors="replace") if isinstance(raw_resp, bytes) else str(raw_resp)
+                        resp_data = json.loads(resp_str)
+                        cacheable, _ = self.is_cacheable_response(resp_data)
+                        if not cacheable:
+                            await self.async_client.delete(k)
+                            purged += 1
+                    elif k_type_str == "string":
+                        raw_val = await self.async_client.get(k)
+                        if not raw_val:
+                            continue
+                        val_str = raw_val.decode("utf-8", errors="replace") if isinstance(raw_val, bytes) else str(raw_val)
+                        val_data = json.loads(val_str)
+                        resp_data = val_data.get("response", {}) if isinstance(val_data, dict) else val_data
+                        cacheable, _ = self.is_cacheable_response(resp_data)
+                        if not cacheable:
+                            await self.async_client.delete(k)
+                            purged += 1
                 except Exception:
                     continue
             logger.info("Async purged %d uncacheable / insufficient data entries from Redis.", purged)
         except Exception as e:
             logger.warning("Error async purging uncacheable entries: %s", e)
         return purged
+
+    def purge(
+        self,
+        query: str,
+        threshold: float = 0.85,
+    ) -> int:
+        """Purge all semantic cache entries matching query with similarity >= threshold."""
+        self.init_index()
+        purged = 0
+        try:
+            norm_q = query.strip().lower()
+            q_hash = hashlib.sha256(norm_q.encode("utf-8")).hexdigest()
+            exact_key = f"{self.key_prefix}exact:{q_hash}"
+            if self.sync_client.delete(exact_key):
+                purged += 1
+
+            query_vec = self.embedder.embed_query(query)
+            vec_bytes = np.array(query_vec, dtype=np.float32).tobytes()
+
+            search_query = "*=>[KNN 50 @vector $vec AS score]"
+            res = self.sync_client.execute_command(
+                "FT.SEARCH", self.index_name,
+                search_query,
+                "PARAMS", "2", "vec", vec_bytes,
+                "SORTBY", "score", "ASC",
+                "RETURN", "3", "prompt", "response", "score",
+                "DIALECT", "2",
+            )
+
+            keys_to_delete = set()
+            if isinstance(res, dict):
+                results = res.get(b"results") or res.get("results") or []
+                for item in results:
+                    key_id = item.get(b"id") or item.get("id")
+                    extra = item.get(b"extra_attributes") or item.get("extra_attributes") or {}
+                    score_raw = extra.get(b"score") or extra.get("score")
+                    if key_id and score_raw is not None:
+                        similarity = 1.0 - float(score_raw)
+                        if similarity >= threshold:
+                            k_str = key_id.decode() if isinstance(key_id, bytes) else str(key_id)
+                            keys_to_delete.add(k_str)
+                            p_raw = extra.get(b"prompt") or extra.get("prompt")
+                            if p_raw:
+                                p_str = p_raw.decode("utf-8", errors="replace") if isinstance(p_raw, bytes) else str(p_raw)
+                                p_hash = hashlib.sha256(p_str.strip().lower().encode("utf-8")).hexdigest()
+                                ex_k = f"{self.key_prefix}exact:{p_hash}"
+                                keys_to_delete.add(ex_k)
+            elif isinstance(res, (list, tuple)) and len(res) >= 3:
+                for i in range(1, len(res), 2):
+                    key_id = res[i]
+                    fields_list = res[i + 1]
+                    fields = {}
+                    if isinstance(fields_list, (list, tuple)):
+                        for j in range(0, len(fields_list), 2):
+                            k = fields_list[j].decode() if isinstance(fields_list[j], bytes) else str(fields_list[j])
+                            v = fields_list[j + 1]
+                            fields[k] = v.decode() if isinstance(v, bytes) else str(v)
+                        score = float(fields.get("score", 1.0))
+                        similarity = 1.0 - score
+                        if similarity >= threshold:
+                            k_str = key_id.decode() if isinstance(key_id, bytes) else str(key_id)
+                            keys_to_delete.add(k_str)
+                            if "prompt" in fields:
+                                p_hash = hashlib.sha256(fields["prompt"].strip().lower().encode("utf-8")).hexdigest()
+                                ex_k = f"{self.key_prefix}exact:{p_hash}"
+                                keys_to_delete.add(ex_k)
+
+            if keys_to_delete:
+                del_count = self.sync_client.delete(*keys_to_delete)
+                purged += del_count
+
+            logger.info("Purged %d semantic cache entries for query '%s' at threshold >= %.2f", purged, query, threshold)
+            return purged
+        except Exception as e:
+            logger.warning("Error during semantic cache purge: %s", e)
+            return purged
+
+    async def apurge(
+        self,
+        query: str,
+        threshold: float = 0.85,
+    ) -> int:
+        """Asynchronously purge all semantic cache entries matching query with similarity >= threshold."""
+        await self.ainit_index()
+        purged = 0
+        try:
+            norm_q = query.strip().lower()
+            q_hash = hashlib.sha256(norm_q.encode("utf-8")).hexdigest()
+            exact_key = f"{self.key_prefix}exact:{q_hash}"
+            del_exact = await self.async_client.delete(exact_key)
+            if del_exact:
+                purged += 1
+
+            import asyncio
+            loop = asyncio.get_running_loop()
+            query_vec = await loop.run_in_executor(None, self.embedder.embed_query, query)
+            vec_bytes = np.array(query_vec, dtype=np.float32).tobytes()
+
+            search_query = "*=>[KNN 50 @vector $vec AS score]"
+            res = await self.async_client.execute_command(
+                "FT.SEARCH", self.index_name,
+                search_query,
+                "PARAMS", "2", "vec", vec_bytes,
+                "SORTBY", "score", "ASC",
+                "RETURN", "3", "prompt", "response", "score",
+                "DIALECT", "2",
+            )
+
+            keys_to_delete = set()
+            if isinstance(res, dict):
+                results = res.get(b"results") or res.get("results") or []
+                for item in results:
+                    key_id = item.get(b"id") or item.get("id")
+                    extra = item.get(b"extra_attributes") or item.get("extra_attributes") or {}
+                    score_raw = extra.get(b"score") or extra.get("score")
+                    if key_id and score_raw is not None:
+                        similarity = 1.0 - float(score_raw)
+                        if similarity >= threshold:
+                            k_str = key_id.decode() if isinstance(key_id, bytes) else str(key_id)
+                            keys_to_delete.add(k_str)
+                            p_raw = extra.get(b"prompt") or extra.get("prompt")
+                            if p_raw:
+                                p_str = p_raw.decode("utf-8", errors="replace") if isinstance(p_raw, bytes) else str(p_raw)
+                                p_hash = hashlib.sha256(p_str.strip().lower().encode("utf-8")).hexdigest()
+                                ex_k = f"{self.key_prefix}exact:{p_hash}"
+                                keys_to_delete.add(ex_k)
+            elif isinstance(res, (list, tuple)) and len(res) >= 3:
+                for i in range(1, len(res), 2):
+                    key_id = res[i]
+                    fields_list = res[i + 1]
+                    fields = {}
+                    if isinstance(fields_list, (list, tuple)):
+                        for j in range(0, len(fields_list), 2):
+                            k = fields_list[j].decode() if isinstance(fields_list[j], bytes) else str(fields_list[j])
+                            v = fields_list[j + 1]
+                            fields[k] = v.decode() if isinstance(v, bytes) else str(v)
+                        score = float(fields.get("score", 1.0))
+                        similarity = 1.0 - score
+                        if similarity >= threshold:
+                            k_str = key_id.decode() if isinstance(key_id, bytes) else str(key_id)
+                            keys_to_delete.add(k_str)
+                            if "prompt" in fields:
+                                p_hash = hashlib.sha256(fields["prompt"].strip().lower().encode("utf-8")).hexdigest()
+                                ex_k = f"{self.key_prefix}exact:{p_hash}"
+                                keys_to_delete.add(ex_k)
+
+            if keys_to_delete:
+                del_count = await self.async_client.delete(*keys_to_delete)
+                purged += del_count
+
+            logger.info("Async purged %d semantic cache entries for query '%s' at threshold >= %.2f", purged, query, threshold)
+            return purged
+        except Exception as e:
+            logger.warning("Error during async semantic cache purge: %s", e)
+            return purged
 
     @staticmethod
     def _extract_match_from_ft_search(res: Any) -> Optional[Tuple[float, str, str]]:
