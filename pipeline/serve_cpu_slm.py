@@ -226,7 +226,7 @@ def main():
     parser = argparse.ArgumentParser(description="Start CPU SLM API Server")
     parser.add_argument("--host", default=os.getenv("SLM_SERVER_HOST", "127.0.0.1"), help="Host to bind (default: 127.0.0.1 - localhost only for security)")
     parser.add_argument("--port", type=int, default=8082, help="Port to listen (default: 8082)")
-    parser.add_argument("--workers", type=int, default=int(os.getenv("SLM_WORKERS", "4")), help="Worker processes")
+    parser.add_argument("--workers", type=int, default=int(os.getenv("SLM_WORKERS", "6")), help="Worker processes")
     parser.add_argument("--threads", type=int, default=int(os.getenv("CPU_NUM_THREADS", "16")), help="CPU threads per worker")
     args = parser.parse_args()
 

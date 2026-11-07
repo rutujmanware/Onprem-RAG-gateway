@@ -128,7 +128,7 @@ onprem-rag-gateway/
 ├── configs/            # YAML configuration files (gateway, SLM, vLLM)
 ├── data/               # Vector features, augmentations, and historical archives
 ├── docs/               # Technical specs & CPU SLM optimization guides
-├── evaluation/         # Benchmark suites, golden datasets, and evaluation judges
+├── evaluation/         # Concurrency load testing benchmarks
 ├── gateway/            # FastAPI gateway, auth, cache, rate limits, and MLP router
 ├── logs/               # Application, cluster, and dataset generation logs
 ├── models/             # Local embedding models, 7B GPU weights, and 3B SLM GGUFs

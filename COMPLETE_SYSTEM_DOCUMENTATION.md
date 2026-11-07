@@ -116,7 +116,7 @@ sequenceDiagram
 | :--- | :---: | :---: | :--- | :--- |
 | **Unified Campus Gateway** | `8080` | `0.0.0.0` | **Public Facing (Intranet)**; Session Cookies, CSRF, Rate Limiting | FastAPI, Uvicorn (6 workers) |
 | **Redis Stack Server** | `6379` | `127.0.0.1` | **Loopback Only**; Password Protected (`REDIS_PASSWORD`) | RediSearch + RedisJSON + HNSW |
-| **CPU SLM Daemon** | `8082` | `127.0.0.1` | **Loopback Only**; Internal microservice | FastAPI, `llama.cpp` (4 workers x 16 threads) |
+| **CPU SLM Daemon** | `8082` | `127.0.0.1` | **Loopback Only**; Internal microservice | FastAPI, `llama.cpp` (6 workers x 16 threads) |
 | **vLLM GPU Engine** | `8000` | `127.0.0.1` | **Loopback Only**; Internal microservice | vLLM OpenAI API Server, CUDA 12.1 |
 
 ---
@@ -272,7 +272,7 @@ Refined prompt rules in [`pipeline/slm_runner.py`](file:///data2/home/ritujmanwa
 Implemented in [`pipeline/serve_cpu_slm.py`](file:///data2/home/ritujmanware/onprem-rag-gateway/pipeline/serve_cpu_slm.py) and [`pipeline/slm_runner.py`](file:///data2/home/ritujmanware/onprem-rag-gateway/pipeline/slm_runner.py):
 - **Model:** `Qwen2.5-3B-Instruct` in 4-bit INT4 quantization (`qwen2.5-3b-instruct-q4_k_m.gguf`, 2.0 GB).
 - **Backend:** `llama-cpp-python` compiled with native AVX-512 acceleration.
-- **Concurrency:** 4 Uvicorn workers, each with 16 decode threads and 32 batch threads.
+- **Concurrency:** 6 Uvicorn workers, each with 16 decode threads and 32 batch threads.
 - **Memory Footprint:** ~2.5 GB RAM total (shared mmap weights).
 - **Performance:** 18 – 24 tokens/sec on modern server CPUs.
 

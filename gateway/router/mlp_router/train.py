@@ -219,28 +219,5 @@ def train():
         gpu_egress = np.mean(t_preds == 1) * 100
         print(f" {t:.2f}  |  {t_acc:.2f}%  |  {t_f1:.4f}  |   {easy_rec:.1f}%    |   {hard_rec:.1f}%    |   {gpu_egress:.1f}%")
 
-    # Evaluate on Golden Eval Set
-    golden_path = os.path.join(BASE_DIR, "evaluation/datasets/golden_eval_set.json")
-    if os.path.exists(golden_path):
-        print("\n" + "="*50)
-        print("EVALUATION ON GOLDEN BENCHMARK SET:")
-        print("="*50)
-        with open(golden_path, "r", encoding="utf-8") as f:
-            golden_data = json.load(f)
-        
-        embedder = SentenceTransformer(local_model_path if os.path.exists(local_model_path) else "all-MiniLM-L6-v2", device=device)
-        for sample in golden_data:
-            q = sample["query"]
-            emb = embedder.encode(q, normalize_embeddings=True)
-            feat = extract_hybrid_features(q, emb)
-            with torch.no_grad():
-                inp = torch.FloatTensor(feat).unsqueeze(0).to(device)
-                logit = net(inp)
-                prob = torch.sigmoid(logit).item()
-            tier = "GPU vLLM" if prob >= 0.5 else "CPU SLM"
-            expected = sample.get("expected_tier", "unknown")
-            print(f"Query: \"{q[:65]}...\"")
-            print(f"  -> Predicted Prob(Hard): {prob:.4f} | Route: {tier} | Expected: {expected}")
-
 if __name__ == "__main__":
     train()

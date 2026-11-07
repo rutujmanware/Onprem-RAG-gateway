@@ -1,46 +1,76 @@
+# ==============================================================================
+# AskIISc On-Premise Institutional RAG Gateway Configuration
+# ==============================================================================
+
 gateway:
   host: "0.0.0.0"
   port: 8080
-  workers: 4
+  workers: 6
   timeout_seconds: 60.0
 
 routing:
-  alpha: 0.65
+  alpha: 0.65                                      # MLP Decision threshold: P(Hard) >= 0.65 -> GPU 7B, else CPU 3B
   fallback_to_cpu_on_gpu_saturation: true
   complexity_model_path: "gateway/router/models/scorer.onnx"
   embedding_dimension: 384
+  embedding_model: "sentence-transformers/all-MiniLM-L6-v2"
 
 admission:
-  global_concurrency_limit: 30
-  per_user_concurrency_limit: 4
-  max_queue_depth: 100
-  queue_wait_timeout_seconds: 15.0
+  global_concurrency_limit: 30                    # Total simultaneous active inferences across all workers
+  per_user_concurrency_limit: 6                   # Max concurrent in-flight requests per individual user account
+  max_queue_depth: 120                            # Max waiting queue depth before 503 shedding
+  queue_wait_timeout_seconds: 30.0                # Max wait time in queue before 503 timeout
   scheduling_policy: "fair_round_robin"
 
 rate_limiting:
   enabled: true
   token_bucket:
-    capacity: 20
-    refill_rate: 5.0
-    burst_limit: 10
+    capacity: 60.0                                # Max burst token bucket capacity per user
+    refill_rate: 20.0                             # Tokens refilled per second
+  otp_verification:
+    max_attempts_per_minute_ip: 10                # Max OTP verify attempts per minute per IP (429 on breach)
+    max_attempts_per_minute_email: 10             # Max OTP verify attempts per minute per email
 
 cache:
-  l0_exact:
-    enabled: true
-    ttl_seconds: 3600
-    hash_algorithm: "sha256"
-  l1_semantic:
-    enabled: true
-    similarity_threshold: 0.88
-    vector_dimension: 384
-    ttl_seconds: 7200
-    index_name: "l1_semantic_cache_idx"
+  enabled: true
+  similarity_threshold: 0.90                    # Cosine distance <= 0.10 (similarity >= 0.90)
+  vector_dimension: 384
+  ttl_seconds: 86400                            # 24 hours semantic cache TTL (86,400s)
+  index_name: "semantic_cache_idx"              # RediSearch HNSW Cosine Vector Index
+  key_prefix: "semcache:"
+  policy:
+    disallow_unretrieved_caching: true          # Never cache responses with zero retrieved chunks
+    disallow_insufficient_data_caching: true    # Never cache refusals / out-of-domain conversational queries
+    purge_uncacheable_on_startup: true
+
+security:
+  session:
+    cookie_name: "askiisc_session"
+    samesite: "strict"                            # Enforce SameSite=Strict on session cookies
+    httponly: true
+    min_secret_entropy_bits: 256
+  csrf:
+    cookie_name: "csrftoken"
+    header_name: "X-CSRF-Token"
+    double_submit: true
+  api_docs:
+    enabled: false                                # /docs, /redoc, /openapi.json disabled (returns 404 in production)
+  prompt_injection_fence:
+    enabled: true                                 # NFR-7 injection pattern detection and XML delimiter fencing
 
 auth:
   enforce_domain: "iisc.ac.in"
+  allowed_domains:
+    - "@iisc.ac.in"
+    - "@gmail.com"
   allow_subdomains: true
+  otp:
+    code_length: 6
+    cooldown_seconds: 60
+    ttl_seconds: 600
+    atomic_burn_lua: true                         # Prevents TOCTOU concurrency race conditions
   bypass_endpoints:
-    - "/healthz"
-    - "/metrics"
-    - "/docs"
-    - "/openapi.json"
+    - "/health"
+    - "/"
+    - "/index.html"
+    - "/me"

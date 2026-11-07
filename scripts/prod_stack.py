@@ -170,13 +170,13 @@ def start_all():
     slm_st, _ = check_port_health(SLM_PORT, "/healthz")
     if slm_st != "READY":
         if not is_pid_running(pids.get("slm", 0)):
-            print(f"⚡ Starting CPU SLM Server on port {SLM_PORT} (Qwen 2.5 3B GGUF with 4 parallel workers)...")
+            print(f"⚡ Starting CPU SLM Server on port {SLM_PORT} (Qwen 2.5 3B GGUF with 6 parallel workers)...")
             slm_cmd = [
                 PYTHON_BIN, "-m", "pipeline.serve_cpu_slm",
                 "--host", "127.0.0.1",
                 "--port", str(SLM_PORT),
                 "--threads", "16",
-                "--workers", "4",
+                "--workers", "6",
             ]
             pid = start_service("slm", slm_cmd)
             pids["slm"] = pid

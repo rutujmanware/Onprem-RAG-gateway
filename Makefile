@@ -13,7 +13,7 @@ help:
 	@echo "Available commands:"
 	@echo "  make setup          - Create virtualenv and install dependencies"
 	@echo "  make dev            - Run Gateway service locally on port 8080 with live reload"
-	@echo "  make prod-up        - Start production stack (Gateway 6 workers, CPU SLM 4x16, vLLM, Redis)"
+	@echo "  make prod-up        - Start production stack (Gateway 6 workers, CPU SLM 6x16, vLLM, Redis)"
 	@echo "  make prod-status    - Display status and health of all production services"
 	@echo "  make prod-restart   - Restart production stack with optimized high-concurrency settings"
 	@echo "  make prod-down      - Gracefully terminate all background services (preserves Redis data)"
@@ -32,11 +32,11 @@ help:
 	@echo "  make query Q=\"...\"  - Perform semantic search query against the Redis vector index"
 	@echo "  make ask Q=\"...\"    - Query the running Gateway with clean formatted answer output"
 	@echo "  make rag-answer Q=\"...\" - Answer query using retrieved context + dual-tier routing"
-	@echo "  make serve-slm      - Start Qwen 2.5 3B CPU SLM server (4 workers x 16 threads = 64 cores)"
+	@echo "  make serve-slm      - Start Qwen 2.5 3B CPU SLM server (6 workers x 16 threads = 96 cores)"
 	@echo "  make serve-gpu      - Start Qwen 2.5 7B GPU LLM server on port 8000"
 	@echo "  make serve-router   - Start MLP Router microservice on port 8090"
 	@echo "  make generate-dataset - Generate synthetic multi-chunk dataset with scripts/dataset_generator.py"
-	@echo "  make eval           - Run offline benchmarks (alpha-sweep, ragas, load tests)"
+	@echo "  make eval           - Run offline router complexity & threshold evaluation"
 	@echo "  make load-test      - Run mixed concurrency load test against running gateway"
 	@echo "  make load-test-cold - Run 100 uncached cold requests load test (0% cache hits) under C=10"
 	@echo "  make test           - Run integration, security & admission queue test suites"
@@ -136,7 +136,7 @@ rag-answer:
 	$(PYTHON) -m pipeline.rag_chain "$(Q)"
 
 serve-slm:
-	$(PYTHON) -m pipeline.serve_cpu_slm --port 8082 --workers 4 --threads 16
+	$(PYTHON) -m pipeline.serve_cpu_slm --port 8082 --workers 6 --threads 16
 
 serve-gpu:
 	CUDA_VISIBLE_DEVICES=0 $(PYTHON) -m vllm.entrypoints.openai.api_server \
@@ -155,8 +155,7 @@ generate-dataset:
 	$(PYTHON) scripts/dataset_generator.py
 
 eval:
-	$(PYTHON) -m evaluation.benchmarks.alpha_sweep
-	$(PYTHON) -m evaluation.benchmarks.ragas_eval
+	$(PYTHON) scripts/eval_router_threshold.py
 
 load-test:
 	PYTHONPATH=. $(PYTHON) -m evaluation.benchmarks.load_test
