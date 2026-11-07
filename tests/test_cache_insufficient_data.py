@@ -34,6 +34,8 @@ class TestCacheInsufficientDataFiltering(unittest.TestCase):
     def test_zero_chunks_unretrieved_documents_rejected(self):
         """Verify that responses with 0 retrieved documents or fallback phrases are strictly rejected."""
         unretrieved_cases = [
+            {"answer": "No specific institutional repository theses were found on this topic.", "chunks": []},
+            {"answer": "No specific institutional repository theses were found on this topic."},
             {"answer": "A detailed 100 character explanation of how algorithms work in computer science.", "chunks": []},
             {"answer": "No specific institutional repository theses were found on this topic. Based on general technical knowledge:\n\nHere is an explanation.", "chunks": []},
             {"answer": "No specific institutional repository theses were found on this topic. Based on general academic knowledge:\n\nHere is an explanation.", "chunks": []},

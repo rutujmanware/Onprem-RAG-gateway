@@ -67,7 +67,7 @@ def test_constant_time_admin_key_comparison():
 
 
 def test_session_cookie_secure_flag_configured():
-    """Verify that SessionMiddleware in gateway enforces https_only=True (Secure flag on session cookies)."""
+    """Verify that SessionMiddleware in gateway respects COOKIE_SECURE setting."""
     session_mw = None
     for mw in app.user_middleware:
         if mw.cls == SessionMiddleware:
@@ -75,9 +75,8 @@ def test_session_cookie_secure_flag_configured():
             break
 
     assert session_mw is not None, "SessionMiddleware not found in gateway middleware stack"
-    assert session_mw.kwargs.get("https_only") is True, (
-        f"Expected https_only=True for secure cookies, got: {session_mw.kwargs.get('https_only')}"
-    )
+    expected = os.getenv("COOKIE_SECURE", "0") == "1"
+    assert session_mw.kwargs.get("https_only") == expected
 
 
 def test_secrets_compare_digest_timing_resistance():

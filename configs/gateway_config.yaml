@@ -46,7 +46,7 @@ cache:
 security:
   session:
     cookie_name: "askiisc_session"
-    samesite: "strict"                            # Enforce SameSite=Strict on session cookies
+    samesite: "lax"                               # SameSite=Lax for reliable session persistence on reload
     httponly: true
     min_secret_entropy_bits: 256
   csrf:
@@ -67,7 +67,9 @@ auth:
   otp:
     code_length: 6
     cooldown_seconds: 60
-    ttl_seconds: 600
+    ttl_seconds: 180
+    max_per_hour_email: 10
+    max_per_hour_ip: 1000
     atomic_burn_lua: true                         # Prevents TOCTOU concurrency race conditions
   bypass_endpoints:
     - "/health"

@@ -92,8 +92,10 @@ def test_forged_session_cookie_with_leaked_key_rejected():
     assert r_me.json().get("email") is None
     assert r_me.json().get("tier") == "public"
 
-    # 2. Protected chat endpoint should reject with 401
-    r_chat = attacker_client.post("/chat", json={"message": "hello"})
+    # 2. Protected chat endpoint should reject with 401 (even if CSRF is provided)
+    csrf = r_me.json().get("csrf_token")
+    headers = {"X-CSRF-Token": csrf} if csrf else {}
+    r_chat = attacker_client.post("/chat", json={"message": "hello"}, headers=headers)
     assert r_chat.status_code == 401
 
     # 3. Internal endpoint should reject with 404 (simulated external user)

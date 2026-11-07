@@ -1,4 +1,4 @@
-.PHONY: help setup download-models dev prod-up prod-down prod-status prod-restart chat-up chat-down chat-restart chat-status chat-logs chat-code test-smtp cache-stats cache-clear queue-stats redis-up redis-down redis-status redis-watch up down logs ingest-pdfs query ask rag-answer serve-slm serve-gpu serve-router generate-dataset eval load-test load-test-cold test test-intensive clean
+.PHONY: help setup download-models dev prod-up prod-down prod-status prod-restart chat-up chat-down chat-restart chat-status chat-logs chat-code test-smtp cache-stats cache-clear otp-clear queue-stats redis-up redis-down redis-status redis-watch up down logs ingest-pdfs query ask rag-answer serve-slm serve-gpu serve-router generate-dataset eval load-test load-test-cold test test-intensive clean
 
 -include .env
 export
@@ -21,6 +21,7 @@ help:
 	@echo "  make chat-restart   - Restart Unified Frontend Gateway on port 8080 (6 workers)"
 	@echo "  make cache-stats    - View semantic cache item count and vector index status"
 	@echo "  make cache-clear    - Clear semantic cache (keeps 2.26M chunk vector index intact)"
+	@echo "  make otp-clear [EMAIL=...] - Clear OTP rate limits (for a specific user or all)"
 	@echo "  make queue-stats    - View admission queue depth, active inferences, and shedding telemetry"
 	@echo "  make redis-up       - Start Redis Stack daemon"
 	@echo "  make redis-down     - Stop Redis Stack daemon"
@@ -97,6 +98,9 @@ cache-stats:
 cache-clear:
 	@curl -s -X POST http://127.0.0.1:8080/cache/clear
 	@echo " -> Semantic cache cleared successfully. Document vector index (2.26M chunks) is untouched."
+
+otp-clear:
+	@$(PYTHON) scripts/clear_otp_limits.py $(if $(EMAIL),$(EMAIL),--all)
 
 queue-stats:
 	@curl -s http://127.0.0.1:8080/queue/stats || echo "Gateway is not running on 8080"

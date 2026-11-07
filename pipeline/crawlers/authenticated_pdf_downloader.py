@@ -66,7 +66,7 @@ class AuthenticatedPDFDownloader:
             cookies=cookie_dict,
             timeout=30.0,
             follow_redirects=True,
-            verify=False, # Allows intranet self-signed certificates
+            verify=False,  # nosec B501 - Intranet crawler for campus repositories with internal/self-signed certs
         )
 
     def _sanitize_filename(self, url: str) -> str:

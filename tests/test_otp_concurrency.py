@@ -44,8 +44,8 @@ def test_redis_otp_concurrency_lockout():
     if r is None:
         pytest.skip("Redis server not reachable, skipping live Redis concurrency test")
 
-    email = f"concurrency_audit_{int(time.time())}@iisc.ac.in"
-    ip = "127.0.0.1"
+    email = f"concurrency_audit_{int(time.time()*1000)}@iisc.ac.in"
+    ip = f"127.0.2.{int(time.time()*1000) % 200}"
 
     code = auth.otp_store.issue(email, ip)
     assert code is not None
@@ -78,8 +78,8 @@ def test_redis_otp_success_burns_key_immediately():
     if r is None:
         pytest.skip("Redis server not reachable, skipping live Redis OTP test")
 
-    email = f"single_use_{int(time.time())}@iisc.ac.in"
-    ip = "127.0.0.1"
+    email = f"single_use_{int(time.time()*1000)}@iisc.ac.in"
+    ip = f"127.0.1.{int(time.time()*1000) % 200}"
 
     code = auth.otp_store.issue(email, ip)
     assert code is not None

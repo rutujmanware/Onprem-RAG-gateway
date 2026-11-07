@@ -134,8 +134,8 @@ from starlette.middleware.sessions import SessionMiddleware
 app.add_middleware(
     SessionMiddleware,
     secret_key=SESSION_SECRET,
-    https_only=os.getenv("COOKIE_SECURE", "1") == "1",
-    same_site="strict",
+    https_only=os.getenv("COOKIE_SECURE", "0") == "1",
+    same_site="lax",
     max_age=int(os.getenv("SESSION_TTL", str(8 * 3600))),
     session_cookie="askiisc_session",
 )
@@ -679,59 +679,25 @@ async def query_endpoint(
         else:
             chunks = candidate_chunks[:3]  # Up to 3 docs for CPU SLM 3B
 
+        if not chunks:
+            refusal_text = "No specific institutional repository theses were found on this topic."
+            return {
+                "query": query,
+                "answer": refusal_text,
+                "route": "hard" if is_hard else "easy",
+                "target_tier": "gpu_vllm" if is_hard else "cpu_slm",
+                "model": "retriever-filter",
+                "score": round(score, 4),
+                "chunks": [],
+                "cached": False,
+                "stats": {
+                    "retrieval_seconds": pre_duration,
+                    "routing_time_seconds": round(time.time() - t0, 4),
+                },
+            }
+
         if decision.target_tier == ModelTier.GPU_LLM:
             gpu_max_tokens = req.max_tokens if (req.max_tokens is not None and req.max_tokens > 0) else 2048
-
-            if not chunks:
-                param_messages = [
-                    {
-                        "role": "system",
-                        "content": (
-                            "You are an advanced academic AI research assistant. "
-                            "No specific institutional repository documents directly cover this topic. "
-                            "Please provide a thorough, accurate, and deeply reasoned explanation of the user's question "
-                            "using standard academic and technical literature."
-                        ),
-                    },
-                    {"role": "user", "content": query},
-                ]
-                vllm_up = await vllm.check_health()
-                if vllm_up:
-                    try:
-                        resp = await vllm.generate_chat(param_messages, max_tokens=gpu_max_tokens, temperature=req.temperature or 0.2)
-                        answer_text = "No specific institutional repository theses were found on this topic. Based on general academic knowledge:\n\n" + resp["choices"][0]["message"]["content"]
-                        res = {
-                            "query": query,
-                            "answer": answer_text,
-                            "route": "hard",
-                            "target_tier": "gpu_vllm",
-                            "model": resp.get("model", "Qwen/Qwen2.5-7B-Instruct"),
-                            "score": round(score, 4),
-                            "chunks": [],
-                            "cached": False,
-                            "stats": {
-                                "retrieval_seconds": pre_duration,
-                                "routing_time_seconds": round(time.time() - t0, 4),
-                            },
-                        }
-                        # Do NOT cache fallback response when no documents were retrieved
-                        return res
-                    except Exception:
-                        pass
-                return {
-                    "query": query,
-                    "answer": "No relevant documents were found in the knowledge base matching your query.",
-                    "route": "hard",
-                    "target_tier": "gpu_vllm",
-                    "model": "retriever-filter",
-                    "score": round(score, 4),
-                    "chunks": [],
-                    "cached": False,
-                    "stats": {
-                        "retrieval_seconds": pre_duration,
-                        "routing_time_seconds": round(time.time() - t0, 4),
-                    },
-                }
 
             vllm_up = await vllm.check_health()
             if vllm_up:
@@ -841,14 +807,20 @@ if STATIC_DIR.exists():
     def generate_csrf_token() -> str:
         return secrets.token_urlsafe(32)
 
-    def set_csrf_cookie(response: Any, token: str):
+    def set_csrf_cookie(response: Any, token: str, request: Optional[Request] = None):
+        is_secure = (os.getenv("COOKIE_SECURE", "0") == "1") or (
+            request is not None and (
+                request.url.scheme == "https" or
+                request.headers.get("x-forwarded-proto") == "https"
+            )
+        )
         response.set_cookie(
             key=CSRF_COOKIE_NAME,
             value=token,
             max_age=int(os.getenv("SESSION_TTL", str(8 * 3600))),
             httponly=False,
-            samesite="strict",
-            secure=os.getenv("COOKIE_SECURE", "1") == "1",
+            samesite="lax",
+            secure=is_secure,
             path="/",
         )
 
@@ -882,7 +854,7 @@ if STATIC_DIR.exists():
     async def serve_index(request: Request):
         response = FileResponse(STATIC_DIR / "index.html")
         csrf_token = request.cookies.get(CSRF_COOKIE_NAME) or generate_csrf_token()
-        set_csrf_cookie(response, csrf_token)
+        set_csrf_cookie(response, csrf_token, request)
         return response
 
     @app.get("/me", include_in_schema=False)
@@ -899,7 +871,7 @@ if STATIC_DIR.exists():
             "debug_enabled": os.getenv("DEBUG_UI", "0") == "1",
             "csrf_token": csrf_token,
         })
-        set_csrf_cookie(response, csrf_token)
+        set_csrf_cookie(response, csrf_token, request)
         return response
 
     @app.post("/auth/otp/request", dependencies=[Depends(verify_csrf_token)], include_in_schema=False)

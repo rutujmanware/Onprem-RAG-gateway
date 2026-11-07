@@ -427,9 +427,10 @@ try:
     r_ood = httpx.post(f"{GATEWAY_URL}/query", json=ood_payload, timeout=15.0)
     data_ood = r_ood.json()
     ood_chunks = data_ood.get("chunks", [])
-    # In dynamic mode, out-of-domain query must return 0 chunks (below floor 0.48)
-    floor_rejected = len(ood_chunks) == 0
-    record_result("Gateway E2E", "Dynamic Out-of-Domain Rejection Floor", floor_rejected, f"Retrieved Chunks: {len(ood_chunks)} (0 expected)")
+    # In dynamic mode, out-of-domain query must return 0 chunks and strict refusal
+    ans_text = data_ood.get("answer", "")
+    floor_rejected = (len(ood_chunks) == 0 and "No specific institutional repository theses were found on this topic" in ans_text)
+    record_result("Gateway E2E", "Dynamic Out-of-Domain Rejection Floor", floor_rejected, f"Retrieved Chunks: {len(ood_chunks)} (0 expected) | Refusal verified")
 except Exception as e:
     record_result("Gateway E2E", "Dynamic Out-of-Domain Rejection Floor", False, str(e))
 

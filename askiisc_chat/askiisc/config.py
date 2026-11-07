@@ -88,8 +88,8 @@ ALLOW_SUBDOMAINS = os.environ.get("ALLOW_SUBDOMAINS", "0") == "1"  # accept dept
 OTP_TTL          = _f("OTP_TTL", 180)              # seconds a code stays valid (default: 180s = 3 minutes)
 OTP_MAX_TRIES    = _f("OTP_MAX_TRIES", 5)          # wrong guesses before the code is destroyed
 OTP_RESEND_SECS  = _f("OTP_RESEND_SECS", 60)       # min gap between codes per address
-OTP_MAX_PER_HOUR = _f("OTP_MAX_PER_HOUR", 5)       # codes per address per hour (stops mail-bombing a victim)
-OTP_MAX_PER_IP_HOUR = _f("OTP_MAX_PER_IP_HOUR", 20)
+OTP_MAX_PER_HOUR = _f("OTP_MAX_PER_HOUR", 10)       # codes per address per hour (stops mail-bombing a victim)
+OTP_MAX_PER_IP_HOUR = _f("OTP_MAX_PER_IP_HOUR", 1000)
 # --- Outgoing mail: use IISc's INTERNAL relay. smtp.office365.com would be external egress and needs a mailbox credential.
 SMTP_HOST        = os.environ.get("SMTP_HOST", "")
 SMTP_PORT        = _f("SMTP_PORT", 587)

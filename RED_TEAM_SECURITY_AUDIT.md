@@ -196,14 +196,14 @@ The evaluation identified **8 distinct security findings**:
 
 ## Remediation Checklist & Verification Commands
 
-- [ ] **VULN-01 Fix:** Update `require_internal_or_auth()` in `gateway/main.py` to reject spoofed `X-Forwarded-For` loopback claims.
-- [ ] **VULN-02 Fix:** Enforce mandatory non-default `SESSION_SECRET` on server initialization.
-- [ ] **VULN-03 Fix:** Forward authenticated user headers across `stream_via_gateway()` so token-bucket rate limits apply to all chat users.
-- [ ] **VULN-04 Fix:** Wire `sanitize_and_fence_prompt()` as active middleware in `gateway/main.py` and `pipeline/rag_chain.py`.
-- [ ] **VULN-05 Fix:** Replace non-atomic Redis OTP verification with atomic Lua transactions.
-- [ ] **VULN-06 Fix:** Add Pydantic validation bounds (`max_length=1500`, `le=50`) on query requests.
-- [ ] **VULN-07 Fix:** Implement administrative semantic cache purging and reduce default TTL.
-- [ ] **VULN-08 Fix:** Use `secrets.compare_digest` for admin keys and set `COOKIE_SECURE=1`.
+- [x] **VULN-01 Fix:** Update `require_internal_or_auth()` in `gateway/main.py` to reject spoofed `X-Forwarded-For` loopback claims. *(Verified by `test_spoofed_forwarded_for_loopback_rejected`)*
+- [x] **VULN-02 Fix:** Enforce mandatory non-default `SESSION_SECRET` on server initialization. *(Verified by `test_forged_session_cookie_with_leaked_key_rejected`)*
+- [x] **VULN-03 Fix:** Forward authenticated user headers across `stream_via_gateway()` so token-bucket rate limits apply to all chat users. *(Verified by `test_loopback_rate_limited` & `test_distinct_user_accounts_isolated`)*
+- [x] **VULN-04 Fix:** Wire `sanitize_and_fence_prompt()` as active middleware in `gateway/main.py` and `pipeline/rag_chain.py`. *(Verified by `test_prompt_injection_rejected_by_gateway` & 11 injection suite tests)*
+- [x] **VULN-05 Fix:** Replace non-atomic Redis OTP verification with atomic Lua transactions. *(Verified by `test_redis_otp_concurrency_lockout`)*
+- [x] **VULN-06 Fix:** Add Pydantic validation bounds (`max_length=1500`, `le=50`) on query requests. *(Verified by `test_query_top_k_unbounded_rejected_with_422` & `test_query_length_bounds_enforced`)*
+- [x] **VULN-07 Fix:** Implement administrative semantic cache purging and reduce default TTL. *(Verified by `test_default_cache_ttl_is_24_hours` & `test_admin_cache_purge_semantic_invalidation`)*
+- [x] **VULN-08 Fix:** Use `secrets.compare_digest` for admin keys and set `COOKIE_SECURE=1`. *(Verified by `test_constant_time_admin_key_comparison` & `test_session_cookie_secure_flag_configured`)*
 
 #### Automated Security Regression Test Command
 ```bash

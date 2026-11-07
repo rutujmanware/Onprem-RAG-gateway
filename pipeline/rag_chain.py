@@ -177,51 +177,10 @@ class RAGQAPipeline:
         if is_hard:
 
             if not chunks:
-                param_messages = [
-                    {
-                        "role": "system",
-                        "content": (
-                            "You are an advanced academic AI research assistant. "
-                            "No specific institutional repository documents directly cover this topic. "
-                            "Please provide a thorough, accurate, and deeply reasoned explanation of the user's question "
-                            "using standard academic and technical literature."
-                        ),
-                    },
-                    {"role": "user", "content": query},
-                ]
-                tokens_to_gen = max_new_tokens if (max_new_tokens and max_new_tokens > 160) else 1024
-                ans_text = None
-                gpu_server_url = os.getenv("VLLM_BASE_URL", "http://localhost:8000/v1").rstrip("/")
-                try:
-                    import httpx
-                    resp = httpx.post(
-                        f"{gpu_server_url}/chat/completions",
-                        json={
-                            "model": "Qwen/Qwen2.5-7B-Instruct",
-                            "messages": param_messages,
-                            "max_tokens": tokens_to_gen,
-                            "temperature": temperature,
-                        },
-                        timeout=90.0,
-                    )
-                    if resp.status_code == 200:
-                        ans_text = resp.json()["choices"][0]["message"]["content"]
-                except Exception:
-                    pass
-
-                if not ans_text:
-                    from pipeline.gpu_llm_runner import GPULLMEngine
-                    engine = GPULLMEngine.get_instance()
-                    ans_text = engine.generate_chat(
-                        param_messages,
-                        max_new_tokens=tokens_to_gen,
-                        temperature=temperature,
-                    )["text"]
-
-                prefix = "No specific institutional repository theses were found on this topic. Based on general academic knowledge:\n\n"
+                refusal = "No specific institutional repository theses were found on this topic."
                 return {
                     "query": query,
-                    "answer": prefix + ans_text,
+                    "answer": refusal,
                     "route": "hard",
                     "target_tier": "gpu_vllm",
                     "probability_hard": prob,
@@ -318,49 +277,10 @@ class RAGQAPipeline:
         easy_prob = prob
 
         if not chunks:
-            param_messages = [
-                {
-                    "role": "system",
-                    "content": (
-                        "You are an accurate, on-premise AI assistant serving the academic/research community at IISc. "
-                        "No specific institutional repository documents directly cover this topic. "
-                        "Please provide a thorough, accurate, and structured explanation of the user's question "
-                        "using standard academic and technical knowledge."
-                    ),
-                },
-                {"role": "user", "content": query},
-            ]
-            tokens_to_gen = min(max_new_tokens or 512, 1024)
-            ans_text = None
-            slm_server_url = os.getenv("SLM_BASE_URL", "http://localhost:8082/v1").rstrip("/")
-            try:
-                import httpx
-                resp = httpx.post(
-                    f"{slm_server_url}/chat/completions",
-                    json={
-                        "messages": param_messages,
-                        "max_tokens": tokens_to_gen,
-                        "temperature": temperature,
-                    },
-                    timeout=60.0,
-                )
-                if resp.status_code == 200:
-                    ans_text = resp.json()["choices"][0]["message"]["content"]
-            except Exception:
-                pass
-
-            if not ans_text:
-                gen_result = self.slm_engine.generate_chat(
-                    messages=param_messages,
-                    max_new_tokens=tokens_to_gen,
-                    temperature=temperature,
-                )
-                ans_text = gen_result["text"]
-
-            prefix = "No specific institutional repository theses were found on this topic. Based on general technical knowledge:\n\n"
+            refusal = "No specific institutional repository theses were found on this topic."
             return {
                 "query": query,
-                "answer": prefix + ans_text,
+                "answer": refusal,
                 "route": "easy",
                 "target_tier": "cpu_slm",
                 "probability_hard": easy_prob,
@@ -526,87 +446,19 @@ class RAGQAPipeline:
             }
 
             if not chunks:
-                prefix = "No specific institutional repository theses were found on this topic. Based on general academic knowledge:\n\n"
-                yield {"type": "token", "delta": prefix}
-                param_messages = [
-                    {
-                        "role": "system",
-                        "content": (
-                            "You are an advanced academic AI research assistant. "
-                            "No specific institutional repository documents directly cover this topic. "
-                            "Please provide a thorough, accurate, and deeply reasoned explanation of the user's question "
-                            "using standard academic and technical literature."
-                        ),
-                    },
-                    {"role": "user", "content": query},
-                ]
-                tokens_to_gen = max_new_tokens if (max_new_tokens and max_new_tokens > 160) else 1024
-                token_count = 0
-                full_response = [prefix]
-                ttft = None
-                streamed = False
-
-                gpu_server_url = os.getenv("VLLM_BASE_URL", "http://localhost:8000/v1").rstrip("/")
-                try:
-                    import httpx
-                    with httpx.stream(
-                        "POST",
-                        f"{gpu_server_url}/chat/completions",
-                        json={
-                            "model": "Qwen/Qwen2.5-7B-Instruct",
-                            "messages": param_messages,
-                            "max_tokens": tokens_to_gen,
-                            "temperature": temperature,
-                            "stream": True,
-                        },
-                        timeout=90.0,
-                    ) as response:
-                        for line in response.iter_lines():
-                            if not line or not line.startswith("data: "):
-                                continue
-                            data_str = line[6:].strip()
-                            if data_str == "[DONE]":
-                                break
-                            try:
-                                d = json.loads(data_str)
-                                delta = d["choices"][0]["delta"].get("content", "")
-                                if delta:
-                                    if ttft is None:
-                                        ttft = round(time.time() - t_start, 3)
-                                    token_count += 1
-                                    full_response.append(delta)
-                                    yield {"type": "token", "delta": delta}
-                            except Exception:
-                                continue
-                    streamed = True
-                except Exception:
-                    streamed = False
-
-                if not streamed:
-                    from pipeline.gpu_llm_runner import GPULLMEngine
-                    engine = GPULLMEngine.get_instance()
-                    for delta in engine.generate_chat_stream(
-                        param_messages,
-                        max_new_tokens=tokens_to_gen,
-                        temperature=temperature,
-                    ):
-                        if ttft is None:
-                            ttft = round(time.time() - t_start, 3)
-                        token_count += 1
-                        full_response.append(delta)
-                        yield {"type": "token", "delta": delta}
-
+                refusal = "No specific institutional repository theses were found on this topic."
+                yield {"type": "token", "delta": refusal}
                 yield {
                     "type": "done",
-                    "full_answer": "".join(full_response),
+                    "full_answer": refusal,
                     "stats": {
                         "retrieval_seconds": round(retrieval_duration, 3),
-                        "generation_seconds": round(time.time() - t_start, 3),
+                        "generation_seconds": 0.0,
                         "total_seconds": round(time.time() - t_start, 3),
-                        "ttft_seconds": ttft or 0.0,
-                        "num_tokens": token_count,
-                        "model": "Qwen/Qwen2.5-7B-Instruct",
-                        "server": "gpu-daemon-port-8000" if streamed else "in-process-gpu",
+                        "ttft_seconds": 0.0,
+                        "num_tokens": 1,
+                        "model": "retriever-filter",
+                        "server": "institutional-filter",
                     },
                 }
                 return
@@ -739,87 +591,19 @@ class RAGQAPipeline:
         }
 
         if not chunks:
-            prefix = "No specific institutional repository theses were found on this topic. Based on general technical knowledge:\n\n"
-            yield {"type": "token", "delta": prefix}
-            param_messages = [
-                {
-                    "role": "system",
-                    "content": (
-                        "You are an accurate, on-premise AI assistant serving the academic/research community at IISc. "
-                        "No specific institutional repository documents directly cover this topic. "
-                        "Please provide a thorough, accurate, and structured explanation of the user's question "
-                        "using standard academic and technical knowledge."
-                    ),
-                },
-                {"role": "user", "content": query},
-            ]
-            tokens_to_gen = min(max_new_tokens or 512, 1024)
-            token_count = 0
-            full_response = [prefix]
-            ttft = None
-            streamed = False
-
-            slm_server_url = os.getenv("SLM_BASE_URL", "http://localhost:8082/v1").rstrip("/")
-            server_root = slm_server_url.rsplit("/v1", 1)[0]
-            try:
-                import httpx
-                h_check = httpx.get(f"{server_root}/healthz", timeout=1.0)
-                if h_check.status_code == 200:
-                    with httpx.stream(
-                        "POST",
-                        f"{slm_server_url}/chat/completions",
-                        json={
-                            "messages": param_messages,
-                            "max_tokens": tokens_to_gen,
-                            "temperature": temperature,
-                            "stream": True,
-                        },
-                        timeout=90.0,
-                    ) as response:
-                        for line in response.iter_lines():
-                            if not line or not line.startswith("data: "):
-                                continue
-                            chunk_str = line[6:].strip()
-                            if chunk_str == "[DONE]":
-                                break
-                            try:
-                                chunk_data = json.loads(chunk_str)
-                                delta = chunk_data["choices"][0]["delta"].get("content", "")
-                                if delta:
-                                    if ttft is None:
-                                        ttft = round(time.time() - t_start, 3)
-                                    token_count += 1
-                                    full_response.append(delta)
-                                    yield {"type": "token", "delta": delta}
-                            except Exception:
-                                continue
-                    streamed = True
-            except Exception:
-                streamed = False
-
-            if not streamed:
-                for delta in self.slm_engine.generate_chat_stream(
-                    messages=param_messages,
-                    max_new_tokens=tokens_to_gen,
-                    temperature=temperature,
-                ):
-                    if ttft is None:
-                        ttft = round(time.time() - t_start, 3)
-                    token_count += 1
-                    full_response.append(delta)
-                    yield {"type": "token", "delta": delta}
-
+            refusal = "No specific institutional repository theses were found on this topic."
+            yield {"type": "token", "delta": refusal}
             yield {
                 "type": "done",
-                "full_answer": "".join(full_response),
+                "full_answer": refusal,
                 "stats": {
                     "retrieval_seconds": round(retrieval_duration, 3),
-                    "generation_seconds": round(time.time() - t_start, 3),
+                    "generation_seconds": 0.0,
                     "total_seconds": round(time.time() - t_start, 3),
-                    "ttft_seconds": ttft or 0.0,
-                    "num_tokens": token_count,
-                    "model": "qwen2.5-3b-instruct-q4_k_m.gguf",
-                    "server": "cpu-daemon-port-8082" if streamed else "in-process-cpu",
+                    "ttft_seconds": 0.0,
+                    "num_tokens": 1,
+                    "model": "retriever-filter",
+                    "server": "institutional-filter",
                 },
             }
             return

@@ -9,7 +9,8 @@ def hash_embed(text: str, dim: int) -> np.ndarray:
     """Deterministic bag-of-words hashing embedder. Offline/testing only."""
     v = np.zeros(dim, dtype=np.float32)
     for tok in re.findall(r"\w+", text.lower()):
-        h = int(hashlib.md5(tok.encode()).hexdigest(), 16)
+        # usedforsecurity=False explicitly indicates non-cryptographic feature hashing
+        h = int(hashlib.md5(tok.encode(), usedforsecurity=False).hexdigest(), 16)
         v[h % dim] += 1.0 if (h >> 64) & 1 else -1.0
     n = np.linalg.norm(v)
     return v / n if n else v
