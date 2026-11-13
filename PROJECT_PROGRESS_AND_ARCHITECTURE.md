@@ -1306,7 +1306,7 @@ Comprehensive end-to-end evaluation was executed using [`tests/benchmark_cache_e
 The GPU tier (`Qwen/Qwen2.5-7B-Instruct`) was migrated from custom server scripts to the official high-throughput **vLLM OpenAI API Server** (`vllm==0.6.3`) hosted directly inside `rag_env`:
 - **Engine Command (`make serve-gpu`):**
   ```bash
-  CUDA_VISIBLE_DEVICES=0 python -m vllm.entrypoints.openai.api_server \
+  CUDA_VISIBLE_DEVICES=$VLLM_GPU python scripts/serve_vllm.py \
     --model /data2/home/ritujmanware/.cache/huggingface/hub/models--Qwen--Qwen2.5-7B-Instruct/snapshots/a09a35458c702b33eeacc393d103063234e8bc28 \
     --served-model-name "Qwen/Qwen2.5-7B-Instruct" \
     --host 127.0.0.1 \
@@ -1315,6 +1315,7 @@ The GPU tier (`Qwen/Qwen2.5-7B-Instruct`) was migrated from custom server script
     --max-model-len 8192 \
     --dtype bfloat16
   ```
+- **Security (red-team fix):** stock `vllm==0.6.3` ignores `--host` (its pre-bound socket uses `bind(("", port))`, i.e. `0.0.0.0`). Always start it via `scripts/serve_vllm.py`, which forces the loopback bind and requires `VLLM_API_KEY` (Bearer auth on `/v1/*`). Verify with `make vllm-check`.
 - **Throughput & Latency:** Delivers **73.4+ tokens/sec** with PagedAttention and continuous batching on the NVIDIA A100.
 
 #### B. Cache Hit vs. Miss Similarity Policy

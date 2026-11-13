@@ -1,4 +1,4 @@
-.PHONY: help setup download-models dev prod-up prod-down prod-status prod-restart chat-up chat-down chat-restart chat-status chat-logs chat-code test-smtp cache-stats cache-clear otp-clear queue-stats redis-up redis-down redis-status redis-watch up down logs ingest-pdfs query ask rag-answer serve-slm serve-gpu serve-router generate-dataset eval load-test load-test-cold test test-intensive clean
+.PHONY: help setup download-models dev prod-up prod-down prod-status prod-restart prod-restart-vllm prod-down-vllm vllm-check chat-up chat-down chat-restart chat-status chat-logs chat-code test-smtp cache-stats cache-clear otp-clear queue-stats redis-up redis-down redis-status redis-watch up down logs ingest-pdfs query ask rag-answer serve-slm serve-gpu serve-router generate-dataset eval load-test load-test-cold test test-intensive clean
 
 -include .env
 export
@@ -17,7 +17,10 @@ help:
 	@echo "  make prod-up        - Start production stack (Gateway 6 workers, CPU SLM 6x16, vLLM, Redis)"
 	@echo "  make prod-status    - Display status and health of all production services"
 	@echo "  make prod-restart   - Restart production stack with optimized high-concurrency settings"
-	@echo "  make prod-down      - Gracefully terminate all background services (preserves Redis data)"
+	@echo "  make prod-restart-vllm - Same, but also restart vLLM via the hardened launcher (slow reload)"
+	@echo "  make prod-down      - Gracefully terminate all background services (preserves Redis data and vLLM)"
+	@echo "  make prod-down-vllm - Same, but also stop the vLLM GPU engine"
+	@echo "  make vllm-check     - Verify vLLM is loopback-only and requires VLLM_API_KEY (red-team fix)"
 	@echo "  make chat-restart   - Restart Unified Frontend Gateway on port 8080 (6 workers)"
 	@echo "  make cache-stats    - View semantic cache item count and vector index status"
 	@echo "  make cache-clear    - Clear semantic cache (keeps 2.26M chunk vector index intact)"
@@ -35,7 +38,7 @@ help:
 	@echo "  make ask Q=\"...\"    - Query the running Gateway with clean formatted answer output"
 	@echo "  make rag-answer Q=\"...\" - Answer query using retrieved context + dual-tier routing"
 	@echo "  make serve-slm      - Start Qwen 2.5 3B CPU SLM server (6 workers x 16 threads = 96 cores)"
-	@echo "  make serve-gpu      - Start Qwen 2.5 7B GPU LLM server on port 8000"
+	@echo "  make serve-gpu      - Start Qwen 2.5 7B vLLM on 127.0.0.1:8000 (GPU = VLLM_GPU, needs VLLM_API_KEY)"
 	@echo "  make serve-router   - Start MLP Router microservice on port 8090"
 	@echo "  make generate-dataset - Generate synthetic multi-chunk dataset with scripts/dataset_generator.py"
 	@echo "  make eval           - Run offline router complexity & threshold evaluation"
@@ -62,11 +65,23 @@ prod-up:
 prod-down:
 	$(PYTHON) scripts/prod_stack.py stop
 
+prod-down-vllm:
+	$(PYTHON) scripts/prod_stack.py stop --with-vllm
+
 prod-status:
 	$(PYTHON) scripts/prod_stack.py status
 
 prod-restart:
 	$(PYTHON) scripts/prod_stack.py restart
+
+# Also restarts the vLLM GPU engine (slow model reload). Needed after vLLM launch/security changes.
+prod-restart-vllm:
+	$(PYTHON) scripts/prod_stack.py restart --with-vllm
+	@echo "vLLM is reloading the model; once ready, verify with: make vllm-check"
+
+# Red-team fix check: loopback-only bind + API key enforced on /v1/*.
+vllm-check:
+	@bash scripts/check_vllm_security.sh
 
 chat-up:
 	$(PYTHON) scripts/prod_stack.py start
@@ -141,8 +156,9 @@ rag-answer:
 serve-slm:
 	$(PYTHON) -m pipeline.serve_cpu_slm --port 8082 --workers 6 --threads 16
 
+# Always launch vLLM through scripts/serve_vllm.py: stock vLLM 0.6.3 ignores --host and binds 0.0.0.0.
 serve-gpu:
-	CUDA_VISIBLE_DEVICES=0 $(PYTHON) -m vllm.entrypoints.openai.api_server \
+	CUDA_VISIBLE_DEVICES=$(or $(VLLM_GPU),0) $(PYTHON) scripts/serve_vllm.py \
 		--model $(MODEL_7B_PATH) \
 		--served-model-name "Qwen/Qwen2.5-7B-Instruct" \
 		--host 127.0.0.1 \
@@ -169,6 +185,7 @@ load-test-cold:
 test:
 	PYTHONPATH=. $(PYTHON) tests/test_admission_queue.py
 	PYTHONPATH=. $(PYTHON) -m pytest tests/test_single_port_security.py
+	PYTHONPATH=. $(PYTHON) -m pytest tests/test_vllm_launcher.py
 	PYTHONPATH=. $(PYTHON) tests/test_injection_fence.py
 	PYTHONPATH=. $(PYTHON) tests/test_rate_limiting.py
 	PYTHONPATH=. $(PYTHON) tests/test_cache_hits.py
