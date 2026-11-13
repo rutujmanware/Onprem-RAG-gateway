@@ -184,11 +184,12 @@ Implemented in [`gateway/cache/redis_semantic_cache.py`](file:///data2/home/ritu
 2. Query text is embedded into a 384-dimensional dense vector using [`all-MiniLM-L6-v2`](file:///data2/home/ritujmanware/onprem-rag-gateway/models/embeddings/all-MiniLM-L6-v2) on CPU (< 4ms).
 3. Performs HNSW cosine similarity search against index `semantic_cache_idx` (key prefix `semcache:`) using RediSearch `FT.SEARCH` with `EF_RUNTIME 64`.
 4. **Cache Hit Decision:**
-   - If cosine similarity $\ge 0.90$ (cosine distance $\le 0.10$) or exact L0 hash match:
+   - Exact L0 hash match, **or** cosine similarity $\ge 0.90$ (cosine distance $\le 0.10$) **and** the intent-equivalence guard (`RedisSemanticCache.check_entity_conflict`) confirms both queries ask the same question. The guard rejects differences in numbers/years, negation, question type (*why* vs. yes/no vs. *what/how*), opposite terms, quantifiers, and swapped roles of two terms. Known limits: PRD §9.1.
      - Returns pre-generated response immediately (< 1ms exact, < 35ms semantic).
      - Emits token deltas via SSE streaming with `cache_hit=True` metadata.
 5. **Cache Miss Decision:**
-   - If similarity $< 0.90$, dispatches to the cold RAG pipeline.
+   - If similarity $< 0.90$ or the intent guard rejects the candidate, dispatches to the cold RAG pipeline.
+6. **Provenance:** Every stored entry carries a keyed HMAC owner tag (`owner`) of the creating user for audit and targeted purge. The cache remains shared across users; lookups do not filter on the tag.
 
 ### Refusal & Anti-Pollution Shield (NFR-6)
 - [`RedisSemanticCache.is_cacheable_response`](file:///data2/home/ritujmanware/onprem-rag-gateway/gateway/cache/redis_semantic_cache.py):
@@ -289,7 +290,7 @@ Implemented in [`pipeline/serve_cpu_slm.py`](file:///data2/home/ritujmanware/onp
 
 ### 8.2 Tier 2: GPU LLM Server (Port 8000)
 - **Model:** `Qwen2.5-7B-Instruct` in full `bfloat16` precision (15.2 GB).
-- **Backend:** vLLM OpenAI-compatible server.
+- **Backend:** vLLM 0.6.3 OpenAI-compatible server, launched **only** via [`scripts/serve_vllm.py`](scripts/serve_vllm.py) (forces the `127.0.0.1` bind that stock 0.6.3 ignores, requires `VLLM_API_KEY` Bearer auth on `/v1/*`). GPU index set by `VLLM_GPU` in `.env`. Verify with `make vllm-check`; known limits in PRD §9.2.
 - **VRAM Footprint:** ~18.7 GB VRAM on NVIDIA A100 (40GB/80GB).
 - **Features:** PagedAttention v2, continuous iteration batching, KV-cache sharing.
 - **Performance:** 45 – 55 tokens/sec per stream; TTFT ~0.033s.
@@ -402,11 +403,12 @@ python scripts/prod_stack.py status
 # Start all production services (skips Redis if already up)
 python scripts/prod_stack.py start
 
-# Restart Gateway and CPU SLM safely
-fuser -k 8082/tcp 2>/dev/null || true
-fuser -k 8080/tcp 2>/dev/null || true
-sleep 2
-python scripts/prod_stack.py start
+# Restart Gateway and CPU SLM safely (vLLM and Redis keep running)
+make prod-restart
+
+# Restart including vLLM (slow model reload), then verify the model-server perimeter
+make prod-restart-vllm
+make vllm-check
 
 # View live gateway logs
 tail -n 100 -f logs/gateway.log
@@ -423,7 +425,7 @@ Run the full automated test suite:
 ```bash
 pytest tests/ -v
 ```
-All **84 unit and integration tests** across 15 test modules must report **100% PASS**.
+All unit and integration tests must report **PASS** (`make test`). This includes the semantic-cache intent-guard suites ([`tests/test_cache_intent_guard.py`](tests/test_cache_intent_guard.py), [`tests/test_cache_intent_guard_extensive.py`](tests/test_cache_intent_guard_extensive.py)), whose documented known limits are marked `xfail`, and the vLLM launcher tests ([`tests/test_vllm_launcher.py`](tests/test_vllm_launcher.py)).
 
 Run the full-stack live verification suite:
 ```bash

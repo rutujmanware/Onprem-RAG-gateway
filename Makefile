@@ -186,6 +186,7 @@ test:
 	PYTHONPATH=. $(PYTHON) tests/test_admission_queue.py
 	PYTHONPATH=. $(PYTHON) -m pytest tests/test_single_port_security.py
 	PYTHONPATH=. $(PYTHON) -m pytest tests/test_vllm_launcher.py
+	PYTHONPATH=. $(PYTHON) -m pytest tests/test_cache_intent_guard.py tests/test_cache_intent_guard_extensive.py
 	PYTHONPATH=. $(PYTHON) tests/test_injection_fence.py
 	PYTHONPATH=. $(PYTHON) tests/test_rate_limiting.py
 	PYTHONPATH=. $(PYTHON) tests/test_cache_hits.py

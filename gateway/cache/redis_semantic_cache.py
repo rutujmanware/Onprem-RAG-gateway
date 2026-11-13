@@ -13,10 +13,12 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import sys
 import time
 import uuid
 import hashlib
+import hmac
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -341,7 +343,7 @@ class RedisSemanticCache:
                 has_conflict, reason = self.check_entity_conflict(query, matched_prompt)
                 if has_conflict:
                     logger.info(
-                        "Semantic match candidates found (sim=%.4f), but rejected due to entity conflict: %s",
+                        "Semantic match candidate (sim=%.4f) rejected by entity/intent guard: %s",
                         similarity, reason
                     )
                     return None
@@ -430,7 +432,7 @@ class RedisSemanticCache:
                 has_conflict, reason = self.check_entity_conflict(query, matched_prompt)
                 if has_conflict:
                     logger.info(
-                        "Semantic match candidates found (sim=%.4f), but rejected due to entity conflict: %s",
+                        "Semantic match candidate (sim=%.4f) rejected by entity/intent guard: %s",
                         similarity, reason
                     )
                     return None
@@ -462,6 +464,7 @@ class RedisSemanticCache:
         response: Dict[str, Any],
         query_vec: Optional[List[float]] = None,
         ttl_seconds: Optional[int] = None,
+        owner: Optional[str] = None,
     ) -> bool:
         """Synchronously store query and generated answer in Redis semantic cache."""
         cacheable, cache_reason = self.is_cacheable_response(response)
@@ -490,6 +493,9 @@ class RedisSemanticCache:
                 "vector": vec_bytes,
                 "created_at": time.time(),
             }
+            owner_tag = self.owner_tag(owner)
+            if owner_tag:
+                payload["owner"] = owner_tag  # audit / targeted purge only; lookups stay shared
 
             self.sync_client.hset(key, mapping=payload)
             self.sync_client.expire(key, ttl)
@@ -498,7 +504,7 @@ class RedisSemanticCache:
             try:
                 norm_q = query.strip().lower()
                 exact_key = f"{self.key_prefix}exact:{hashlib.sha256(norm_q.encode('utf-8')).hexdigest()}"
-                self.sync_client.set(exact_key, json.dumps({"prompt": query, "response": response}), ex=ttl)
+                self.sync_client.set(exact_key, json.dumps({"prompt": query, "response": response, "owner": owner_tag}), ex=ttl)
             except Exception:
                 pass
             return True
@@ -512,6 +518,7 @@ class RedisSemanticCache:
         response: Dict[str, Any],
         query_vec: Optional[List[float]] = None,
         ttl_seconds: Optional[int] = None,
+        owner: Optional[str] = None,
     ) -> bool:
         """Asynchronously store query and generated answer in Redis semantic cache."""
         cacheable, cache_reason = self.is_cacheable_response(response)
@@ -542,6 +549,9 @@ class RedisSemanticCache:
                 "vector": vec_bytes,
                 "created_at": time.time(),
             }
+            owner_tag = self.owner_tag(owner)
+            if owner_tag:
+                payload["owner"] = owner_tag  # audit / targeted purge only; lookups stay shared
 
             await self.async_client.hset(key, mapping=payload)
             await self.async_client.expire(key, ttl)
@@ -550,7 +560,7 @@ class RedisSemanticCache:
             try:
                 norm_q = query.strip().lower()
                 exact_key = f"{self.key_prefix}exact:{hashlib.sha256(norm_q.encode('utf-8')).hexdigest()}"
-                await self.async_client.set(exact_key, json.dumps({"prompt": query, "response": response}), ex=ttl)
+                await self.async_client.set(exact_key, json.dumps({"prompt": query, "response": response, "owner": owner_tag}), ex=ttl)
             except Exception:
                 pass
             return True
@@ -882,12 +892,25 @@ class RedisSemanticCache:
         return None
 
     @staticmethod
-    def check_entity_conflict(query_a: str, query_b: str) -> Tuple[bool, str]:
-        """Detect if two queries conflict in numerical/temporal values or negation polarity.
+    def owner_tag(owner: Optional[str]) -> str:
+        """Keyed, non-reversible tag of the user who created a cache entry (audit / targeted purge).
 
-        Dense embedding models (e.g. all-MiniLM-L6-v2) assign ~0.993+ similarity to temporal
-        swaps like 'in 2023' vs 'in 2024' because all other sentence tokens overlap.
-        This guard prevents returning stale/conflicting years, counts, or inverted facts.
+        The cache stays shared across users; the tag is recorded, never used to filter lookups.
+        """
+        if not owner:
+            return ""
+        secret = os.getenv("SESSION_SECRET", "semantic-cache-owner")
+        return hmac.new(secret.encode("utf-8"), owner.strip().lower().encode("utf-8"), hashlib.sha256).hexdigest()[:16]
+
+    @staticmethod
+    def check_entity_conflict(query_a: str, query_b: str) -> Tuple[bool, str]:
+        """Return (True, reason) when two embedding-similar queries must NOT share a cached answer.
+
+        Dense embeddings (all-MiniLM-L6-v2) measure topical overlap, not intent: 'in 2023' vs
+        'in 2024', 'Why does X always...' vs 'Does X always...', 'advantages' vs 'disadvantages'
+        and 'HCl added to NaOH' vs 'NaOH added to HCl' all score 0.91-0.999, so no similarity
+        threshold separates them from genuine paraphrases. A false conflict only costs a fresh
+        generation; a false hit serves a wrong (possibly poisoned) answer, so checks are strict.
         """
         import re
 
@@ -898,12 +921,184 @@ class RedisSemanticCache:
             return True, f"Numerical / Year mismatch: {nums_a} vs {nums_b}"
 
         # 2. Negation / Polarity Check (prevents answering the inverse question)
-        negations = {"not", "no", "never", "without", "none", "neither", "nor", "n't"}
-        words_a = set(re.findall(r"\b\w+(?:'\w+)?\b", query_a.lower()))
-        words_b = set(re.findall(r"\b\w+(?:'\w+)?\b", query_b.lower()))
-        has_neg_a = bool(words_a & negations)
-        has_neg_b = bool(words_b & negations)
+        words_a = set(re.findall(r"\b\w+(?:'\w+)?\b", _normalize_quotes(query_a.lower())))
+        words_b = set(re.findall(r"\b\w+(?:'\w+)?\b", _normalize_quotes(query_b.lower())))
+        has_neg_a = _has_negation(words_a)
+        has_neg_b = _has_negation(words_b)
         if has_neg_a != has_neg_b:
             return True, f"Polarity / Negation mismatch: {has_neg_a} vs {has_neg_b}"
 
-        return False, "No conflict"
+        # 3. Intent equivalence (red-team finding: semantic cache intent collisions)
+        return check_intent_conflict(query_a, query_b)
+
+
+# ---------------------------------------------------------------------------
+# Intent-equivalence guard for semantic cache hits
+# ---------------------------------------------------------------------------
+_NEGATIONS = {"not", "no", "never", "without", "none", "neither", "nor", "cannot", "unable"}
+
+_WH_TYPES = {"why": "why", "who": "who", "whom": "who", "whose": "who", "when": "when", "where": "where"}
+_YESNO_AUX = {"is", "are", "was", "were", "do", "does", "did", "can", "could", "will", "would", "should",
+              "shall", "has", "have", "had", "may", "might", "must"}
+_INTRO_VERBS = {"explain", "describe", "tell", "discuss", "show", "know", "understand"}
+_POLITE_PREFIX = re.compile(
+    r"^(?:(?:please|kindly)\s+|(?:can|could|would|will)\s+you\s+(?:please\s+)?|"
+    r"(?:i\s+(?:want|would\s+like|wish)\s+to\s+know)\s+|do\s+you\s+know\s+)+"
+)
+_QUANTIFIERS = {"always", "never", "sometimes", "often", "usually", "rarely", "all", "every", "each", "any",
+                "some", "none", "only", "most", "few", "many", "both", "either", "neither"}
+# Directional words whose left/right operands must not swap (titration order, 'effect of X on Y', 'X than Y').
+_DIRECTIONAL = {"to", "into", "onto", "on", "from", "than", "toward", "towards", "over", "against"}
+_INTENT_STOPWORDS = {
+    "the", "a", "an", "of", "in", "for", "and", "or", "with", "as", "at", "by", "about", "its", "it", "this", "that",
+    "these", "those", "there", "their", "be", "been", "being", "s", "what", "which", "how", "why", "who", "whom",
+    "whose", "when", "where", "me", "i", "you", "we", "please", "kindly",
+} | _YESNO_AUX | _INTRO_VERBS | _DIRECTIONAL
+_ANTONYM_PAIRS = [
+    ("advantage", "disadvantage"), ("advantage", "limitation"), ("benefit", "drawback"), ("benefit", "risk"),
+    ("pro", "con"), ("merit", "demerit"), ("strength", "weakness"), ("application", "limitation"),
+    ("use", "limitation"), ("increase", "decrease"), ("increase", "reduce"), ("rise", "fall"), ("raise", "lower"),
+    ("high", "low"), ("higher", "lower"), ("highest", "lowest"), ("more", "less"), ("most", "least"),
+    ("maximum", "minimum"), ("maximize", "minimize"), ("max", "min"), ("gain", "loss"), ("positive", "negative"),
+    ("success", "failure"), ("succeed", "fail"), ("find", "fail"), ("best", "worst"), ("better", "worse"),
+    ("fast", "slow"), ("faster", "slower"), ("large", "small"), ("larger", "smaller"), ("largest", "smallest"),
+    ("big", "small"), ("strong", "weak"), ("hot", "cold"), ("heat", "cool"), ("heating", "cooling"),
+    ("add", "remove"), ("before", "after"), ("above", "below"), ("inside", "outside"), ("input", "output"),
+    ("acidic", "basic"), ("oxidation", "reduction"), ("oxidize", "reduce"), ("charge", "discharge"),
+    ("cause", "prevent"), ("enable", "prevent"), ("true", "false"), ("valid", "invalid"), ("safe", "unsafe"),
+    ("stable", "unstable"), ("possible", "impossible"), ("accurate", "inaccurate"), ("efficient", "inefficient"),
+    ("agree", "disagree"), ("support", "oppose"), ("include", "exclude"), ("first", "last"), ("start", "end"),
+    ("early", "late"), ("past", "future"), ("upper", "lower"), ("forward", "backward"), ("import", "export"),
+    ("supply", "demand"), ("similarity", "difference"), ("similar", "different"), ("same", "different"),
+    ("internal", "external"), ("cause", "avoid"), ("correct", "incorrect"), ("legal", "illegal"),
+]
+_NEGATING_PREFIXES = ("un", "in", "im", "ir", "il", "dis", "non")
+_SUFFIXES = ("ization", "isation", "ations", "ation", "ments", "ment", "ings", "ing", "ies", "es", "ed", "ly", "s")
+
+
+def _normalize_quotes(text: str) -> str:
+    return text.replace("\u2019", "'").replace("\u2018", "'").replace("`", "'")
+
+
+def _has_negation(words) -> bool:
+    return any(w in _NEGATIONS or w.endswith("n't") for w in words)
+
+
+def _stem(word: str) -> str:
+    """Tiny suffix stripper so 'advantages'/'advantage' and 'increasing'/'increase' compare equal."""
+    for suf in _SUFFIXES:
+        if suf == "s" and word.endswith("ss"):  # 'weakness', 'process', 'glass' are not plurals
+            continue
+        if len(word) > len(suf) + 2 and word.endswith(suf):
+            word = word[: -len(suf)] + ("y" if suf == "ies" else "")
+            break
+    if len(word) > 4 and word.endswith("e"):
+        word = word[:-1]
+    return word
+
+
+_ANTONYMS: Dict[str, set] = {}
+for _a, _b in _ANTONYM_PAIRS:
+    _ANTONYMS.setdefault(_stem(_a), set()).add(_stem(_b))
+    _ANTONYMS.setdefault(_stem(_b), set()).add(_stem(_a))
+
+
+def _intent_tokens(query: str) -> List[str]:
+    text = _normalize_quotes(query.lower())
+    text = re.sub(r"\bnon-(?=[a-z])", "non", text).replace("-", " ")
+    text = _POLITE_PREFIX.sub("", text.strip())
+    return re.findall(r"[a-z0-9]+(?:'[a-z]+)?", text)
+
+
+def _question_type(tokens: List[str]) -> str:
+    """Coarse intent class: why / who / when / where / yesno / describe (what, how, explain, keyword search)."""
+    if not tokens:
+        return "describe"
+    first = tokens[0]
+    if first in _INTRO_VERBS and len(tokens) > 1:  # 'Explain why X' asks the same thing as 'Why X'
+        if tokens[1] == "me" and len(tokens) > 2:
+            first = tokens[2]
+        else:
+            first = tokens[1]
+    if first == "how" and len(tokens) > 1 and tokens[1] == "come":
+        return "why"
+    if first in _WH_TYPES:
+        return _WH_TYPES[first]
+    if first in _YESNO_AUX:
+        return "yesno"
+    return "describe"
+
+
+def _content_stems(tokens: List[str]) -> set:
+    return {_stem(w) for w in tokens if w not in _INTENT_STOPWORDS and w not in _QUANTIFIERS}
+
+
+def _is_content(word: str) -> bool:
+    return word not in _INTENT_STOPWORDS and word not in _QUANTIFIERS
+
+
+def _sides(tokens: List[str], i: int) -> Tuple[set, set]:
+    """Content stems before / after position i."""
+    return ({_stem(w) for w in tokens[:i] if _is_content(w)}, {_stem(w) for w in tokens[i + 1:] if _is_content(w)})
+
+
+def _crossing(side_a: Tuple[set, set], side_b: Tuple[set, set]) -> Optional[Tuple[str, str]]:
+    """Return (x, y) if x moves from before->after the pivot AND y moves after->before (a true swap).
+
+    Moving a whole phrase to the other side ('CO2 to methanol conversion') is a harmless reordering;
+    only terms crossing each other ('HCl added to NaOH' vs 'NaOH added to HCl') change meaning.
+    """
+    (before_a, after_a), (before_b, after_b) = side_a, side_b
+    to_right = sorted(w for w in before_a - after_a if w in after_b and w not in before_b)
+    to_left = sorted(w for w in after_a - before_a if w in before_b and w not in after_b)
+    return (to_right[0], to_left[0]) if to_right and to_left else None
+
+
+def check_intent_conflict(query_a: str, query_b: str) -> Tuple[bool, str]:
+    """Rule-based check that two queries ask the same thing (not just share a topic)."""
+    ta, tb = _intent_tokens(query_a), _intent_tokens(query_b)
+
+    # a) Question form: 'Why does X...' presupposes X; 'Does X...' asks whether X holds.
+    qa, qb = _question_type(ta), _question_type(tb)
+    if qa != qb:
+        return True, f"Intent mismatch: question type '{qa}' vs '{qb}'"
+
+    # b) Opposite / negated terms: advantages vs disadvantages, increase vs decrease, accurate vs inaccurate.
+    sa, sb = _content_stems(ta), _content_stems(tb)
+    for w in sa ^ sb:
+        other = sb if w in sa else sa
+        opposite = _ANTONYMS.get(w, set()) & other
+        if opposite:
+            return True, f"Intent mismatch: opposite terms '{w}' vs '{sorted(opposite)[0]}'"
+        for p in _NEGATING_PREFIXES:
+            base = w[len(p):]
+            if (w.startswith(p) and len(base) >= 4 and base in other) or (p + w) in other:
+                return True, f"Intent mismatch: negated form of '{w}'"
+
+    # c) Quantifier scope: 'always' / 'every' / 'some' / 'only' change what is being claimed.
+    quant_a, quant_b = set(ta) & _QUANTIFIERS, set(tb) & _QUANTIFIERS
+    if quant_a != quant_b:
+        return True, f"Intent mismatch: quantifiers {sorted(quant_a)} vs {sorted(quant_b)}"
+
+    # d) Role reversal: two terms swap sides of a directional word ('HCl added to NaOH' vs
+    #    'NaOH added to HCl', 'X than Y') or of a shared verb/noun ('insulin inhibits glucagon').
+    for word in _DIRECTIONAL:
+        pos_a = [i for i, w in enumerate(ta) if w == word]
+        pos_b = [i for i, w in enumerate(tb) if w == word]
+        if pos_a and len(pos_a) == len(pos_b):
+            for i, j in zip(pos_a, pos_b):
+                swap = _crossing(_sides(ta, i), _sides(tb, j))
+                if swap:
+                    return True, f"Intent mismatch: '{swap[0]}' and '{swap[1]}' swap around '{word}'"
+    stems_a = [_stem(w) if _is_content(w) else None for w in ta]
+    stems_b = [_stem(w) if _is_content(w) else None for w in tb]
+    # Verb/noun pivots only for pure permutations (same content words, different order), so that
+    # rephrasings like 'monitoring water quality using IoT' vs 'IoT for monitoring water quality' still hit.
+    same_words = sorted(x for x in stems_a if x) == sorted(x for x in stems_b if x)
+    for pivot in (sa & sb) if same_words else ():
+        if stems_a.count(pivot) == 1 and stems_b.count(pivot) == 1:
+            swap = _crossing(_sides(ta, stems_a.index(pivot)), _sides(tb, stems_b.index(pivot)))
+            if swap:
+                return True, f"Intent mismatch: '{swap[0]}' and '{swap[1]}' swap around '{pivot}'"
+
+    return False, "No conflict"

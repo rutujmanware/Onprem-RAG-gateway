@@ -383,9 +383,9 @@ async def chat_completions(
                 complete_text = "".join(full_ans)
                 if complete_text and collected_chunks:
                     try:
-                        cache.store(query, {"answer": complete_text, "chunks": collected_chunks})
+                        cache.store(query, {"answer": complete_text, "chunks": collected_chunks}, owner=client_id)
                         if query != raw_query:
-                            cache.store(raw_query, {"answer": complete_text, "chunks": collected_chunks})
+                            cache.store(raw_query, {"answer": complete_text, "chunks": collected_chunks}, owner=client_id)
                     except Exception:
                         pass
                 yield "data: [DONE]\n\n"
@@ -424,7 +424,7 @@ async def chat_completions(
                     }
                     resp["user"] = user.email
                     ans_text = resp["choices"][0]["message"]["content"]
-                    await cache.astore(query, {"answer": ans_text})
+                    await cache.astore(query, {"answer": ans_text}, owner=client_id)
                     return resp
                 except Exception:
                     pass
@@ -439,9 +439,9 @@ async def chat_completions(
                     temperature=req.temperature or 0.2,
                 )
                 ans_text = gpu_res["text"]
-                await cache.astore(query, {"answer": ans_text})
+                await cache.astore(query, {"answer": ans_text}, owner=client_id)
                 if query != raw_query:
-                    await cache.astore(raw_query, {"answer": ans_text})
+                    await cache.astore(raw_query, {"answer": ans_text}, owner=client_id)
                 return {
                     "id": f"chatcmpl-hard-{uuid.uuid4().hex[:8]}",
                     "object": "chat.completion",
@@ -486,9 +486,9 @@ async def chat_completions(
                     "routing_time_seconds": round(time.time() - t0, 4),
                 }
                 ans_text = resp["choices"][0]["message"]["content"]
-                await cache.astore(query, {"answer": ans_text})
+                await cache.astore(query, {"answer": ans_text}, owner=client_id)
                 if query != raw_query:
-                    await cache.astore(raw_query, {"answer": ans_text})
+                    await cache.astore(raw_query, {"answer": ans_text}, owner=client_id)
                 return resp
             except Exception:
                 pass
@@ -504,7 +504,7 @@ async def chat_completions(
         ans_text = rag_res.get("answer", "")
         retrieved_chunks = rag_res.get("chunks", [])
         if retrieved_chunks:
-            await cache.astore(query, {"answer": ans_text, "chunks": retrieved_chunks})
+            await cache.astore(query, {"answer": ans_text, "chunks": retrieved_chunks}, owner=client_id)
         return {
             "id": f"chatcmpl-slm-{uuid.uuid4().hex[:8]}",
             "object": "chat.completion",
@@ -680,9 +680,9 @@ async def query_endpoint(
                         }
                         if query != raw_query:
                             cache_payload["normalized_query"] = query
-                        cache.store(query, cache_payload)
+                        cache.store(query, cache_payload, owner=client_id)
                         if query != raw_query:
-                            cache.store(raw_query, cache_payload)
+                            cache.store(raw_query, cache_payload, owner=client_id)
                     except Exception:
                         pass
                 yield "data: [DONE]\n\n"
@@ -779,9 +779,9 @@ async def query_endpoint(
                     if query != raw_query:
                         res["normalized_query"] = query
                     if not req.bypass_cache and served_chunks and not is_no_relevant_docs_answer(answer_text):
-                        await cache.astore(query, res)
+                        await cache.astore(query, res, owner=client_id)
                         if query != raw_query:
-                            await cache.astore(raw_query, res)
+                            await cache.astore(raw_query, res, owner=client_id)
                     return res
                 except Exception:
                     pass
@@ -806,9 +806,9 @@ async def query_endpoint(
             res["cached"] = False
             res["routing_time_seconds"] = round(time.time() - t0, 4)
             if not req.bypass_cache and res.get("chunks") and not is_no_relevant_docs_answer(res.get("answer", "")):
-                await cache.astore(query, res)
+                await cache.astore(query, res, owner=client_id)
                 if query != raw_query:
-                    await cache.astore(raw_query, res)
+                    await cache.astore(raw_query, res, owner=client_id)
             return res
 
         # Route: Easy -> CPU SLM
@@ -837,9 +837,9 @@ async def query_endpoint(
         res["cached"] = False
         res["routing_time_seconds"] = round(time.time() - t0, 4)
         if not req.bypass_cache and res.get("chunks") and not is_no_relevant_docs_answer(res.get("answer", "")):
-            await cache.astore(query, res)
+            await cache.astore(query, res, owner=client_id)
             if query != raw_query:
-                await cache.astore(raw_query, res)
+                await cache.astore(raw_query, res, owner=client_id)
         return res
 
 

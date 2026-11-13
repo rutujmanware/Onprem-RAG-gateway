@@ -55,6 +55,7 @@ Individually rate-limiting, retrying, or caching at the application layer is ad 
   * The gateway shall return a cached response for any incoming query whose dense embedding cosine similarity to an active cached entry exceeds threshold $\tau$ (default $\tau = 0.90$, cosine distance $\le 0.10$) or matches exact L0 hash, without invoking retriever or LLM tiers.
   * *Sub-FR-1.1 (Typo Normalization):* The gateway shall normalize technical domain typographical errors in $\le 0.5\text{ ms}$ prior to cache lookup and embedding calculation, ensuring minor spelling variations hit the cache.
   * *Sub-FR-1.2 (Anti-Pollution Gate):* The gateway shall strictly prohibit the caching of any response that retrieved zero document chunks or contains out-of-domain institutional refusal markers.
+  * *Sub-FR-1.3 (Intent-Equivalence Guard):* A semantic (non-exact) hit additionally requires that the incoming query and the cached prompt ask the same question. Similarity $\ge \tau$ is necessary but **not sufficient**: the gateway shall reject the hit when the two queries differ in numbers/years, negation, question type (*why* vs. yes/no vs. *what/how*), opposite terms (e.g. advantages/disadvantages, increase/decrease, un-/in-/dis-/non- forms), quantifier scope (*always*, *every*, *some*, *only*), or the roles of two terms (*A added to B* vs. *B added to A*, *A inhibits B* vs. *B inhibits A*). Rejected hits fall through to a fresh RAG generation. See §9.1 for known limits.
 * **FR-2 (Must): Complexity Routing & Seamless Fallback State Machine**
   * The gateway shall classify query complexity using an ONNX-runtime Two-Tower MLP scorer ($P(\text{hard}) \ge \alpha$, default $\alpha = 0.65$), directing simple queries to the Tier-1 CPU SLM and complex multi-source queries to the Tier-2 GPU LLM.
   * *Acceptance:* Under simulated GPU saturation, timeout ($> 30\text{s}$), or HTTP 5xx errors, 100% of subsequent requests within the failure window shall automatically reroute to the CPU SLM, achieving a 200 OK response.
@@ -87,6 +88,7 @@ Individually rate-limiting, retrying, or caching at the application layer is ad 
 * **NFR-6 (Anti-Pollution Integrity):**
   * 0% of ungrounded responses (0 chunks retrieved) or refusal strings enter the semantic cache index.
   * $\le 5\%$ of adversarial poisoning attempts succeed in altering stored answers for legitimate victim queries.
+  * *Status:* the intent-equivalence guard (Sub-FR-1.3) passes a curated adversarial suite (0 wrong hits on 104 different-intent pairs; 48/48 genuine paraphrases above $\tau$ still served from cache). A curated suite is **not** a population rate: the $\le 5\%$ target has not yet been measured on a representative adversarial workload (§7, §9.1).
 * **NFR-7 (Prompt Injection & Jailbreak Defense):**
   * The gateway detects and blocks $\ge 95\%$ of adversarial prompt injection, DAN jailbreaks, system delimiter escapes, and instruction override attacks, while maintaining a false positive rate $\le 1\%$ on legitimate academic queries.
 
@@ -110,7 +112,7 @@ graph TD
 
     subgraph GATEWAY_TIER ["2. CACHING, ROUTING & ADMISSION TIER"]
         L0Cache["L0 Exact Hash Cache<br/><i>(In-memory SHA-256 Fast Path &lt; 1ms)</i>"]
-        L1Cache["L1 RediSearch Semantic Cache<br/><i>(Port :6379, HNSW Cosine Index, tau &gt;= 0.90)</i>"]
+        L1Cache["L1 RediSearch Semantic Cache<br/><i>(Port :6379, HNSW Cosine Index, tau &gt;= 0.90 + Intent-Equivalence Guard)</i>"]
         AntiPollution["Anti-Pollution Shield [NFR-6]<br/><i>(Zero-chunk & Refusal Invalidation Gate)</i>"]
         AdmissionCtrl["Admission & Rate Limiter<br/><i>(Token Bucket 60/20, Concurrency Semaphores)</i>"]
         MLPRouter["Two-Tower MLP Complexity Router<br/><i>(ONNX Runtime, P(hard) &gt;= 0.65)</i>"]
@@ -192,6 +194,8 @@ graph TD
 | **Ultra-Low-Latency Typo Normalizer ($3.95\ \mu\text{s}$)** | LLM-based query re-writing or heavy fuzzy edit distance | LLM rewriting introduces 200–500ms of latency per query. A bounded candidate-intersection Levenshtein filter with dictionary protection achieves microsecond latency without semantic drift. |
 | **Redis Stack for Vector DB & Semantic Cache** | Cloud Vector DBs (Pinecone) or dual PostgreSQL + pgvector setups | Centralizes institutional thesis embeddings (2.26M vectors) and multi-level semantic caching in one low-latency, zero-cost, bare-metal in-memory daemon. |
 | **Anti-Pollution Semantic Cache Shield** | Caching every generated response unconditionally | Caching answers when zero chunks are retrieved poisons the cache with persistent hallucinations or generic refusals, corrupting subsequent user inquiries. |
+| **Rule-Based Intent-Equivalence Guard on Semantic Hits** | Raising $\tau$; a duplicate-question cross-encoder (`quora-distilroberta-base`) | Different-intent pairs score 0.91–0.999 and genuine paraphrases 0.92–0.998, so no threshold separates them. The cross-encoder mislabelled 10/15 adversarial pairs as duplicates. Deterministic rules cost ~0.04 ms per check, need no model, and fail safe: a false block only costs a fresh generation. |
+| **Shared (Unpartitioned) Semantic Cache with Owner Tags** | Per-user cache partitioning | All authenticated users have identical corpus access, so a shared cache keeps cross-user hit rates. Each entry records a keyed (HMAC) owner tag for audit and targeted purge; lookups do not filter on it. Must be revisited if access tiers are introduced (§9.1). |
 | **Single-Port Architecture (`:8080`)** | Exposing separate frontend, gateway, and model ports | Multiple open ports expand the attack surface and require complex CORS/proxy configurations. Single-port reverse mounting hides internal endpoints behind session authentication. |
 
 ---
@@ -256,10 +260,41 @@ Track C  |---[Locust Generator]---[Baseline/Config Exps]---[Cost Model/Plots]---
   * *Mitigation:* Enforce strict anti-pollution validation: responses with zero retrieved chunks or standard refusal phrasing are never stored.
 * **R3: Typo Normalizer Latency Overhead**
   * *Mitigation:* Length-bounded candidate filtering with dictionary lookup ensures microsecond execution ($3.95\ \mu\text{s}$ benchmarked).
+* **R4: Semantic Cache Intent Collisions (Cache Poisoning by Near-Duplicate Questions)**
+  * *Risk:* Dense embeddings measure topical overlap, not intent, so a loaded question (*"Why does X always…?"*) can seed an answer that is replayed for a neutral or opposite question (*"Does X…?"*, *"disadvantages"* vs. *"advantages"*).
+  * *Mitigation:* Intent-equivalence guard (Sub-FR-1.3), applied at lookup time so pre-existing entries are also covered; regression suites `tests/test_cache_intent_guard.py` and `tests/test_cache_intent_guard_extensive.py`. Residual risk in §9.1.
+* **R5: Model Server Exposure through the Pinned vLLM Version**
+  * *Risk:* The pinned vLLM 0.6.3 pre-binds its listening socket to all interfaces regardless of `--host`, which would expose the unauthenticated model API beyond the `:8080` perimeter (FR-4 / NFR-4).
+  * *Mitigation:* vLLM is launched only through `scripts/serve_vllm.py` (forces the loopback bind, refuses non-loopback hosts, requires `VLLM_API_KEY` Bearer auth on `/v1/*`); `make vllm-check` verifies the perimeter after every restart. Residual risk in §9.2.
 
 ---
 
-## 9. References
+## 9. Known Limitations
+
+### 9.1 Semantic Cache Intent-Equivalence Guard (Sub-FR-1.3, NFR-6)
+The guard is deterministic and rule-based. Its behaviour is pinned by `tests/test_cache_intent_guard_extensive.py`, where the items below are recorded as expected failures (`xfail`) so any change is visible.
+
+| # | Limitation | Effect | Example (similarity) | Mitigation / Status |
+| :-- | :--- | :--- | :--- | :--- |
+| L1 | **Same-structure substitutions are not detected** (different verb or entity in the same slot). | Wrong cache hit (correctness risk). | *"Who supervised the thesis on graphene?"* vs. *"Who wrote the thesis on graphene?"* (0.952) | Open. Most other substitutions tested score below $\tau$ (e.g. melting vs. boiling point 0.857, CNN vs. RNN 0.722). Admins can remove bad entries with `/cache/purge`. |
+| L2 | **Opposite terms outside the curated lexicon** are not recognised (e.g. upsides/downsides, criticize/support, causes/consequences). | Wrong hit only if similarity $\ge \tau$. | All tested pairs scored 0.48–0.81, i.e. below $\tau$. | Lexicon in `gateway/cache/redis_semantic_cache.py` (`_ANTONYM_PAIRS`) must be extended by hand. |
+| L3 | **Accepted over-blocking** of some genuine paraphrases: passive voice, noun-phrase permutations, an added quantifier word, *why…* vs. *what is the importance of…*. | Cache miss: a fresh generation (latency/compute cost), never a wrong answer. | *"Does glucagon secretion inhibit insulin?"* vs. *"Is insulin inhibited by glucagon secretion?"*; *"Graphene synthesis by CVD"* vs. *"CVD synthesis of graphene"*. | By design: strictness is preferred because a false hit serves a wrong answer. |
+| L4 | **English-only heuristics.** Question-type, opposite-term, quantifier and role rules assume English. | Non-English queries are protected only by $\tau$, number and negation checks. | — | Open. |
+| L5 | **Embedding misses below $\tau$** for some genuine paraphrases. | Lower hit rate (FR-1/NFR-1), not a correctness issue. | *"How does a transformer work?"* vs. *"How do transformers work?"* (0.874) | Tune $\tau$ or the embedding model only together with the guard suite. |
+| L6 | **Evidence is a curated suite, not a population rate.** | NFR-6 ($\le 5\%$ successful poisoning) is **not yet measured**. | 104 adversarial + 53 paraphrase pairs. | Run the §7 adversarial mix on a representative workload before claiming NFR-6. |
+| L7 | **Shared cache namespace.** Entries are not partitioned by user; owner tags are recorded but not enforced; no purge-by-owner endpoint yet. Entries created before owner tagging have no tag. | A poisoned entry that passes the guard is visible to all users until TTL (24 h) or purge. | — | Acceptable while all users share the same corpus access. If restricted content or access tiers are added, the cache key **must** include the access tier. |
+| L8 | **Retrieval acronym ambiguity** (e.g. *GANs* vs. *GaN*) is outside the cache's scope. | A wrong-topic answer can be cached for the *same* question. | — | Separate retrieval fix required. |
+
+### 9.2 GPU Model Serving (vLLM 0.6.3, pinned)
+| # | Limitation | Effect | Mitigation / Status |
+| :-- | :--- | :--- | :--- |
+| L9 | vLLM 0.6.3 ignores `--host` for its pre-bound socket and binds all interfaces. | Any launch that bypasses `scripts/serve_vllm.py` (e.g. `python -m vllm.entrypoints.openai.api_server` or `vllm serve`) re-opens the model API to the network. | Launch only via `make serve-gpu` / `scripts/prod_stack.py`; run `make vllm-check` after every restart; `make prod-status` warns when an unauthenticated vLLM is running. Upgrading vLLM is blocked by other workloads. |
+| L10 | The model API key (`VLLM_API_KEY`) is a single static shared secret. | Anyone with shell access to the host can read `.env` and call the model locally. | `.env` is git-ignored; keep it owner-only (`chmod 600`, no extra ACLs); rotate the key by editing `.env` and running `make prod-restart-vllm`. |
+| L11 | On shared GPUs, vLLM 0.6.3 start-up profiling counts other processes' memory changes as its own. | Start-up can fail with *"No available memory for the cache blocks"*, or over-allocate if a co-located job shrinks during profiling. | Select a GPU with steady usage and ~19 GB free via `VLLM_GPU` in `.env`. |
+
+---
+
+## 10. References
 
 1. **AskIISc System Progress & Architecture:** Detailed engineering logs, CPU/GPU benchmarks, and multi-worker deployment specifications.
 2. **RediSearch & Redis Stack Documentation:** Real-time vector search using HNSW vector indexes over cosine distance metrics.
