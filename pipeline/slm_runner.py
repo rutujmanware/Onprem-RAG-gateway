@@ -21,6 +21,12 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv(ROOT_DIR / ".env", override=False)
+except ImportError:
+    pass
+
 import torch
 
 LOCAL_GGUF_MODEL = os.path.join(ROOT_DIR, "models", "slm_gguf", "qwen2.5-3b-instruct-q4_k_m.gguf")
@@ -31,6 +37,10 @@ LOCAL_0_5B_MODEL = os.path.join(ROOT_DIR, "models", "slm_cpu", "qwen2.5-0.5b")
 def resolve_default_model() -> str:
     env_model = os.getenv("SLM_MODEL_NAME")
     if env_model:
+        if not os.path.isabs(env_model):
+            root_relative = os.path.join(ROOT_DIR, env_model)
+            if os.path.exists(root_relative):
+                return root_relative
         return env_model
     if os.path.exists(LOCAL_GGUF_MODEL):
         return LOCAL_GGUF_MODEL

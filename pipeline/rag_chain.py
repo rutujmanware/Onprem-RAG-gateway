@@ -24,6 +24,7 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from pipeline.retriever import RedisChunkRetriever, retrieve_chunks, sanitize_chunks
+from pipeline.sanitizer import is_no_relevant_docs_answer
 from pipeline.slm_runner import CPUSLMEngine
 
 try:
@@ -228,13 +229,14 @@ class RAGQAPipeline:
                     ans_text = data["choices"][0]["message"]["content"]
                     tok_count = data.get("usage", {}).get("completion_tokens", len(ans_text.split()))
                     tok_s = round(tok_count / max(gen_duration, 0.001), 2)
+                    served_chunks = [] if is_no_relevant_docs_answer(ans_text) else sanitize_chunks(chunks)
                     return {
                         "query": query,
                         "answer": ans_text,
                         "route": "hard",
                         "target_tier": "gpu_vllm",
                         "probability_hard": prob,
-                        "chunks": sanitize_chunks(chunks),
+                        "chunks": served_chunks,
                         "stats": {
                             "retrieval_seconds": round(retrieval_duration, 3),
                             "generation_seconds": round(gen_duration, 3),
@@ -258,14 +260,16 @@ class RAGQAPipeline:
             )
             gen_duration = time.time() - t0_gen
             total_duration = time.time() - t_start
+            ans_text = gen_result["text"]
+            served_chunks = [] if is_no_relevant_docs_answer(ans_text) else sanitize_chunks(chunks)
 
             return {
                 "query": query,
-                "answer": gen_result["text"],
+                "answer": ans_text,
                 "route": "hard",
                 "target_tier": "gpu_vllm",
                 "probability_hard": prob,
-                "chunks": sanitize_chunks(chunks),
+                "chunks": served_chunks,
                 "stats": {
                     "retrieval_seconds": round(retrieval_duration, 3),
                     "generation_seconds": round(gen_duration, 3),
@@ -319,13 +323,14 @@ class RAGQAPipeline:
                 ans_text = data["choices"][0]["message"]["content"]
                 tok_count = data.get("usage", {}).get("completion_tokens", len(ans_text.split()))
                 tok_s = round(tok_count / max(gen_duration, 0.001), 2)
+                served_chunks = [] if is_no_relevant_docs_answer(ans_text) else sanitize_chunks(chunks)
                 return {
                     "query": query,
                     "answer": ans_text,
                     "route": "easy",
                     "target_tier": "cpu_slm",
                     "probability_hard": easy_prob,
-                    "chunks": sanitize_chunks(chunks),
+                    "chunks": served_chunks,
                     "stats": {
                         "retrieval_seconds": round(retrieval_duration, 3),
                         "generation_seconds": round(gen_duration, 3),
@@ -351,14 +356,16 @@ class RAGQAPipeline:
         gen_duration = time.time() - t0_gen
 
         total_duration = time.time() - t_start
+        ans_text = gen_result["text"]
+        served_chunks = [] if is_no_relevant_docs_answer(ans_text) else sanitize_chunks(chunks)
 
         return {
             "query": query,
-            "answer": gen_result["text"],
+            "answer": ans_text,
             "route": "easy",
             "target_tier": "cpu_slm",
             "probability_hard": easy_prob,
-            "chunks": sanitize_chunks(chunks),
+            "chunks": served_chunks,
             "stats": {
                 "retrieval_seconds": round(retrieval_duration, 3),
                 "generation_seconds": round(gen_duration, 3),
@@ -455,6 +462,7 @@ class RAGQAPipeline:
                 yield {
                     "type": "done",
                     "full_answer": refusal,
+                    "chunks": [],
                     "stats": {
                         "retrieval_seconds": round(retrieval_duration, 3),
                         "generation_seconds": 0.0,
@@ -526,9 +534,13 @@ class RAGQAPipeline:
                 gen_duration = time.time() - t0_gen
                 total_duration = time.time() - t_start
                 tok_per_sec = round(token_count / max(gen_duration, 0.001), 2)
+                full_ans = "".join(full_response)
+                if is_no_relevant_docs_answer(full_ans):
+                    yield {"type": "chunks", "chunks": []}
                 yield {
                     "type": "done",
-                    "full_answer": "".join(full_response),
+                    "full_answer": full_ans,
+                    "chunks": [] if is_no_relevant_docs_answer(full_ans) else sanitize_chunks(chunks),
                     "stats": {
                         "retrieval_seconds": round(retrieval_duration, 3),
                         "generation_seconds": round(gen_duration, 3),
@@ -565,10 +577,14 @@ class RAGQAPipeline:
             gen_duration = time.time() - t0_gen
             total_duration = time.time() - t_start
             tok_per_sec = round(token_count / max(gen_duration, 0.001), 2)
+            full_ans = "".join(full_response)
+            if is_no_relevant_docs_answer(full_ans):
+                yield {"type": "chunks", "chunks": []}
 
             yield {
                 "type": "done",
-                "full_answer": "".join(full_response),
+                "full_answer": full_ans,
+                "chunks": [] if is_no_relevant_docs_answer(full_ans) else sanitize_chunks(chunks),
                 "stats": {
                     "retrieval_seconds": round(retrieval_duration, 3),
                     "generation_seconds": round(gen_duration, 3),
@@ -600,6 +616,7 @@ class RAGQAPipeline:
             yield {
                 "type": "done",
                 "full_answer": refusal,
+                "chunks": [],
                 "stats": {
                     "retrieval_seconds": round(retrieval_duration, 3),
                     "generation_seconds": 0.0,
@@ -666,9 +683,13 @@ class RAGQAPipeline:
                 gen_duration = time.time() - t0_gen
                 total_duration = time.time() - t_start
                 tok_per_sec = round(token_count / max(gen_duration, 0.001), 2)
+                full_ans = "".join(full_response)
+                if is_no_relevant_docs_answer(full_ans):
+                    yield {"type": "chunks", "chunks": []}
                 yield {
                     "type": "done",
-                    "full_answer": "".join(full_response),
+                    "full_answer": full_ans,
+                    "chunks": [] if is_no_relevant_docs_answer(full_ans) else sanitize_chunks(chunks),
                     "stats": {
                         "retrieval_seconds": round(retrieval_duration, 3),
                         "generation_seconds": round(gen_duration, 3),
@@ -709,10 +730,13 @@ class RAGQAPipeline:
         total_duration = time.time() - t_start
         final_answer = "".join(full_text).strip()
         approx_tokens = len(final_answer.split()) * 4 // 3
+        if is_no_relevant_docs_answer(final_answer):
+            yield {"type": "chunks", "chunks": []}
 
         yield {
             "type": "done",
             "full_answer": final_answer,
+            "chunks": [] if is_no_relevant_docs_answer(final_answer) else sanitize_chunks(chunks),
             "stats": {
                 "ttft_seconds": round(first_token_time or 0, 3),
                 "retrieval_seconds": round(retrieval_duration, 3),

@@ -79,10 +79,23 @@ def sanitize_chunk(chunk: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def sanitize_chunks(chunks: List[Any]) -> List[Dict[str, Any]]:
-    """Sanitize a list of chunks for response by keeping only the document title."""
+    """Sanitize a list of chunks for response by keeping only unique document titles."""
     if not isinstance(chunks, list):
         return chunks
-    return [sanitize_chunk(c) for c in chunks]
+    seen_titles = set()
+    unique_chunks = []
+    for c in chunks:
+        if not isinstance(c, dict):
+            continue
+        sc = sanitize_chunk(c)
+        title = (sc.get("title") or "").strip()
+        if title:
+            if title not in seen_titles:
+                seen_titles.add(title)
+                unique_chunks.append(sc)
+        else:
+            unique_chunks.append(sc)
+    return unique_chunks
 
 
 def load_env_file():

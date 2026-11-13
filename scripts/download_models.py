@@ -130,6 +130,8 @@ def download_slm_model(force: bool = False) -> bool:
             return True
 
     SLM_DIR.mkdir(parents=True, exist_ok=True)
+    if SLM_TARGET_PATH.is_symlink() and (force or not SLM_TARGET_PATH.exists()):
+        SLM_TARGET_PATH.unlink()
     print(f"⬇️ Downloading GGUF weights ({SLM_FILENAME}) from HuggingFace Hub...")
     t0 = time.time()
     try:

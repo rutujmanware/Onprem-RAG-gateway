@@ -12,7 +12,7 @@ from .retrieval import Retriever, NpzRetriever
 from .router import Router
 from .prompt import build_messages
 from . import auth
-from . import gateway_backend
+from .gateway_backend import stream_via_gateway, is_no_relevant_docs_answer
 from .llm_clients import stream_chat, mean_prob, ModelError
 
 log = logging.getLogger("askiisc")
@@ -139,7 +139,7 @@ async def chat(req: ChatReq, request: Request):
     if C.REQUIRE_LOGIN and not user:
         return JSONResponse({"error": "Sign in with your IISc email to use AskIISc."}, status_code=401)
     if C.BACKEND == "gateway":
-        return StreamingResponse(gateway_backend.stream_via_gateway(req.message, tier), media_type="text/event-stream",
+        return StreamingResponse(stream_via_gateway(req.message, tier), media_type="text/event-stream",
                                  headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
     async def gen():
         t0 = time.perf_counter(); tr = {"ts": time.time(), "tier": tier, "user": user and hashlib.sha256(user["sub"].encode()).hexdigest()[:10], "q_len": len(req.message), "thesis": req.thesis_id}
@@ -166,7 +166,19 @@ async def chat(req: ChatReq, request: Request):
             r = app.state.router.route(req.message, qvec, req.force)
             first = r["route"]
             def used(which): return chunks[:C.SLM_TOP_K] if which == "slm" else chunks   # CPU SLM reads fewer chunks
-            def cites(which): return [{"n": i, **c.cite()} for i, c in enumerate(used(which), 1)]
+            def cites(which):
+                seen = set()
+                out = []
+                for c in used(which):
+                    ci = c.cite()
+                    key = (ci.get("title") or ci.get("thesis_id") or "").strip()
+                    if key:
+                        if key not in seen:
+                            seen.add(key)
+                            out.append({"n": len(out) + 1, **ci})
+                    else:
+                        out.append({"n": len(out) + 1, **ci})
+                return out
             yield sse("meta", {"tier": tier, "route": first, "s": round(r["s"], 3), "alpha": app.state.router.alpha,
                                "reason": r["reason"], "citations": cites(first)})
             order = [first] + (["llm" if first == "slm" else "slm"] if req.force not in ("slm", "llm") else [])
@@ -192,6 +204,8 @@ async def chat(req: ChatReq, request: Request):
                         and conf < C.CASCADE_MIN_CONF and len(order) > 1):
                     yield sse("escalate", {"conf": round(conf, 3), "threshold": C.CASCADE_MIN_CONF})
                     final = {"model": which, "escalated": True}; continue
+                if is_no_relevant_docs_answer(out.get("text", "")):
+                    yield sse("sources", {"citations": []})
                 final = {"model": which, "conf": conf, "ttft": ttft, "escalated": bool(final)}
                 break
             t3 = time.perf_counter()

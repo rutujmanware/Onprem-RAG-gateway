@@ -39,7 +39,7 @@ from gateway.clients.cpu_slm_client import CPUSLMClient
 from gateway.clients.vllm_client import VLLMClient
 from pipeline.rag_chain import RAGQAPipeline
 from pipeline.retriever import sanitize_chunks
-from pipeline.sanitizer import sanitize_and_fence_prompt, PromptInjectionAlert
+from pipeline.sanitizer import sanitize_and_fence_prompt, PromptInjectionAlert, is_no_relevant_docs_answer
 
 logger = logging.getLogger("gateway.main")
 
@@ -664,8 +664,12 @@ async def query_endpoint(
                     yield f"data: {json.dumps(event)}\n\n"
 
                 full_text = "".join(collected_answer)
-                # Only cache responses when document chunks were successfully retrieved
-                if full_text and collected_chunks:
+                if is_no_relevant_docs_answer(full_text):
+                    collected_chunks = []
+                    yield f"data: {json.dumps({'type': 'chunks', 'chunks': []})}\n\n"
+
+                # Only cache responses when document chunks were successfully retrieved and not a refusal
+                if full_text and collected_chunks and not is_no_relevant_docs_answer(full_text):
                     try:
                         cache_payload = {
                             "query": raw_query,
@@ -757,6 +761,7 @@ async def query_endpoint(
                         temperature=req.temperature or 0.2,
                     )
                     answer_text = resp["choices"][0]["message"]["content"]
+                    served_chunks = [] if is_no_relevant_docs_answer(answer_text) else sanitize_chunks(chunks)
                     res = {
                         "query": raw_query,
                         "answer": answer_text,
@@ -764,7 +769,7 @@ async def query_endpoint(
                         "target_tier": "gpu_vllm",
                         "model": resp.get("model", "Qwen/Qwen2.5-7B-Instruct"),
                         "score": round(score, 4),
-                        "chunks": sanitize_chunks(chunks),
+                        "chunks": served_chunks,
                         "cached": False,
                         "stats": {
                             "retrieval_seconds": pre_duration,
@@ -773,7 +778,7 @@ async def query_endpoint(
                     }
                     if query != raw_query:
                         res["normalized_query"] = query
-                    if not req.bypass_cache and chunks:
+                    if not req.bypass_cache and served_chunks and not is_no_relevant_docs_answer(answer_text):
                         await cache.astore(query, res)
                         if query != raw_query:
                             await cache.astore(raw_query, res)
@@ -791,13 +796,16 @@ async def query_endpoint(
                 chunks=chunks,
             )
             if "chunks" in res:
-                res["chunks"] = sanitize_chunks(res["chunks"])
+                if is_no_relevant_docs_answer(res.get("answer", "")):
+                    res["chunks"] = []
+                else:
+                    res["chunks"] = sanitize_chunks(res["chunks"])
             res["query"] = raw_query
             if query != raw_query:
                 res["normalized_query"] = query
             res["cached"] = False
             res["routing_time_seconds"] = round(time.time() - t0, 4)
-            if not req.bypass_cache and res.get("chunks"):
+            if not req.bypass_cache and res.get("chunks") and not is_no_relevant_docs_answer(res.get("answer", "")):
                 await cache.astore(query, res)
                 if query != raw_query:
                     await cache.astore(raw_query, res)
@@ -816,7 +824,10 @@ async def query_endpoint(
             chunks=chunks,
         )
         if "chunks" in res:
-            res["chunks"] = sanitize_chunks(res["chunks"])
+            if is_no_relevant_docs_answer(res.get("answer", "")):
+                res["chunks"] = []
+            else:
+                res["chunks"] = sanitize_chunks(res["chunks"])
         res["query"] = raw_query
         if query != raw_query:
             res["normalized_query"] = query
@@ -825,7 +836,7 @@ async def query_endpoint(
         res["score"] = round(score, 4)
         res["cached"] = False
         res["routing_time_seconds"] = round(time.time() - t0, 4)
-        if not req.bypass_cache and res.get("chunks"):
+        if not req.bypass_cache and res.get("chunks") and not is_no_relevant_docs_answer(res.get("answer", "")):
             await cache.astore(query, res)
             if query != raw_query:
                 await cache.astore(raw_query, res)

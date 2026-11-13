@@ -751,16 +751,71 @@
       let text = '';
       let dtEl = null;
 
+      const isNoDocsAnswer = s => {
+        if (!s) return false;
+        const low = s.toLowerCase();
+        return low.includes('no specific institutional repository') ||
+               low.includes('no institutional repository') ||
+               low.includes('no relevant document') ||
+               low.includes('no relevant documents') ||
+               low.includes('no documents were found') ||
+               low.includes('no document was found') ||
+               low.includes('no documents found') ||
+               low.includes('no documents are present') ||
+               low.includes('not present in the thesis') ||
+               low.includes('not found in the thesis') ||
+               low.includes('not found in any of the provided documents') ||
+               low.includes('do not contain information to answer') ||
+               low.includes('does not contain information to answer') ||
+               low.includes('do not contain any information') ||
+               low.includes('does not contain any information') ||
+               low.includes('do not provide any information') ||
+               low.includes('does not provide any information') ||
+               low.includes('cannot answer based on the provided') ||
+               low.includes('unable to answer based on the provided') ||
+               low.includes('insufficient information') ||
+               low.includes('insufficient data') ||
+               low.includes('insufficient context') ||
+               low.includes('not enough information') ||
+               low.includes('do not have enough information') ||
+               low.includes('does not have enough information') ||
+               low.includes('no information is available') ||
+               low.includes('no information was found') ||
+               low.includes('no information about') ||
+               low.includes('no information provided') ||
+               low.includes('there is no information') ||
+               low.includes('unable to find information') ||
+               low.includes('cannot find information') ||
+               low.includes('retrieval failed');
+      };
+
       const showSources = cs => {
         if (dtEl) dtEl.remove();
         dtEl = null;
-        if (!cs || !cs.length) return;
-        const dt = document.createElement('details');
-        dt.innerHTML = '<summary>' + cs.length + ' source document' + (cs.length > 1 ? 's' : '') + '</summary>';
+        if (!cs || !cs.length || isNoDocsAnswer(text)) return;
+
+        // Deduplicate repeated thesis titles using a Set so each source entry is shown only once
+        const seen = new Set();
+        const unique = [];
         cs.forEach(c => {
+          const key = (c.title || c.thesis_id || '').trim();
+          if (key) {
+            if (!seen.has(key)) {
+              seen.add(key);
+              unique.push(c);
+            }
+          } else {
+            unique.push(c);
+          }
+        });
+        if (!unique.length) return;
+
+        const dt = document.createElement('details');
+        dt.innerHTML = '<summary>' + unique.length + ' source document' + (unique.length > 1 ? 's' : '') + '</summary>';
+        unique.forEach((c, idx) => {
           const x = document.createElement('div');
           x.className = 'citation-card';
-          x.textContent = `[${c.n}] ${c.title || c.thesis_id || 'Untitled Document'}` +
+          x.textContent = `[${idx + 1}] ${c.title || c.thesis_id || 'Untitled Document'}` +
                           (c.chapter ? ` · ${c.chapter}` : '') +
                           (c.version ? ` · v${c.version}` : '') +
                           (DEBUG && c.distance ? ` (dist: ${Number(c.distance).toFixed(3)})` : '') +
@@ -822,15 +877,20 @@
               if (DEBUG && d.s != null) head.innerHTML += `<span class="badge" style="color:var(--mut)">P(hard)=${d.s} / α=${d.alpha}</span>`;
               if (d.citations) showSources(d.citations);
             }
-            else if (ev === 'sources') {
+            else if (ev === 'sources' || ev === 'chunks') {
               if (d.citations) showSources(d.citations);
               else if (d.chunks) showSources(d.chunks);
+              else showSources([]);
             }
             else if (ev === 'token') {
               const delta = d.t !== undefined ? d.t : (d.delta !== undefined ? d.delta : (d.content || d.token || ''));
               if (delta) {
                 text += delta;
                 body.innerHTML = renderMathAndMarkdown(text);
+                if (dtEl && isNoDocsAnswer(text)) {
+                  dtEl.remove();
+                  dtEl = null;
+                }
               }
             }
             else if (ev === 'escalate') {
@@ -854,6 +914,10 @@
               body.style.color = 'crimson';
             }
             else if (ev === 'done') {
+              if (dtEl && isNoDocsAnswer(text)) {
+                dtEl.remove();
+                dtEl = null;
+              }
               if (d.refused) {
                 foot.textContent = 'No models were called';
                 continue;

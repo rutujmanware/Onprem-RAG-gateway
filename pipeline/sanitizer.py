@@ -77,3 +77,94 @@ def fence_context_chunks(chunks: List[Dict[str, Any]]) -> str:
     inner = "\n\n".join(blocks)
     return f"<context_data>\n{inner}\n</context_data>"
 
+
+# Canonical refusal and insufficient data phrases emitted when corpus documents do not answer the prompt
+NO_RELEVANT_DOCS_PHRASES = (
+    "no specific institutional repository",
+    "no institutional repository theses",
+    "no institutional repository documents",
+    "no theses were found",
+    "no thesis was found",
+    "no relevant documents",
+    "no relevant document",
+    "no relevant information",
+    "no relevant thesis",
+    "no relevant theses",
+    "no documents were found",
+    "no document was found",
+    "no documents found",
+    "no document found",
+    "no documents directly cover",
+    "no documents in the thesis",
+    "no documents are present",
+    "no relevant documents are present",
+    "not present in the thesis",
+    "not found in the thesis",
+    "not mentioned in the thesis",
+    "not found in any of the provided documents",
+    "do not contain information to answer",
+    "does not contain information to answer",
+    "do not contain enough information",
+    "does not contain enough information",
+    "do not contain any information",
+    "does not contain any information",
+    "do not provide any information",
+    "does not provide any information",
+    "do not provide enough information",
+    "does not provide enough information",
+    "cannot find any information",
+    "could not find any information",
+    "cannot find information",
+    "unable to find information",
+    "cannot answer based on",
+    "unable to answer based on",
+    "insufficient information",
+    "insufficient data",
+    "insufficient context",
+    "not enough information",
+    "not have enough information",
+    "do not have enough information",
+    "does not have enough information",
+    "no information provided",
+    "information is not available",
+    "no information is available",
+    "no information was found",
+    "no information about",
+    "there is no information",
+    "retrieval failed",
+    "based on general academic knowledge",
+    "based on general technical knowledge",
+)
+
+NO_RELEVANT_DOCS_PATTERNS = [
+    re.compile(r"no\s+specific\s+institutional\s+repository", re.IGNORECASE),
+    re.compile(r"no\s+institutional\s+repository", re.IGNORECASE),
+    re.compile(r"no\s+thes[ie]s\s+(?:were|was|are|is)?\s*found", re.IGNORECASE),
+    re.compile(r"no\s+relevant\s+documents?", re.IGNORECASE),
+    re.compile(r"no\s+documents?\s+(?:were|was|are|is)?\s*(?:found|present)", re.IGNORECASE),
+    re.compile(r"not\s+present\s+in\s+the\s+thes[ie]s", re.IGNORECASE),
+    re.compile(r"not\s+found\s+in\s+(?:the\s+thes[ie]s|the\s+provided\s+documents?)", re.IGNORECASE),
+    re.compile(r"(?:provided|retrieved)\s+documents?\s+do(?:es)?\s*not\s+contain", re.IGNORECASE),
+    re.compile(r"(?:cannot|unable\s+to)\s+answer\s+based\s+on\s+the\s+(?:provided|retrieved)", re.IGNORECASE),
+    re.compile(r"no\s+information\s+(?:is\s+)?(?:about|regarding|on|in|available|found|provided)", re.IGNORECASE),
+    re.compile(r"there\s+is\s+no\s+information", re.IGNORECASE),
+    re.compile(r"no\s+documents?\s+(?:directly\s+)?(?:cover|discuss|address)", re.IGNORECASE),
+]
+
+
+def is_no_relevant_docs_answer(answer_text: str) -> bool:
+    """Return True if answer_text indicates that no relevant documents were found in the thesis repository."""
+    if not answer_text or not isinstance(answer_text, str):
+        return False
+    t = answer_text.strip().lower()
+    if not t:
+        return False
+    for p in NO_RELEVANT_DOCS_PHRASES:
+        if p in t:
+            return True
+    for pat in NO_RELEVANT_DOCS_PATTERNS:
+        if pat.search(t):
+            return True
+    return False
+
+
