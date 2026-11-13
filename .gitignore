@@ -88,3 +88,6 @@ packages/
 *.bak
 .DS_Store
 Thumbs.db
+#test sets
+tests/test_cache_intent_guard_extensive.py
+tests/test_cache_intent_guard.py

@@ -148,6 +148,8 @@ CPU_BATCH_THREADS=32
 
 VLLM_BASE_URL=http://localhost:8000/v1
 VLLM_MODEL_NAME=Qwen/Qwen2.5-7B-Instruct
+VLLM_API_KEY=<GENERATE: python -c 'import secrets;print(secrets.token_hex(32))'>   # required by scripts/serve_vllm.py; sent as Bearer by all clients
+VLLM_GPU=0          # GPU index for vLLM (shared machine: pick a GPU with steady usage and ~19 GB free)
 GPU_DEVICE=0
 
 # Router & Admission Control
@@ -367,12 +369,12 @@ huggingface-cli download Qwen/Qwen2.5-7B-Instruct --local-dir models/llm_7b/qwen
 make serve-gpu
 
 # Via Native Command (always use the hardened launcher, never `python -m vllm.entrypoints.openai.api_server`):
-CUDA_VISIBLE_DEVICES=0 python scripts/serve_vllm.py \
+CUDA_VISIBLE_DEVICES=${VLLM_GPU:-0} python scripts/serve_vllm.py \
     --model models/llm_7b/qwen2.5-7b-instruct \
     --served-model-name "Qwen/Qwen2.5-7B-Instruct" \
     --host 127.0.0.1 \
     --port 8000 \
-    --gpu-memory-utilization 0.90 \
+    --gpu-memory-utilization 0.45 \
     --max-model-len 8192 \
     --dtype bfloat16
 ```
@@ -458,15 +460,25 @@ make prod-status
 # Or natively:
 python scripts/prod_stack.py status
 
-# Graceful restart with zero downtime:
+# Graceful restart of Gateway + CPU SLM (vLLM and Redis keep running):
 make prod-restart
 # Or natively:
 python scripts/prod_stack.py restart
 
-# Stop services (preserves Redis Stack database in RAM):
-make prod-down
+# Also restart vLLM (slow model reload; needed after vLLM launch/security changes):
+make prod-restart-vllm
 # Or natively:
-python scripts/prod_stack.py stop
+python scripts/prod_stack.py restart --with-vllm
+
+# Verify the GPU model server is loopback-only and requires VLLM_API_KEY:
+make vllm-check
+
+# Stop services (preserves Redis Stack database in RAM and the vLLM engine):
+make prod-down
+# Also stop vLLM:
+make prod-down-vllm
+# Or natively:
+python scripts/prod_stack.py stop [--with-vllm]
 ```
 
 ---
@@ -475,7 +487,7 @@ python scripts/prod_stack.py stop
 
 The codebase includes an extensive suite of unit, security, and intensive end-to-end integration tests:
 
-### Running Full Pytest Suite (84 Tests):
+### Running Full Pytest Suite:
 ```bash
 # Via Make:
 make test
@@ -484,7 +496,13 @@ make test
 pytest tests/ -v
 ```
 
-### Running Intensive Full-Stack Verification (36 Checks):
+### Semantic Cache Intent-Guard Suites:
+`make test` includes [`tests/test_cache_intent_guard.py`](tests/test_cache_intent_guard.py) and [`tests/test_cache_intent_guard_extensive.py`](tests/test_cache_intent_guard_extensive.py) (rule, real-embedding, live Redis and live gateway checks). Known limits are recorded as `xfail`; see §9 of the [PRD](product_requirements_document.md).
+```bash
+PYTHONPATH=. pytest -q tests/test_cache_intent_guard.py tests/test_cache_intent_guard_extensive.py
+```
+
+### Running Intensive Full-Stack Verification:
 Verifies live MLP routing, CPU SLM TTFT, GPU vLLM throughput, Redis semantic cache exact and paraphrase hits, and output sanitization:
 ```bash
 # Via Make:
@@ -529,6 +547,10 @@ make otp-clear
 | **Gateway returns 429 Too Many Requests** | Client token bucket capacity exhausted. | Wait 2 seconds for bucket refill (20 tokens/sec), or increase `RATE_LIMIT_BURST` and `RATE_LIMIT_RPS` in `.env`. |
 | **OTP Email not received** | SMTP credentials invalid or rate limit hit. | Run `python scripts/clear_otp_limits.py <your_email>`. Verify SMTP credentials with `python scripts/test_smtp.py <your_email>`. |
 | **vLLM CUDA Out-of-Memory** | GPU VRAM over-allocation. | Set `--gpu-memory-utilization 0.85` or decrease `--max-model-len 4096` in `Makefile` / `scripts/prod_stack.py`. |
+| **vLLM: `No available memory for the cache blocks`** | vLLM 0.6.3 counts other users' memory changes on a shared GPU during start-up profiling. | Choose a GPU with steady usage and ~19 GB free (`nvidia-smi`), set `VLLM_GPU` in `.env`, then `make prod-restart-vllm`. |
+| **vLLM: `Address already in use` on restart** | Previous server's connections on port 8000 still closing. | Already handled by `scripts/serve_vllm.py` (`SO_REUSEADDR`); if it persists, check `ss -ltnp \| grep :8000` for a stray process. |
+| **`make vllm-check` fails / 🚨 warning in `make prod-status`** | vLLM was started without `scripts/serve_vllm.py`, so it is bound to `0.0.0.0` without an API key. | `make prod-restart-vllm`, then `make vllm-check`. |
+| **Cached answer not reused for a rephrased question** | The semantic-cache intent guard rejected the match (different question type, opposite terms, quantifiers, swapped roles) or similarity < 0.90. | Expected behaviour; the gateway logs `rejected by entity/intent guard: <reason>`. See PRD §9.1. |
 | **CSRF Error: 403 Forbidden** | Missing or mismatched CSRF cookie/header. | Ensure client passes `X-CSRF-Token` header matching the `csrftoken` cookie issued by `GET /me` or `GET /`. |
 
 ---
@@ -558,6 +580,7 @@ make prod-up
 make prod-status
 
 # 6. Verify System Health & Security
+make vllm-check
 make test-intensive
 
 # 7. Access Web Chat UI

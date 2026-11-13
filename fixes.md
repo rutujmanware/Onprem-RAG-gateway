@@ -18,6 +18,8 @@
 | **VULN-06** | **Denial of Service via Unbounded `top_k` and Query Text** | **MEDIUM (CVSS 5.3)** | **RESOLVED & VERIFIED** | [`gateway/main.py`](gateway/main.py) & [`pipeline/retriever.py`](pipeline/retriever.py) |
 | **VULN-07** | **Unpartitioned Semantic Cache Poisoning Across Users** | **MEDIUM (CVSS 5.3)** | **RESOLVED & VERIFIED** | [`gateway/cache/redis_semantic_cache.py`](gateway/cache/redis_semantic_cache.py) & [`gateway/main.py`](gateway/main.py) |
 | **VULN-08** | **Timing Analysis on `ADMIN_KEY` & Cleartext Cookies** | **LOW (CVSS 3.7)** | **RESOLVED & VERIFIED** | [`gateway/main.py`](gateway/main.py), [`.env`](.env), [`.env.example`](.env.example) |
+| **VULN-09** | **Unauthenticated GPU Model API Reachable Beyond the `:8080` Perimeter (vLLM 0.6.3 ignores `--host`)** | **HIGH** | **RESOLVED & VERIFIED** | [`scripts/serve_vllm.py`](scripts/serve_vllm.py), [`scripts/prod_stack.py`](scripts/prod_stack.py), [`Makefile`](Makefile), vLLM clients |
+| **VULN-10** | **Semantic Cache Intent Collisions (near-duplicate questions reuse each other's answers)** | **MEDIUM** | **MITIGATED (known limits documented)** | [`gateway/cache/redis_semantic_cache.py`](gateway/cache/redis_semantic_cache.py), [`gateway/main.py`](gateway/main.py) |
 
 ---
 
@@ -1211,6 +1213,53 @@ tests/test_constant_time_and_cookie_security.py::test_secrets_compare_digest_tim
   - `test_otp_verify_rate_limiting`: 429 Too Many Requests after 10 failed attempts.
   - `test_debug_mode_disabled_by_default`: Production environment leaves debug disabled.
   - `test_session_cookie_samesite_strict`: Enforces `SameSite=Strict`.
+
+---
+
+## VULN-09: Unauthenticated GPU Model API Reachable Beyond the Perimeter
+
+*Reported by the red team, Nov 2026 (private channel; host and reproduction details intentionally omitted).*
+
+### 1. Root Cause
+- The documented design keeps the vLLM server (port 8000) on `127.0.0.1` behind the `:8080` gateway (FR-4, NFR-4), and every launch path passed `--host 127.0.0.1`.
+- The pinned **vLLM 0.6.3** pre-binds its listening socket with `bind(("", port))` in `run_server()` and hands that file descriptor to uvicorn, so `--host` is silently ignored and the server listens on **all interfaces**.
+- No API key was configured, so the model accepted unauthenticated inference requests.
+- Upgrading vLLM was not an option because other workloads depend on 0.6.3.
+
+### 2. Changes Applied
+1. [`scripts/serve_vllm.py`](scripts/serve_vllm.py): drop-in launcher (same arguments as the stock entrypoint) that rebinds the pre-bound socket to `--host`, verifies the bound address, refuses non-loopback hosts unless `VLLM_ALLOW_NON_LOOPBACK=1`, sets `SO_REUSEADDR` for quick restarts, and **refuses to start without `VLLM_API_KEY`**. vLLM then enforces `Authorization: Bearer <key>` on `/v1/*`.
+2. All vLLM clients send the key: [`pipeline/rag_chain.py`](pipeline/rag_chain.py), [`gateway/clients/vllm_client.py`](gateway/clients/vllm_client.py), [`askiisc_chat/askiisc/config.py`](askiisc_chat/askiisc/config.py).
+3. [`scripts/prod_stack.py`](scripts/prod_stack.py) and `make serve-gpu` use the launcher; `restart --with-vllm` stops the whole vLLM process group (so GPU memory is released); `status`/`start` warn when an unauthenticated vLLM is running; `VLLM_GPU` selects the GPU.
+4. New Make targets: `prod-restart-vllm`, `prod-down-vllm`, `vllm-check` ([`scripts/check_vllm_security.sh`](scripts/check_vllm_security.sh)).
+
+### 3. Verification
+- [`tests/test_vllm_launcher.py`](tests/test_vllm_launcher.py): 9 tests (stock 0.6.3 binds `0.0.0.0`; launcher binds `127.0.0.1`; wildcard/non-loopback hosts refused; `SO_REUSEADDR` set).
+- Live: `make vllm-check` → listener `127.0.0.1:8000`; 401 without key and with a wrong key; 200 with the key; unreachable via the host's network IPs.
+- Residual limits: PRD §9.2 (L9–L11).
+
+---
+
+## VULN-10: Semantic Cache Intent Collisions
+
+*Reported by the red team, Nov 2026 (private channel; the detailed prompt pairs are intentionally not reproduced here).*
+
+### 1. Root Cause
+- A semantic hit only required the nearest cached prompt to have cosine similarity $\ge 0.90$ plus two narrow checks (numbers, negation words).
+- `all-MiniLM-L6-v2` measures topical overlap, not intent. Different-intent pairs (a loaded *"Why does X always…?"* vs. a neutral *"Does X…?"*, *advantages* vs. *disadvantages*, two reactants swapped) scored **0.91–0.999**, overlapping genuine paraphrases (0.92–0.998). No threshold separates them.
+- The cache namespace is shared across users, so a replayed answer can reach other accounts (cross-account impact was not demonstrated by the red team; plausible from code).
+- Evaluated alternatives: raising the threshold (cannot separate the ranges); a duplicate-question cross-encoder (`cross-encoder/quora-distilroberta-base`) mislabelled 10/15 adversarial pairs as duplicates.
+
+### 2. Changes Applied
+1. [`gateway/cache/redis_semantic_cache.py`](gateway/cache/redis_semantic_cache.py): `check_entity_conflict()` now also runs `check_intent_conflict()`; a semantic hit is rejected when the queries differ in question type (*why* / yes-no / *what-how* / *who* / *when* / *where*), opposite terms (curated lexicon + un-/in-/im-/ir-/il-/dis-/non- forms), quantifiers, or when two terms swap sides of a directional word or a shared verb (pure permutations only). Negation detection fixed for `n't` contractions and curly apostrophes.
+2. The guard runs at **lookup** time, so entries cached before the fix are also protected; no cache wipe was needed.
+3. Each stored entry records a keyed HMAC-SHA256 owner tag (`owner`, keyed by `SESSION_SECRET`) of the creating user for audit and targeted purge. The cache stays shared (lookups do not filter on it), which is acceptable while all authenticated users share the same corpus access.
+4. [`gateway/main.py`](gateway/main.py): all 16 `store`/`astore` calls pass `owner=client_id`.
+
+### 3. Verification
+- [`tests/test_cache_intent_guard.py`](tests/test_cache_intent_guard.py) (61 tests) and [`tests/test_cache_intent_guard_extensive.py`](tests/test_cache_intent_guard_extensive.py) (550 tests: rule level, real-embedding decision level, live Redis, live gateway, robustness, symmetry, performance).
+- Curated adversarial suite: wrong cache hits **74/104 → 0/104** (similarity $\ge 0.90$ and guard passed); genuine paraphrases above threshold still served from cache: **48/48**. Guard cost ≈ 0.04 ms per check.
+- This is a curated suite, not a population rate: the NFR-6 target ($\le 5\%$ successful poisoning) is **not yet measured**.
+- Residual limits recorded as `xfail` and in PRD §9.1 (L1–L8), notably same-structure substitutions (*"Who supervised…"* vs. *"Who wrote…"*), English-only heuristics, and the shared cache namespace.
 
 ---
 
