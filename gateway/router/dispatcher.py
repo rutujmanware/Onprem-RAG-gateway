@@ -30,9 +30,11 @@ class RequestDispatcher:
     def decide(self, score: float, gpu_saturated: bool = False, force_tier=None) -> RouteDecision:
         if force_tier:
             return RouteDecision(target_tier=force_tier, score=score, alpha=self.alpha, target_model=self.slm_model_name if force_tier == ModelTier.CPU_SLM else self.vllm_model_name, reason=f"Manual: {force_tier}")
-        if score <= self.alpha:
-            return RouteDecision(target_tier=ModelTier.CPU_SLM, score=score, alpha=self.alpha, target_model=self.slm_model_name, reason="Score <= Alpha")
+        # FR-2: P(hard) >= alpha routes to the Tier-2 GPU LLM, so a score exactly at alpha is GPU-bound.
+        # Same rule as QueryRouter (prob >= threshold) and serve_router (score >= threshold).
+        if score < self.alpha:
+            return RouteDecision(target_tier=ModelTier.CPU_SLM, score=score, alpha=self.alpha, target_model=self.slm_model_name, reason="Score < Alpha")
         else:
             if gpu_saturated and self.fallback_enabled:
                 return RouteDecision(target_tier=ModelTier.CPU_SLM, score=score, alpha=self.alpha, target_model=self.slm_model_name, reason="GPU saturated", fallback_applied=True)
-            return RouteDecision(target_tier=ModelTier.GPU_LLM, score=score, alpha=self.alpha, target_model=self.vllm_model_name, reason="Score > Alpha")
+            return RouteDecision(target_tier=ModelTier.GPU_LLM, score=score, alpha=self.alpha, target_model=self.vllm_model_name, reason="Score >= Alpha")

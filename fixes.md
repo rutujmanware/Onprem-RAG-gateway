@@ -1263,5 +1263,15 @@ tests/test_constant_time_and_cookie_security.py::test_secrets_compare_digest_tim
 
 ---
 
+## DEFECT-12: Routing Boundary Off-by-One at `P(hard) == alpha` (FR-2)
+
+*Reported by the red team, Nov 2026.*
+
+- **Defect:** FR-2 specifies $P(\text{hard}) \ge \alpha$ routes to the Tier-2 GPU LLM, but [`gateway/router/dispatcher.py`](gateway/router/dispatcher.py) used `score <= self.alpha` for the CPU branch, so a score exactly at $\alpha = 0.65$ was sent to the CPU SLM. The MLP router (`prob >= threshold`) and the router microservice (`score >= threshold`) already used the correct boundary, so the gateway disagreed with its own router at equality.
+- **Fix:** CPU branch is now `score < self.alpha`; reasons renamed to `Score < Alpha` / `Score >= Alpha`. The GPU-saturation fallback still applies at equality.
+- **Verification:** [`tests/test_dispatcher_threshold.py`](tests/test_dispatcher_threshold.py) (20 tests: equality, just-below, custom alphas, saturation fallback, forced tier, and a 1,001-point sweep checking agreement with the router rule). 10 of these fail on the previous code and all 20 pass after the fix. Added to `make test`.
+
+---
+
 ## Remediation Complete
 All security vulnerabilities, cache qualification defects, frontend/backend break vectors, and redundant code have been fully resolved, hardened, and verified with passing regression tests. All changes are cleanly staged. Per instructions, `git commit` has not been run.
