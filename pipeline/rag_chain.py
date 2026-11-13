@@ -27,6 +27,13 @@ from pipeline.retriever import RedisChunkRetriever, retrieve_chunks, sanitize_ch
 from pipeline.sanitizer import is_no_relevant_docs_answer
 from pipeline.slm_runner import CPUSLMEngine
 
+
+def _vllm_auth_headers() -> Dict[str, str]:
+    """Bearer header for the vLLM server, which requires VLLM_API_KEY on /v1/*."""
+    key = os.getenv("VLLM_API_KEY", "").strip()
+    return {"Authorization": f"Bearer {key}"} if key else {}
+
+
 try:
     from gateway.router.mlp_router.inference import QueryRouter
 except Exception:
@@ -214,6 +221,7 @@ class RAGQAPipeline:
                     t0_gen = time.time()
                     resp = httpx.post(
                         f"{gpu_server_url}/chat/completions",
+                        headers=_vllm_auth_headers(),
                         json={
                             "model": "Qwen/Qwen2.5-7B-Instruct",
                             "messages": messages,
@@ -504,6 +512,7 @@ class RAGQAPipeline:
                 with httpx.stream(
                     "POST",
                     f"{gpu_server_url}/chat/completions",
+                    headers=_vllm_auth_headers(),
                     json={
                         "model": "Qwen/Qwen2.5-7B-Instruct",
                         "messages": messages,

@@ -366,8 +366,8 @@ huggingface-cli download Qwen/Qwen2.5-7B-Instruct --local-dir models/llm_7b/qwen
 # Via Make:
 make serve-gpu
 
-# Via Native Command:
-CUDA_VISIBLE_DEVICES=0 python -m vllm.entrypoints.openai.api_server \
+# Via Native Command (always use the hardened launcher, never `python -m vllm.entrypoints.openai.api_server`):
+CUDA_VISIBLE_DEVICES=0 python scripts/serve_vllm.py \
     --model models/llm_7b/qwen2.5-7b-instruct \
     --served-model-name "Qwen/Qwen2.5-7B-Instruct" \
     --host 127.0.0.1 \
@@ -377,9 +377,12 @@ CUDA_VISIBLE_DEVICES=0 python -m vllm.entrypoints.openai.api_server \
     --dtype bfloat16
 ```
 
+> **Security note (vLLM 0.6.3):** stock vLLM 0.6.3 pre-binds its socket with `bind(("", port))`, so `--host 127.0.0.1` is ignored and the model API listens on **all interfaces**. `scripts/serve_vllm.py` forces the bind onto `--host`, refuses non-loopback hosts, and refuses to start without `VLLM_API_KEY` (set in `.env`), which vLLM then enforces as `Authorization: Bearer <key>` on every `/v1/*` route. Verify after every restart: `ss -ltnp | grep :8000` must show `127.0.0.1:8000`.
+
 ### Testing GPU LLM Endpoint
 ```bash
-curl -s http://localhost:8000/v1/models | jq .
+curl -s http://localhost:8000/v1/models -H "Authorization: Bearer $VLLM_API_KEY" | jq .   # 200
+curl -s -o /dev/null -w '%{http_code}\n' http://localhost:8000/v1/models                    # 401
 ```
 
 ---

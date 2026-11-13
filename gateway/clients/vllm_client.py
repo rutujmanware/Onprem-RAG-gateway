@@ -7,6 +7,12 @@ DEFAULT_VLLM_BASE_URL = os.getenv("VLLM_BASE_URL", "http://localhost:8000/v1")
 DEFAULT_VLLM_MODEL = os.getenv("VLLM_MODEL_NAME", "Qwen/Qwen2.5-7B-Instruct")
 
 
+def vllm_auth_headers() -> Dict[str, str]:
+    """Bearer header for the vLLM server, which requires VLLM_API_KEY on /v1/*."""
+    key = os.getenv("VLLM_API_KEY", "").strip()
+    return {"Authorization": f"Bearer {key}"} if key else {}
+
+
 class VLLMClient:
     """Asynchronous HTTP client for the on-premise GPU LLM (vLLM / FastAPI) server."""
 
@@ -27,6 +33,7 @@ class VLLMClient:
             self._client = httpx.AsyncClient(
                 base_url=self.base_url,
                 timeout=self.timeout,
+                headers=vllm_auth_headers(),
             )
         return self._client
 

@@ -152,7 +152,9 @@ def start_all():
         if not is_pid_running(pids.get("vllm", 0)):
             print(f"🔥 Starting vLLM GPU Server on port {VLLM_PORT} (NVIDIA A100)...")
             vllm_cmd = [
-                PYTHON_BIN, "-m", "vllm.entrypoints.openai.api_server",
+                # Hardened launcher: vLLM 0.6.3 ignores --host on its pre-bound
+                # socket (binds 0.0.0.0); serve_vllm.py enforces loopback + API key.
+                PYTHON_BIN, str(ROOT_DIR / "scripts" / "serve_vllm.py"),
                 "--model", "models/llm_7b/qwen2.5-7b-instruct",
                 "--served-model-name", "Qwen/Qwen2.5-7B-Instruct",
                 "--host", "127.0.0.1",
@@ -161,10 +163,14 @@ def start_all():
                 "--max-model-len", "8192",
                 "--dtype", "bfloat16",
             ]
-            pid = start_service("vllm", vllm_cmd, env={"CUDA_VISIBLE_DEVICES": "0"})
+            # GPU index for vLLM on this shared machine; set VLLM_GPU in .env (default 0).
+            vllm_gpu = os.getenv("VLLM_GPU", "0").strip() or "0"
+            print(f"   (vLLM on GPU {vllm_gpu}; set VLLM_GPU in .env to change)")
+            pid = start_service("vllm", vllm_cmd, env={"CUDA_VISIBLE_DEVICES": vllm_gpu})
             pids["vllm"] = pid
     else:
         print(f"✅ vLLM GPU Server is already running on port {VLLM_PORT}.")
+        warn_if_vllm_insecure()
 
     # 3. Start CPU SLM Server
     slm_st, _ = check_port_health(SLM_PORT, "/healthz")
@@ -218,6 +224,65 @@ def start_all():
     print_status()
 
 
+def vllm_is_unauthenticated() -> bool:
+    """True if the running vLLM answers /v1/models WITHOUT a Bearer key (pre-hardening launch)."""
+    try:
+        req = urllib.request.Request(f"http://127.0.0.1:{VLLM_PORT}/v1/models")
+        with urllib.request.urlopen(req, timeout=2.0) as resp:
+            return resp.status == 200
+    except Exception:
+        return False  # 401 (secured) or not running
+
+
+def warn_if_vllm_insecure() -> None:
+    if vllm_is_unauthenticated():
+        print("🚨 SECURITY: the running vLLM on port 8000 accepts unauthenticated /v1 requests")
+        print("   (started without scripts/serve_vllm.py, so it is also bound to 0.0.0.0).")
+        print("   Fix: python scripts/prod_stack.py restart --with-vllm   (or: make prod-restart-vllm)")
+
+
+def stop_process_group(name: str, pid: int, timeout: float = 90.0) -> None:
+    """SIGTERM a service's whole process group and wait, escalating to SIGKILL.
+
+    vLLM runs its engine in a child process that owns the GPU memory; killing only
+    the parent can orphan it and leave the GPU allocated, so the new vLLM fails to start.
+    Services are launched with start_new_session=True, so the PID is its group leader.
+    """
+    try:
+        pgid = os.getpgid(pid)
+    except ProcessLookupError:
+        return
+    if pgid != pid or pgid == os.getpgid(0):
+        print(f"⚠️ {name} (PID {pid}) is not its own process group; signalling the PID only.")
+        send = lambda sig: os.kill(pid, sig)
+        alive = lambda: is_pid_running(pid)
+    else:
+        send = lambda sig: os.killpg(pgid, sig)
+
+        def alive() -> bool:
+            try:
+                os.killpg(pgid, 0)
+                return True
+            except ProcessLookupError:
+                return False
+
+    print(f"Stopping {name} (process group {pgid}), waiting up to {int(timeout)}s for GPU release...")
+    try:
+        send(signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    deadline = time.time() + timeout
+    while time.time() < deadline and alive():
+        time.sleep(1.0)
+    if alive():
+        print(f"Force killing {name} (process group {pgid})...")
+        try:
+            send(signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        time.sleep(2.0)
+
+
 def stop_all(stop_redis: bool = False, stop_vllm: bool = False):
     pids = load_pids()
     print("=" * 70)
@@ -227,7 +292,14 @@ def stop_all(stop_redis: bool = False, stop_vllm: bool = False):
     # Stop order: Gateway -> SLM (Keep Redis and vLLM active to avoid costly reload)
     service_names = ["gateway", "slm"]
     if stop_vllm:
-        service_names.append("vllm")
+        vllm_pid = pids.get("vllm")
+        if vllm_pid and is_pid_running(vllm_pid):
+            stop_process_group("vllm", vllm_pid)
+        else:
+            print("ℹ️ No vLLM PID recorded; if port 8000 is still busy, stop that process manually.")
+        service_names.append("vllm")  # drop it from the PID file below
+    else:
+        print("ℹ️ Preserving vLLM GPU engine (use --with-vllm to restart it).")
     if stop_redis:
         service_names.append("redis")
     else:
@@ -275,6 +347,7 @@ def print_status():
     print("\n" + "=" * 70)
     print("📊 PRODUCTION STACK HEALTH & RUNTIME DASHBOARD")
     print("=" * 70)
+    warn_if_vllm_insecure()
 
     services = [
         ("Redis Vector & Cache", REDIS_PORT, "", True, pids.get("redis"), True),
@@ -323,16 +396,18 @@ def print_status():
 def main():
     parser = argparse.ArgumentParser(description="Production Stack Orchestrator")
     parser.add_argument("action", choices=["start", "stop", "status", "restart"], help="Action to perform")
+    parser.add_argument("--with-vllm", action="store_true",
+                        help="Also stop/restart the vLLM GPU engine (slow model reload; needed to apply vLLM launch changes)")
     args = parser.parse_args()
 
     if args.action == "start":
         start_all()
     elif args.action == "stop":
-        stop_all()
+        stop_all(stop_vllm=args.with_vllm)
     elif args.action == "status":
         print_status()
     elif args.action == "restart":
-        stop_all()
+        stop_all(stop_vllm=args.with_vllm)
         time.sleep(1.0)
         start_all()
 

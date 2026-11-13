@@ -30,6 +30,7 @@ _pw_str = f":{_redis_pw}@" if _redis_pw else ""
 REDIS_URL = os.getenv("REDIS_URL", f"redis://{_pw_str}{os.getenv('REDIS_HOST', 'localhost')}:{os.getenv('REDIS_PORT', '6379')}/0")
 GATEWAY_URL = os.getenv("GATEWAY_URL", "http://127.0.0.1:8080").rstrip("/")
 VLLM_BASE = os.getenv("VLLM_BASE_URL", "http://127.0.0.1:8000").rstrip("/").rsplit("/v1", 1)[0]
+VLLM_HEADERS = {"Authorization": f"Bearer {os.getenv('VLLM_API_KEY', '')}"}
 SLM_BASE = os.getenv("SLM_BASE_URL", "http://127.0.0.1:8082").rstrip("/").rsplit("/v1", 1)[0]
 
 FORBIDDEN_CHUNK_KEYS = {"chunk_key", "handle_id", "chunk_index", "vector", "embedding"}
@@ -203,7 +204,14 @@ except Exception as e:
     record_result("GPU vLLM", "Health Check", False, str(e))
 
 try:
-    r_vllm_models = httpx.get(f"{VLLM_BASE}/v1/models", timeout=3.0)
+    r_vllm_unauth = httpx.get(f"{VLLM_BASE}/v1/models", timeout=3.0)
+    record_result("GPU vLLM", "Unauthenticated /v1 Rejected", r_vllm_unauth.status_code == 401,
+                  f"Status without Bearer key: {r_vllm_unauth.status_code} (expected 401)")
+except Exception as e:
+    record_result("GPU vLLM", "Unauthenticated /v1 Rejected", False, str(e))
+
+try:
+    r_vllm_models = httpx.get(f"{VLLM_BASE}/v1/models", headers=VLLM_HEADERS, timeout=3.0)
     models_json = r_vllm_models.json()
     model_id = models_json["data"][0]["id"]
     record_result("GPU vLLM", "Models Registry", r_vllm_models.status_code == 200, f"Active Model: {model_id}")
@@ -219,6 +227,7 @@ try:
     t0 = time.time()
     r_vllm_sync = httpx.post(
         f"{VLLM_BASE}/v1/chat/completions",
+        headers=VLLM_HEADERS,
         json={"model": "Qwen/Qwen2.5-7B-Instruct", "messages": vllm_sample_messages, "max_tokens": 100, "temperature": 0.2},
         timeout=30.0,
     )
@@ -238,6 +247,7 @@ try:
     with httpx.stream(
         "POST",
         f"{VLLM_BASE}/v1/chat/completions",
+        headers=VLLM_HEADERS,
         json={"model": "Qwen/Qwen2.5-7B-Instruct", "messages": vllm_sample_messages, "max_tokens": 120, "temperature": 0.2, "stream": True},
         timeout=30.0,
     ) as stream_resp:
