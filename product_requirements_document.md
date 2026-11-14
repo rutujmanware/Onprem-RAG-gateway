@@ -31,6 +31,7 @@ Individually rate-limiting, retrying, or caching at the application layer is ad 
 * External cloud SaaS dependencies (the architecture enforces 100% zero-egress bare-metal operation).
 * A commercial multi-tenant credit-billing system (tenants and users are authenticated campus identities).
 * General-purpose API gateway features unrelated to LLM/RAG workloads (e.g., GraphQL proxies, arbitrary REST routing).
+* Metadata-filtered retrieval (restricting results by author, advisor, department, degree or year) is not applicable to this project: retrieval is content-based, and questions that name a person or department are answered by semantic search over thesis text.
 
 ---
 
@@ -121,7 +122,7 @@ graph TD
         AntiPollution["Anti-Pollution Shield [NFR-6]<br/><i>(Zero-chunk & Refusal Invalidation Gate)</i>"]
         AdmissionCtrl["Admission & Rate Limiter<br/><i>(Token Bucket 60/20, Concurrency Semaphores)</i>"]
         MLPRouter["Two-Tower MLP Complexity Router<br/><i>(ONNX Runtime, P(hard) &gt;= 0.65)</i>"]
-        Retriever["Dynamic RediSearch Retriever<br/><i>(HNSW 384-d, 2.26M Chunks, Metadata Filter)</i>"]
+        Retriever["Dynamic RediSearch Retriever<br/><i>(HNSW 384-d, 2.26M Chunks)</i>"]
         FallbackSM["Fallback State Machine [NFR-2]<br/><i>(Circuit Breaker, 30s Timeout, 5xx Trap)</i>"]
     end
 
