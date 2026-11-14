@@ -37,7 +37,8 @@ def test_admin_cache_purge_semantic_invalidation():
     """Verify that POST /cache/purge eradicates semantic matches >= 0.85 from Redis."""
     cache = RedisSemanticCache.get_instance()
     poison_query = "What is the secret admission code for the dean's office?"
-    poison_answer = {"answer": "The secret code is 999999 for unauthorized testing.", "target_tier": "cpu_slm"}
+    poison_answer = {"answer": "The secret code is 999999 for unauthorized testing.", "target_tier": "cpu_slm",
+                     "chunks": [{"doc_id": "test_poison", "content": "synthetic"}]}
 
     # Store entry in cache
     stored = cache.store(poison_query, poison_answer, owner="purge-test@iisc.ac.in")
@@ -71,6 +72,7 @@ def test_cache_hit_provenance_and_badge():
     test_answer = {
         "answer": "IISc was founded in 1909 with support from Jamsetji Tata and the Maharaja of Mysore.",
         "target_tier": "gpu_llm",
+        "chunks": [{"doc_id": "test_iisc_history", "content": "synthetic"}],
     }
 
     cache.store(test_query, test_answer)

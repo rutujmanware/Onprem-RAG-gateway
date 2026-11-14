@@ -323,9 +323,13 @@ class RedisSemanticCache:
             if response.get("error"):
                 return False, f"Response contains error: {response.get('error')}"
 
-            # Document retrieval verification: if chunks key is present, verify at least one chunk exists
+            # Document retrieval verification, fail closed (DEFECT-23): an answer is cacheable only if it
+            # carries the non-empty list of chunks it was generated from. A payload without chunk
+            # information is treated as ungrounded, so a store call that forgets them stores nothing.
             chunks = response.get("chunks")
-            if chunks is not None and len(chunks) == 0:
+            if chunks is None:
+                return False, "No retrieval provenance (chunks missing): ungrounded answers are never cached"
+            if not isinstance(chunks, list) or len(chunks) == 0:
                 return False, "No document chunks were retrieved from knowledge base"
 
             if response.get("num_chunks") == 0:
@@ -335,10 +339,9 @@ class RedisSemanticCache:
                 return False, "Zero document citations retrieved from knowledge base"
 
             ans = str(response.get("answer") or response.get("content") or "").strip()
-        elif isinstance(response, str):
-            ans = response.strip()
         else:
-            ans = str(response).strip()
+            # a bare string (or anything else) has no retrieval provenance
+            return False, "No retrieval provenance (not a structured answer with chunks)"
 
         if len(ans) < 15:
             return False, f"Answer is too short ({len(ans)} chars) to be cacheable"

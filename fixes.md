@@ -1390,5 +1390,23 @@ tests/test_constant_time_and_cookie_security.py::test_secrets_compare_digest_tim
 - **Evidence:** a new frozen rare-term set (`scripts/eval_retrieval.py generate-rare`: 120 questions about rare words sampled from the corpus, filtered by rules and an LLM term judge before any retrieval run, plus 15 off-corpus questions built around rare non-academic words): hit@3 0.467 → 0.758, empty answers 34% → 12%, 35 questions better and 0 worse (sign test p ≈ 6·10⁻¹¹). Main 244-question set unchanged (hit@3 0.691 → 0.691; 3 better, 3 worse). Off-corpus questions that now retrieve something: 6/40 → 9/40 and 1/15 → 2/15 (rare words used in another sense, e.g. "yolk", "lifespan", a name in acknowledgements); end to end all of them are still refused, because the answer prompt allows the refusal when no document is on topic. A variant without the corroboration rule was rejected (6/15 rare off-corpus questions retrieved something).
 - **Tests:** [`tests/test_rare_terms.py`](tests/test_rare_terms.py), stoplist case in [`tests/test_topic_speller.py`](tests/test_topic_speller.py).
 
+## DEFECT-23: Ungrounded Non-Streaming Chat Completions Were Cached (Sub-FR-1.2 / NFR-6)
+
+- **Symptom:** a non-streaming `POST /v1/chat/completions` (the default, `stream: false`) answered by the GPU tier, the in-process GPU fallback or the CPU tier was stored in the shared cache, and an identical later request was served from the cache. These branches send the caller's messages to the model without any retrieval, so the stored answer was never grounded in a thesis, and a caller-supplied system message could dictate what got stored.
+- **Root cause:** a gap in the DEFECT-09 fix. Those branches stored `{"answer": ...}` with no chunk information, and the anti-pollution gate only rejected a chunk list that was present and empty; a missing list passed. The DEFECT-09 tests only covered `"chunks": []`.
+- **Fix:**
+  - The gate fails closed ([`gateway/cache/redis_semantic_cache.py`](gateway/cache/redis_semantic_cache.py) `is_cacheable_response`): an answer is cacheable only with a non-empty list of retrieved chunks; a missing key, a non-list or a bare string is rejected. The same gate runs on lookup and in `/cache/purge-invalid`, so entries stored earlier without chunks are never served.
+  - The three non-streaming branches no longer write to the cache ([`gateway/main.py`](gateway/main.py)). Streaming chat completions, `/query` and the in-process RAG fallback keep caching, as they store the chunks they retrieved.
+- **Tests:** [`tests/test_ungrounded_and_admin_guard.py`](tests/test_ungrounded_and_admin_guard.py): the gate for every payload without provenance; route-level tests of the real handler for the CPU and GPU routes (nothing stored, the second identical request reaches the model again); a caller-supplied system message stores nothing. Test payloads that seeded the cache without chunks were updated. Live: the same request sent twice through the running gateway was answered by the model both times (`cached: false`).
+
+## DEFECT-24: Cache Administration Open to Any Logged-In User; Hidden Routes Revealed by Malformed Bodies
+
+- **Symptom:** any signed-in user could call `/cache/clear`, `/cache/purge`, `/cache/purge-invalid`, `/cache/stats` and `/queue/stats`. `/cache/clear` needs no request body, so one empty POST could empty the cache shared by all users. Separately, a caller who was not signed in got HTTP 422 instead of 404 for malformed JSON on hidden routes, which revealed that those routes exist.
+- **Root cause:** the admin routes used the same guard as the question routes, which accepts loopback, an admin key or any live session. FastAPI validates the body before it runs route dependencies, so the 422 came before the guard.
+- **Fix** ([`gateway/main.py`](gateway/main.py)):
+  - New guard `require_internal_or_admin` (loopback or `ADMIN_API_KEY` only) on all `/cache/*` routes and `/queue/stats`. Question routes still accept a session.
+  - A validation-error handler runs the route's guard first: a caller the guard would reject gets the same 404 whether the body is valid or not.
+- **Tests:** [`tests/test_ungrounded_and_admin_guard.py`](tests/test_ungrounded_and_admin_guard.py): a session gets 404 on every admin route and nothing is cleared or purged; loopback and the admin key still work; malformed or empty bodies get 404 from an unauthorised caller and 422 from loopback. Live probe on the running gateway confirms the same.
+
 ## Remediation Complete
 All security vulnerabilities, cache qualification defects, frontend/backend break vectors, and redundant code have been fully resolved, hardened, and verified with passing regression tests. All changes are cleanly staged. Per instructions, `git commit` has not been run.
