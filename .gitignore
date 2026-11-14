@@ -89,19 +89,8 @@ packages/
 *.bak
 .DS_Store
 Thumbs.db
-#test sets
-tests/test_cache_intent_guard_extensive.py
+# Private red-team regression tests: they contain the red team's attack questions / evidence, which stay in
+# the blue-team/TA channel. `make test` runs them only where the files exist (see PRIVATE_TESTS in the Makefile).
 tests/test_cache_intent_guard.py
-tests/test_cache_index_alter.py
-tests/test_cache_owner_scoping.py
-tests/test_cache_regenerate.py
-tests/test_premise_routing.py
-tests/test_premise_rules.py
+tests/test_cache_intent_guard_extensive.py
 tests/test_refusal_mixed.py
-tests/test_embedder_onnx.py
-tests/test_premise_routing.py
-tests/test_retrieval_warmup.py
-tests/test_slm_slots.py
-tests/test_topic_retrieval.py
-tests/test_topic_speller.py
-tests/test_rare_terms.py

@@ -8,7 +8,8 @@ async def test_semantic_cache():
     query = "What is the primary function of vermiculite in industry?"
     response = {
         "answer": "Vermiculite is used in thermal insulation, fireproofing, and agricultural soil conditioning.",
-        "route": "cached"
+        "route": "cached",
+        "chunks": [{"doc_id": "test_vermiculite", "content": "Vermiculite thermal insulation"}],  # gate needs provenance
     }
 
     try:

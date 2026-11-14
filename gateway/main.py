@@ -10,7 +10,9 @@ from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional
 from pathlib import Path
 from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 
@@ -126,29 +128,43 @@ def require_internal_or_auth(request: Request):
     2. Valid authenticated web session (IISc user logged into AskIISc)
     3. Valid X-Admin-Key / Bearer header matching ADMIN_API_KEY (if configured)
     """
-    client_host = request.client.host if request.client else ""
-    xff = request.headers.get("x-forwarded-for")
+    if _is_loopback(request) or _has_live_session(request) or _has_admin_key(request):
+        return True
+    raise HTTPException(status_code=404, detail="Not Found")
 
-    # Direct loopback without external forwarder
+
+def require_internal_or_admin(request: Request):
+    """Cache/queue administration (/cache/*, /queue/stats): loopback or ADMIN_API_KEY only.
+
+    A logged-in user session is NOT enough (DEFECT-24): these routes can clear or purge the cache that
+    every user shares, and /cache/clear needs no request body at all. Returns 404 to hide the routes.
+    """
+    if _is_loopback(request) or _has_admin_key(request):
+        return True
+    raise HTTPException(status_code=404, detail="Not Found")
+
+
+def _is_loopback(request: Request) -> bool:
     # Security note (VULN-01 fix): Never trust client-supplied X-Forwarded-For headers
     # to authenticate loopback access (CWE-290). Only direct local socket connections
     # without forwarding headers are permitted unauthenticated loopback access.
-    if not xff and client_host in ("127.0.0.1", "::1", "localhost", "testclient"):
-        return True
+    client_host = request.client.host if request.client else ""
+    return not request.headers.get("x-forwarded-for") and client_host in ("127.0.0.1", "::1", "localhost", "testclient")
 
-    # Allow authenticated web session
-    if "session" in request.scope:
-        user = request.session.get("user")
-        if user and user.get("exp", 0) > time.time():
-            return True
 
-    # Allow admin API key (VULN-08: constant-time comparison prevents timing side-channels)
-    if ADMIN_KEY:
-        auth_hdr = request.headers.get("X-Admin-Key") or request.headers.get("Authorization", "").replace("Bearer ", "").strip()
-        if auth_hdr and secrets.compare_digest(auth_hdr, ADMIN_KEY):
-            return True
+def _has_live_session(request: Request) -> bool:
+    if "session" not in request.scope:
+        return False
+    user = request.session.get("user")
+    return bool(user and isinstance(user, dict) and user.get("exp", 0) > time.time())
 
-    raise HTTPException(status_code=404, detail="Not Found")
+
+def _has_admin_key(request: Request) -> bool:
+    # VULN-08: constant-time comparison prevents timing side-channels
+    if not ADMIN_KEY:
+        return False
+    auth_hdr = request.headers.get("X-Admin-Key") or request.headers.get("Authorization", "").replace("Bearer ", "").strip()
+    return bool(auth_hdr) and secrets.compare_digest(auth_hdr, ADMIN_KEY)
 
 # Session Security (VULN-02 Remediation):
 # Enforce high-entropy cryptographic session secret. Never allow known weak or fallback keys.
@@ -202,12 +218,39 @@ class DirectQueryRequest(BaseModel):
     # Single-use token issued only with a cached answer; requests a fresh answer for that same question.
     regenerate_token: Optional[str] = Field(default=None, max_length=128)
 
+
+_ROUTE_GUARDS = (require_internal_or_auth, require_internal_or_admin)
+
+
+def _route_guard(request: Request):
+    for route in app.router.routes:
+        if getattr(route, "path", None) == request.url.path and request.method in (getattr(route, "methods", None) or ()):
+            for dep in getattr(route, "dependencies", None) or ():
+                if dep.dependency in _ROUTE_GUARDS:
+                    return dep.dependency
+    return None
+
+
+@app.exception_handler(RequestValidationError)
+async def hide_guarded_routes_on_bad_body(request: Request, exc: RequestValidationError):
+    """FastAPI parses and validates the body before running route dependencies, so a malformed body
+    used to get 422 from a hidden route before its access guard ran, revealing that the route exists.
+    An unauthorised caller now gets the same 404 as for a well-formed request."""
+    guard = _route_guard(request)
+    if guard is not None:
+        try:
+            guard(request)
+        except HTTPException as e:
+            return JSONResponse({"detail": e.detail}, status_code=e.status_code)
+    return await request_validation_exception_handler(request, exc)
+
+
 @app.get("/healthz", include_in_schema=False)
 @app.get("/health", include_in_schema=False)
 async def healthz():
     return {"status": "ok"}
 
-@app.get("/cache/stats", dependencies=[Depends(require_internal_or_auth)], include_in_schema=False)
+@app.get("/cache/stats", dependencies=[Depends(require_internal_or_admin)], include_in_schema=False)
 async def cache_stats(cache: RedisSemanticCache = Depends(get_semantic_cache)):
     count = await cache.acount()
     return {
@@ -225,7 +268,7 @@ class CachePurgeRequest(BaseModel):
     query: str = Field(..., min_length=2, max_length=1500)
     threshold: Optional[float] = Field(default=0.85, ge=0.5, le=1.0)
 
-@app.post("/cache/purge", dependencies=[Depends(require_internal_or_auth)], include_in_schema=False)
+@app.post("/cache/purge", dependencies=[Depends(require_internal_or_admin)], include_in_schema=False)
 async def cache_purge_query(
     req: CachePurgeRequest,
     cache: RedisSemanticCache = Depends(get_semantic_cache),
@@ -238,17 +281,17 @@ async def cache_purge_query(
         "threshold": req.threshold or 0.85,
     }
 
-@app.post("/cache/clear", dependencies=[Depends(require_internal_or_auth)], include_in_schema=False)
+@app.post("/cache/clear", dependencies=[Depends(require_internal_or_admin)], include_in_schema=False)
 async def cache_clear(cache: RedisSemanticCache = Depends(get_semantic_cache)):
     success = await cache.aclear()
     return {"status": "cleared" if success else "failed"}
 
-@app.post("/cache/purge-invalid", dependencies=[Depends(require_internal_or_auth)], include_in_schema=False)
+@app.post("/cache/purge-invalid", dependencies=[Depends(require_internal_or_admin)], include_in_schema=False)
 async def cache_purge_invalid(cache: RedisSemanticCache = Depends(get_semantic_cache)):
     purged = await cache.apurge_uncacheable_entries()
     return {"status": "ok", "purged_count": purged}
 
-@app.get("/queue/stats", dependencies=[Depends(require_internal_or_auth)], include_in_schema=False)
+@app.get("/queue/stats", dependencies=[Depends(require_internal_or_admin)], include_in_schema=False)
 async def queue_stats(admission: AdmissionController = Depends(get_admission_controller)):
     return admission.get_stats()
 
@@ -470,8 +513,8 @@ async def chat_completions(
                         "routing_time_seconds": round(time.time() - t0, 4),
                     }
                     resp["user"] = user.email
-                    ans_text = resp["choices"][0]["message"]["content"]
-                    await cache.astore(query, {"answer": ans_text}, owner=client_id)
+                    # DEFECT-23: this branch sends req.messages to the model without retrieval, so the
+                    # answer is ungrounded and is never cached (Sub-FR-1.2 / NFR-6).
                     return resp
                 except Exception:
                     pass
@@ -485,10 +528,7 @@ async def chat_completions(
                     max_new_tokens=gpu_max_tokens,
                     temperature=req.temperature or 0.2,
                 )
-                ans_text = gpu_res["text"]
-                await cache.astore(query, {"answer": ans_text}, owner=client_id)
-                if query != raw_query:
-                    await cache.astore(raw_query, {"answer": ans_text}, owner=client_id)
+                ans_text = gpu_res["text"]  # no retrieval: never cached (DEFECT-23)
                 return {
                     "id": f"chatcmpl-hard-{uuid.uuid4().hex[:8]}",
                     "object": "chat.completion",
@@ -532,10 +572,7 @@ async def chat_completions(
                     "reason": decision.reason,
                     "routing_time_seconds": round(time.time() - t0, 4),
                 }
-                ans_text = resp["choices"][0]["message"]["content"]
-                await cache.astore(query, {"answer": ans_text}, owner=client_id)
-                if query != raw_query:
-                    await cache.astore(raw_query, {"answer": ans_text}, owner=client_id)
+                # no retrieval: never cached (DEFECT-23)
                 return resp
             except Exception:
                 pass

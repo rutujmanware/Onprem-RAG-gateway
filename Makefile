@@ -198,11 +198,18 @@ load-test-cache:
 cache-check:
 	PYTHONPATH=. $(PYTHON) scripts/check_cache_isolation.py
 
+# Red-team regression tests that contain the red team's attack data: gitignored (private channel only), so a
+# fresh clone does not have them. `make test` runs them when present and says so when they are skipped.
+PRIVATE_TESTS := tests/test_cache_intent_guard.py tests/test_cache_intent_guard_extensive.py tests/test_refusal_mixed.py
+
 test:
 	PYTHONPATH=. $(PYTHON) tests/test_admission_queue.py
 	PYTHONPATH=. $(PYTHON) -m pytest tests/test_single_port_security.py
-	PYTHONPATH=. $(PYTHON) -m pytest tests/test_vllm_launcher.py tests/test_dispatcher_threshold.py tests/test_cache_owner_scoping.py tests/test_cache_regenerate.py tests/test_premise_rules.py tests/test_premise_routing.py tests/test_topic_retrieval.py tests/test_topic_speller.py tests/test_rare_terms.py tests/test_slm_slots.py tests/test_retrieval_warmup.py tests/test_refusal_mixed.py tests/test_embedder_onnx.py tests/test_cache_index_alter.py
-	PYTHONPATH=. $(PYTHON) -m pytest tests/test_cache_intent_guard.py tests/test_cache_intent_guard_extensive.py
+	PYTHONPATH=. $(PYTHON) -m pytest tests/test_vllm_launcher.py tests/test_dispatcher_threshold.py tests/test_cache_owner_scoping.py tests/test_cache_regenerate.py tests/test_premise_rules.py tests/test_premise_routing.py tests/test_topic_retrieval.py tests/test_topic_speller.py tests/test_rare_terms.py tests/test_ungrounded_and_admin_guard.py tests/test_slm_slots.py tests/test_retrieval_warmup.py tests/test_embedder_onnx.py tests/test_cache_index_alter.py
+	PYTHONPATH=. $(PYTHON) -m pytest tests/test_break_hardening.py tests/test_cache_purge_and_ttl.py tests/test_constant_time_and_cookie_security.py tests/test_dos_boundary_validation.py tests/test_otp_concurrency.py tests/test_refusal_chunks.py tests/test_typo_normalizer.py
+	@present="$(wildcard $(PRIVATE_TESTS))"; \
+	if [ -n "$$present" ]; then PYTHONPATH=. $(PYTHON) -m pytest $$present; \
+	else echo "Skipping private red-team regression tests (not in the public repository)."; fi
 	PYTHONPATH=. $(PYTHON) tests/test_injection_fence.py
 	PYTHONPATH=. $(PYTHON) tests/test_rate_limiting.py
 	PYTHONPATH=. $(PYTHON) tests/test_cache_hits.py
