@@ -212,13 +212,140 @@ def cmd_generate(args):
     print(f"Wrote {len(rows)} questions {kinds} -> {QFILE}\nSHA-256 {digest}")
 
 
+# ----------------------------------------------------------------------------------- rare-term set
+RARE_QFILE = OUT / "rare_questions.jsonl"
+RARE_TEMPLATES = ["What is known about {t}?", "Explain {t}.", "What research has been done on {t}?"]
+RARE_MAX_ENGLISH_FREQ = 3_000_000   # symspell corpus count; above this a word is everyday English ("letter", "bolt")
+RARE_TOPIC_MIN_CHUNKS = 10          # ... or one thesis must use the word this often (else: title match required)
+RARE_GOLD_MIN_CHUNKS = 5            # a gold thesis has the word in its title or in >= this many chunks
+RARE_MAX_GOLD = 30                  # more theses than this discussing it = not a rare topic
+RARE_JUDGE_PROMPT = """Is "{w}" a real technical or scientific term, method, material, molecule, organism, gene, device or
+named concept that a student could ask a research search engine about?
+Answer NO for: people's names, OCR/scanning fragments or misspellings (e.g. "puter", "eration"), everyday words,
+abbreviations of ordinary words, and anything you do not recognise. Answer with exactly YES or NO."""
+# Off-corpus questions built around rare NON-academic words: they must still retrieve nothing.
+RARE_OFF_CORPUS = [
+    "Who is Lionel Messi?", "What songs did Arijit Singh sing?", "What is known about Shah Rukh Khan?",
+    "How do I level up fast in Minecraft?", "Explain Pokemon evolution.", "Who is Virat Kohli?",
+    "What is known about Taylor Swift?", "Explain the plot of Baahubali.", "What is a good tiramisu recipe?",
+    "How is biryani cooked?", "What is known about the Kardashians?", "Explain the rules of kabaddi.",
+    "Who is Sachin Tendulkar?", "How do I play Fortnite?", "What is known about Bollywood award shows?",
+]
+_RARE_TOKEN = re.compile(r"\b[A-Za-z][A-Za-z0-9]{3,}\b")
+
+
+_FREQ = None
+
+
+def english_freq(w: str) -> int:
+    global _FREQ
+    if _FREQ is None:
+        from importlib.resources import files
+        _FREQ = {l.split()[0]: int(l.split()[1]) for l in open(str(files("symspellpy") / "frequency_dictionary_en_82_765.txt"))}
+    return _FREQ.get(w, 0)
+
+
+def _doc_counts(r, query: str, limit: int = 200) -> dict:
+    """{doc_id: matching chunks} for a RediSearch query (FT.AGGREGATE; never FT.INFO)."""
+    res = r.execute_command("FT.AGGREGATE", "rag_documents_idx", query, "VERBATIM", "LOAD", "1", "@doc_id",
+                            "GROUPBY", "1", "@doc_id", "REDUCE", "COUNT", "0", "AS", "n",
+                            "SORTBY", "2", "@n", "DESC", "MAX", str(limit), "DIALECT", "2")
+    out = {}
+    for row in res[1:]:
+        d = dict(zip(row[::2], row[1::2]))
+        out[d[b"doc_id"].decode()] = int(d[b"n"])
+    return out
+
+
+def cmd_generate_rare(args):
+    """Freeze a set of questions about RARE words sampled at random from the corpus.
+
+    A word qualifies when 3..max_chunks chunks contain it (title or text), it looks like a word (not a
+    PDF/hex artefact or DNA string), it is not everyday English (frequency, -ly/-ed/-ing forms), and it is
+    a TOPIC: it appears in some thesis title or one thesis uses it in >= RARE_TOPIC_MIN_CHUNKS chunks.
+    Gold = theses with the word in the title or in >= RARE_GOLD_MIN_CHUNKS chunks (at most RARE_MAX_GOLD).
+    Questions use fixed templates. All rules were fixed before any retrieval system was run on the set."""
+    if RARE_QFILE.exists() and not args.force:
+        sys.exit(f"{RARE_QFILE} exists (frozen); use --force to regenerate")
+    r = redis_client()
+    rng = random.Random(args.seed)
+    seen, rows, tries = set(), [], 0
+    target = args.n * 3  # oversample: the LLM judge below rejects names, OCR fragments, everyday words
+    while len(rows) < target and tries < 40000:
+        tries += 1
+        key = r.randomkey()
+        if not key or not key.startswith(b"doc:chunk:"):
+            continue
+        text = (r.hget(key, "content") or b"").decode("utf8", "ignore")
+        if any(m in text.lower() for m in ("endobj", "/type", "xref", "stream")):
+            continue
+        toks = [t for t in _RARE_TOKEN.findall(text)
+                if t.lower() not in seen and sum(ch.isalpha() for ch in t) / len(t) >= 0.7
+                and not re.fullmatch(r"[a-fA-F0-9]+", t) and not re.search(r"(.)\1\1", t.lower())]
+        rng.shuffle(toks)
+        for t in toks[:5]:
+            w = t.lower()
+            seen.add(w)
+            if set(w) <= set("acgtu"):  # nucleotide strings
+                continue
+            if w in english_words() and (english_freq(w) >= RARE_MAX_ENGLISH_FREQ or re.search(r"(?:ly|ed|ing)$", w)):
+                continue
+            q = f"(@title:({w})) | (@content:({w}))"
+            df = int(r.execute_command("FT.SEARCH", "rag_documents_idx", q, "VERBATIM", "LIMIT", "0", "0", "DIALECT", "2")[0])
+            if not 3 <= df <= args.max_chunks:
+                continue
+            counts = _doc_counts(r, q)
+            titled = set(_doc_counts(r, f"@title:({w})"))
+            if not titled and max(counts.values(), default=0) < RARE_TOPIC_MIN_CHUNKS:
+                continue  # mentioned in passing everywhere, a topic nowhere (typos, fragments, names)
+            gold = sorted(d for d, n in counts.items() if n >= RARE_GOLD_MIN_CHUNKS or d in titled)
+            if not gold or len(gold) > RARE_MAX_GOLD:
+                continue
+            rows.append({"id": "", "kind": "rare", "term": w, "df": df, "surface": t,
+                         "dictionary_word": w in english_words(), "gold_docs": gold, "gold_doc": gold[0]})
+            break
+    import httpx
+
+    async def judge_all():
+        async with httpx.AsyncClient(timeout=120) as client:
+            sem = asyncio.Semaphore(16)
+
+            async def one(row):
+                async with sem:
+                    row["judge"] = (await llm(client, RARE_JUDGE_PROMPT.format(w=row["term"]))).upper()[:3]
+            await asyncio.gather(*(one(x) for x in rows))
+    asyncio.run(judge_all())
+    rejected = [x["term"] for x in rows if not x["judge"].startswith("YES")]
+    rows = [x for x in rows if x["judge"].startswith("YES")][:args.n]
+    for i, x in enumerate(rows):
+        x["id"] = f"rare-{i:03d}"
+        x["question"] = RARE_TEMPLATES[i % len(RARE_TEMPLATES)].format(t=x.pop("surface"))
+        x.pop("judge")
+    print(f"LLM judge rejected {len(rejected)} candidate words, e.g. {rejected[:25]}")
+    for i, q in enumerate(RARE_OFF_CORPUS):
+        rows.append({"id": f"rareoff-{i:03d}", "kind": "off_corpus", "question": q, "gold_doc": None})
+    with open(RARE_QFILE, "w") as f:
+        for row in rows:
+            f.write(json.dumps(row) + "\n")
+    digest = hashlib.sha256(RARE_QFILE.read_bytes()).hexdigest()
+    (OUT / "rare_questions.sha256").write_text(digest + "\n")
+    n_rare = sum(r_["kind"] == "rare" for r_ in rows)
+    print(f"Wrote {n_rare} rare-term + {len(RARE_OFF_CORPUS)} off-corpus questions -> {RARE_QFILE}\nSHA-256 {digest}")
+
+
 # ----------------------------------------------------------------------------------- systems
-def load_questions():
-    digest = hashlib.sha256(QFILE.read_bytes()).hexdigest()
-    frozen = (OUT / "questions.sha256").read_text().strip()
+def load_questions(qset: str = "main"):
+    qfile, shafile = (QFILE, OUT / "questions.sha256") if qset == "main" else (RARE_QFILE, OUT / "rare_questions.sha256")
+    digest = hashlib.sha256(qfile.read_bytes()).hexdigest()
+    frozen = shafile.read_text().strip()
     if digest != frozen:
-        sys.exit("questions.jsonl changed since it was frozen")
-    return [json.loads(l) for l in QFILE.read_text().splitlines()]
+        sys.exit(f"{qfile.name} changed since it was frozen")
+    return [json.loads(l) for l in qfile.read_text().splitlines()]
+
+
+def _results_path(system: str, qset: str, tag: str = "") -> Path:
+    name = system + (f"_{tag}" if tag else "")
+    return OUT / (f"results_{name}.jsonl" if qset == "main" else f"results_{qset}_{name}.jsonl")
 
 
 def system_baseline():
@@ -361,12 +488,12 @@ SYSTEMS = {
 
 
 def cmd_run(args):
-    qs = load_questions()
+    qs = load_questions(args.set)
     if args.limit:
         qs = qs[:args.limit]
     run = SYSTEMS[args.system]()
     run(qs[0]["question"])  # warm up
-    out = OUT / f"results_{args.system}.jsonl"
+    out = _results_path(args.system, args.set, args.tag)
     with open(out, "w") as f:
         for i, q in enumerate(qs):
             t0 = time.perf_counter()
@@ -390,13 +517,20 @@ def metrics(qs, res, threshold=None):
             got = [d for d, s in got if threshold is None or s >= threshold]
         return got
 
+    def gold(q):  # rare-term questions list every thesis that really discusses the word
+        return set(q.get("gold_docs") or [q["gold_doc"]])
+
+    def first_hit(q, k):
+        d = docs(by_id[q["id"]])[:k]
+        return next((i for i, x in enumerate(d) if x in gold(q)), None)
+
     m = {}
     for k in (1, 3, 5, 8):
-        m[f"hit@{k}"] = sum(q["gold_doc"] in docs(by_id[q["id"]])[:k] for q in ans) / max(1, len(ans))
+        m[f"hit@{k}"] = sum(first_hit(q, k) is not None for q in ans) / max(1, len(ans))
     rr = []
     for q in ans:
-        d = docs(by_id[q["id"]])[:8]
-        rr.append(1 / (d.index(q["gold_doc"]) + 1) if q["gold_doc"] in d else 0)
+        i = first_hit(q, 8)
+        rr.append(1 / (i + 1) if i is not None else 0)
     m["mrr@8"] = statistics.mean(rr) if rr else 0
     m["empty"] = sum(not docs(by_id[q["id"]]) for q in ans) / max(1, len(ans))
     m["off_accept"] = sum(bool(docs(by_id[q["id"]])) for q in off) / max(1, len(off))
@@ -406,17 +540,20 @@ def metrics(qs, res, threshold=None):
 
 
 def cmd_report(args):
-    qs = load_questions()
-    files = sorted(OUT.glob("results_*.jsonl"))
+    qs = load_questions(args.set)
+    if args.set == "main":
+        files = sorted(f for f in OUT.glob("results_*.jsonl") if not f.name.startswith("results_rare_"))
+    else:
+        files = sorted(OUT.glob(f"results_{args.set}_*.jsonl"))
     print(f"{'system':28} {'kind':7} {'n':>4} " + " ".join(f"{h:>8}" for h in
           ("hit@1", "hit@3", "hit@5", "hit@8", "mrr@8", "empty", "off_acc", "p50ms", "p95ms")))
     for fpath in files:
-        name = fpath.stem[len("results_"):]
+        name = fpath.stem[len("results_" if args.set == "main" else f"results_{args.set}_"):]
         res = [json.loads(l) for l in fpath.read_text().splitlines()]
         scored = res and res[0]["got"] and isinstance(res[0]["got"][0], list)
         thresholds = [None] + (args.thresholds if scored else [])
         for th in thresholds:
-            for kind in ("all", "topic", "detail"):
+            for kind in (("all", "topic", "detail") if args.set == "main" else ("all",)):
                 sub = [q for q in qs if kind == "all" or q["kind"] in (kind, "off_corpus")]
                 m, na, _ = metrics(sub, res, th)
                 label = name + (f" @rr>={th}" if th is not None else "")
@@ -431,10 +568,16 @@ def main():
     sub = ap.add_subparsers(dest="cmd", required=True)
     g = sub.add_parser("generate"); g.add_argument("--n", type=int, default=120); g.add_argument("--seed", type=int, default=20261114)
     g.add_argument("--force", action="store_true")
+    gr = sub.add_parser("generate-rare"); gr.add_argument("--n", type=int, default=120)
+    gr.add_argument("--seed", type=int, default=20261114); gr.add_argument("--max-chunks", type=int, default=2000)
+    gr.add_argument("--force", action="store_true")
     r = sub.add_parser("run"); r.add_argument("system", choices=sorted(SYSTEMS)); r.add_argument("--limit", type=int)
+    r.add_argument("--set", choices=["main", "rare"], default="main")
+    r.add_argument("--tag", default="", help="suffix for the results file (compare code versions)")
     p = sub.add_parser("report"); p.add_argument("--thresholds", type=float, nargs="*", default=[])
+    p.add_argument("--set", choices=["main", "rare"], default="main")
     a = ap.parse_args()
-    {"generate": cmd_generate, "run": cmd_run, "report": cmd_report}[a.cmd](a)
+    {"generate": cmd_generate, "generate-rare": cmd_generate_rare, "run": cmd_run, "report": cmd_report}[a.cmd](a)
 
 
 if __name__ == "__main__":
