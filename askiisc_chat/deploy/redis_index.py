@@ -31,8 +31,9 @@ def main():
             if n % 1000 == 0: pipe.execute()
         pipe.execute(); print(f"checked {n} keys; set {C.F_ACCESS}={a.access} where it was missing")
     else:
-        info = r.execute_command("FT.INFO", C.INDEX_NAME); d = {info[i].decode(): info[i + 1] for i in range(0, len(info), 2)}
-        print("num_docs:", d.get("num_docs"), "| indexing failures:", d.get("hash_indexing_failures"))
+        # FT.SEARCH count, not FT.INFO: FT.INFO on a vector index can deadlock this RediSearch build (2026-11-14).
+        total = r.execute_command("FT.SEARCH", C.INDEX_NAME, "*", "LIMIT", "0", "0")
+        print("num_docs:", total[0] if isinstance(total, list) else total)
         key = next(r.scan_iter(match=a.prefix + "*", count=100), None)
         if not key: sys.exit("FAIL: no keys with prefix " + a.prefix)
         h = {k.decode(): v for k, v in r.hgetall(key).items()}

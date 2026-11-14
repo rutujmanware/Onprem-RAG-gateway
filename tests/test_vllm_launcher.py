@@ -52,7 +52,35 @@ def test_wildcard_hosts_are_refused(host):
         resolve_bind_host(host)
 
 
-def test_non_loopback_needs_explicit_opt_in():
-    with pytest.raises(ValueError):
-        resolve_bind_host("10.0.0.5")
-    assert resolve_bind_host("10.0.0.5", allow_non_loopback=True) == "10.0.0.5"
+@pytest.mark.parametrize("host", ["10.0.0.5", "192.168.1.10", "8.8.8.8", "172.17.0.1"])
+def test_non_loopback_hosts_are_always_refused(host):
+    with pytest.raises(ValueError, match="not a loopback"):
+        resolve_bind_host(host)
+
+
+def test_resolve_bind_host_has_no_override_parameter():
+    import inspect
+    assert list(inspect.signature(resolve_bind_host).parameters) == ["host"]
+
+
+def test_shim_refuses_non_loopback_bind_even_if_called_directly():
+    """Defence in depth: a shim built for a non-loopback host must still refuse to serve."""
+    shim = make_host_bound_socket_module("0.0.0.0")
+    sock = shim.socket(shim.AF_INET, shim.SOCK_STREAM)
+    try:
+        with pytest.raises(RuntimeError, match="refusing to serve"):
+            sock.bind(("", 0))
+    finally:
+        sock.close()
+
+
+def test_removed_override_env_var_blocks_startup(monkeypatch):
+    """Setting the removed VLLM_ALLOW_NON_LOOPBACK must stop the launcher, not be silently ignored."""
+    import sys
+    from scripts import serve_vllm
+    monkeypatch.setenv("VLLM_ALLOW_NON_LOOPBACK", "1")
+    monkeypatch.setenv("VLLM_API_KEY", "test-key")
+    monkeypatch.setattr(serve_vllm, "_load_env", lambda: None)
+    monkeypatch.setattr(sys, "argv", ["serve_vllm.py", "--model", "m", "--host", "127.0.0.1", "--port", "18999"])
+    with pytest.raises(SystemExit, match="no longer supported"):
+        serve_vllm.main()

@@ -13,11 +13,12 @@ class CPUSLMClient:
         self,
         base_url: Optional[str] = None,
         model_name: Optional[str] = None,
-        timeout: float = 60.0,
+        timeout: Optional[Any] = None,
     ):
         self.base_url = (base_url or DEFAULT_SLM_BASE_URL).rstrip("/")
         self.model_name = model_name or DEFAULT_SLM_MODEL
-        self.timeout = timeout
+        # Fast connect; the server answers 503 within SLM_QUEUE_TIMEOUT when all slots are busy.
+        self.timeout = timeout if timeout is not None else httpx.Timeout(connect=2.0, read=60.0, write=10.0, pool=2.0)
         self._client: Optional[httpx.AsyncClient] = None
 
     @property

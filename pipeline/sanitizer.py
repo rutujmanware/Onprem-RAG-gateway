@@ -62,6 +62,37 @@ def sanitize_and_fence_prompt(prompt: str) -> str:
     return f"```user\n{clean_prompt}\n```"
 
 
+# Shared by the CPU-SLM and GPU-LLM RAG prompts (pipeline/slm_runner.py, pipeline/gpu_llm_runner.py).
+# Red-team finding: loaded questions ("Why does X always...?") were answered by confirming the false premise,
+# while the neutral form of the same question ("Does X...?") was correctly refused on the same context.
+REFUSAL_SENTENCE = "No specific institutional repository theses were found on this topic."
+
+# Rule 3 of both RAG prompts. The refusal sentence claims that NO thesis is about the topic, so it must
+# not be used when on-topic documents were retrieved but do not answer the exact question or confirm
+# its claim (red-team: "Are bacterial plasmids always essential...?" retrieved plasmid-maintenance
+# theses, yet both models answered with the refusal sentence and the sources were hidden).
+REFUSAL_RULE = (
+    "3. Relevance and Refusal: If the provided documents contain information relevant to the question, answer "
+    "directly from them with citations, without opening disclaimers; if they do not cover some specific part of the "
+    "question, mention that briefly after your answer. Reply with exactly '" + REFUSAL_SENTENCE + "' and nothing else "
+    "ONLY when none of the provided documents is about the topic of the question. Never guess or give an ungrounded "
+    "answer.\n"
+)
+
+PREMISE_RULES = (
+    "4. Check the Question's Premise: Some questions contain a built-in claim (for example 'Why does X always...', "
+    "'Why can X...', 'Why is X essential for every...'). Challenge that claim ONLY if (a) the provided documents "
+    "contradict it, (b) it is a sweeping absolute claim (always, never, every, all, only, guarantees) that the documents "
+    "do not establish, or (c) it contradicts well-established scientific principles. In those cases say so in your "
+    "first sentence (for example: 'This is not generally true: ...' or 'The provided theses do not support the claim "
+    "that ...'), then state what the documents do support; never explain why such a claim is true. If the claim is "
+    "reasonable and simply not discussed in the documents, do NOT challenge or doubt it: answer from what the documents "
+    "say, and if needed note briefly that they do not address that specific point.\n"
+    "5. Single Outcome: The refusal sentence stands alone. If you have anything relevant to say from the documents, "
+    "do not write the refusal sentence at all; never follow it with an explanation or 'However, ...'.\n"
+)
+
+
 def fence_context_chunks(chunks: List[Dict[str, Any]]) -> str:
     """Format and fence retrieved knowledge base chunks inside strict XML boundary tags.
     Escapes any closing boundary tags within corpus text to prevent delimiter breakout.
@@ -152,12 +183,86 @@ NO_RELEVANT_DOCS_PATTERNS = [
 ]
 
 
+# Answers that admit they are not grounded are never served as grounded, whatever their length.
+UNGROUNDED_MARKERS = ("based on general academic knowledge", "based on general technical knowledge", "retrieval failed")
+# A refusal is short. A longer answer that mentions a gap in passing ("...no information about X, but the
+# theses describe Y [Document 1]") is an answer: it keeps its sources and may be cached.
+REFUSAL_MAX_WORDS = 60
+# Words after the refusal sentence that make an answer "mixed" (refusal + explanation).
+MIXED_MIN_WORDS = 12
+
+# Tolerates short variants of the sentence ending ("...found on this.", "...found for this query.").
+_REFUSAL_RE = re.compile(r"^\W*no\s+specific\s+institutional\s+repository\s+thes[ie]s\s+(?:were|was)\s+found\b[^.!?\n]{0,40}[.!?]?\W*",
+                         re.IGNORECASE)
+_CONNECTOR_RE = re.compile(r"^(?:however|but|that said|nevertheless)\s*[,:]?\s*", re.IGNORECASE)
+
+
+def starts_with_refusal(text: str) -> bool:
+    return bool(text) and bool(_REFUSAL_RE.match(text))
+
+
+def strip_mixed_refusal_text(text: str) -> str:
+    """'<refusal sentence> <explanation>' -> '<explanation>'. A pure refusal is returned unchanged."""
+    if not text:
+        return text
+    m = _REFUSAL_RE.match(text)
+    if not m:
+        return text
+    rest = _CONNECTOR_RE.sub("", text[m.end():].lstrip())
+    if len(rest.split()) < MIXED_MIN_WORDS:
+        return text
+    return rest[:1].upper() + rest[1:]
+
+
+def strip_mixed_refusal(deltas):
+    """Streaming version of strip_mixed_refusal_text. Holds back only output that begins with the refusal
+    sentence, until it is clear whether an explanation follows (MIXED_MIN_WORDS); any other answer passes
+    through without delay."""
+    target = REFUSAL_SENTENCE.lower()
+    buf, mode = "", "probe"
+    try:
+        for d in deltas:
+            if mode == "pass":
+                yield d
+                continue
+            buf += d
+            norm = re.sub(r"\s+", " ", buf.lstrip()).lower()
+            if mode == "probe":
+                if target.startswith(norm) or target.startswith(norm.lstrip("*_#> ")):
+                    continue
+                if _REFUSAL_RE.match(buf):
+                    mode = "after"
+                else:
+                    mode = "pass"
+                    yield buf
+                    buf = ""
+                    continue
+            m = _REFUSAL_RE.match(buf)
+            rest = buf[m.end():] if m else buf
+            if len(rest.split()) > MIXED_MIN_WORDS:  # explanation follows: drop the refusal sentence
+                mode = "pass"
+                yield strip_mixed_refusal_text(buf)
+                buf = ""
+        if buf:
+            yield buf  # pure refusal (or short tail): unchanged
+    finally:
+        close = getattr(deltas, "close", None)
+        if close:
+            close()
+
+
 def is_no_relevant_docs_answer(answer_text: str) -> bool:
-    """Return True if answer_text indicates that no relevant documents were found in the thesis repository."""
+    """Return True if answer_text IS a refusal / no-relevant-documents answer (not merely mentions a gap)."""
     if not answer_text or not isinstance(answer_text, str):
         return False
     t = answer_text.strip().lower()
     if not t:
+        return False
+    if any(m in t for m in UNGROUNDED_MARKERS):
+        return True
+    if _REFUSAL_RE.match(t):
+        return len(t[_REFUSAL_RE.match(t).end():].split()) < MIXED_MIN_WORDS
+    if len(t.split()) > REFUSAL_MAX_WORDS:
         return False
     for p in NO_RELEVANT_DOCS_PHRASES:
         if p in t:

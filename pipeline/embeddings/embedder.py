@@ -1,12 +1,44 @@
 import hashlib
+import logging
 import math
 import os
 import random
-from typing import List, Optional
+import threading
+from typing import Dict, List, Optional, Tuple
+
+logger = logging.getLogger("pipeline.embedder")
 
 # Prevent OpenMP and HuggingFace Tokenizers thread crashes on high-core-count machines
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
+# One loaded (tokenizer, model) per (model path, device) per process. The gateway used to build a new
+# RAGQAPipeline (router + retriever, each with its own embedder) for every fresh request, reloading
+# MiniLM from disk twice (~110 ms per request). All LocalEmbedder instances now share the weights.
+_MODEL_CACHE: Dict[Tuple[str, str, Optional[str]], Tuple[object, object, threading.Lock]] = {}
+_MODEL_CACHE_LOCK = threading.Lock()
+
+# ONNX Runtime backend (NFR-1, semantic-cache p99). scripts/export_embedder_onnx.py exports the same
+# MiniLM model to <model dir>/onnx/model.onnx and verifies it against PyTorch (cosine >= 0.99999), so
+# the document index, the semantic cache and the router (all built with PyTorch vectors) are unaffected.
+# Measured on this host: ~2x faster per query. EMBED_BACKEND=auto (default: ONNX when the file exists,
+# else PyTorch) | onnx (required) | torch.
+_ORT_SESSIONS: Dict[str, object] = {}
+
+
+def _ort_session(path: str):
+    with _MODEL_CACHE_LOCK:
+        if path not in _ORT_SESSIONS:
+            import onnxruntime as ort
+            so = ort.SessionOptions()
+            so.intra_op_num_threads = max(1, int(os.getenv("EMBED_NUM_THREADS", "8")))
+            so.inter_op_num_threads = 1
+            so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+            # Idle threads sleep instead of spinning: 6 gateway workers share a busy host (latency cost < 1 ms).
+            so.add_session_config_entry("session.intra_op.allow_spinning", os.getenv("EMBED_ORT_SPIN", "0"))
+            _ORT_SESSIONS[path] = ort.InferenceSession(path, so, providers=["CPUExecutionProvider"])
+        return _ORT_SESSIONS[path]
+
 
 class LocalEmbedder:
     """Robust dense embedder using direct Hugging Face transformers with mean-pooling,
@@ -27,6 +59,7 @@ class LocalEmbedder:
         self._model = None
         self._torch = None
         self._F = None
+        self._tok_lock = threading.Lock()
 
         local_dir = os.path.abspath("models/embeddings/all-MiniLM-L6-v2")
         if os.path.exists(local_dir):
@@ -45,9 +78,22 @@ class LocalEmbedder:
 
             self._torch = torch
             self._F = F
-            self._tokenizer = AutoTokenizer.from_pretrained(self.hf_name, cache_dir=cache_folder)
-            self._model = AutoModel.from_pretrained(self.hf_name, cache_dir=cache_folder).to(self.device)
-            self._model.eval()
+            # NFR-1: torch defaults to one thread per core (128 here). With 6 gateway workers embedding
+            # concurrently that oversubscribes the CPU and inflates semantic-cache p99. OMP_NUM_THREADS set
+            # above is ignored once torch was imported earlier (the router imports it first), so set it here.
+            embed_threads = int(os.getenv("EMBED_NUM_THREADS", "16"))
+            if embed_threads > 0 and device == "cpu":
+                torch.set_num_threads(embed_threads)
+            key = (self.hf_name, str(self.device), cache_folder)
+            with _MODEL_CACHE_LOCK:
+                if key not in _MODEL_CACHE:
+                    tok = AutoTokenizer.from_pretrained(self.hf_name, cache_dir=cache_folder)
+                    model = AutoModel.from_pretrained(self.hf_name, cache_dir=cache_folder).to(self.device)
+                    model.eval()
+                    # Fast (Rust) tokenizers are not safe for concurrent calls ("Already borrowed"),
+                    # so tokenization is serialized per shared tokenizer (~0.1 ms); inference is not.
+                    _MODEL_CACHE[key] = (tok, model, threading.Lock())
+                self._tokenizer, self._model, self._tok_lock = _MODEL_CACHE[key]
         except Exception:
             # Priority 2: Fallback to sentence_transformers if available
             try:
@@ -55,6 +101,36 @@ class LocalEmbedder:
                 self._st_model = SentenceTransformer(self.hf_name, device=self.device)
             except Exception:
                 self._st_model = None
+
+        self._ort = None
+        backend = os.getenv("EMBED_BACKEND", "auto").lower()
+        onnx_path = os.path.join(self.hf_name, "onnx", "model.onnx") if os.path.isdir(self.hf_name) else ""
+        if backend in ("auto", "onnx") and str(device) == "cpu" and self._tokenizer is not None:
+            if onnx_path and os.path.exists(onnx_path):
+                try:
+                    self._ort = _ort_session(onnx_path)
+                    self._ort_inputs = [i.name for i in self._ort.get_inputs()]
+                except Exception as exc:
+                    if backend == "onnx":
+                        raise
+                    logger.warning("ONNX embedder unavailable (%s); using PyTorch", exc)
+        if backend == "onnx" and self._ort is None:
+            raise RuntimeError(f"EMBED_BACKEND=onnx but no usable ONNX model for {self.hf_name}: "
+                               "run scripts/export_embedder_onnx.py")
+        self.backend = "onnx" if self._ort is not None else ("torch" if self._model is not None else "fallback")
+
+    def _ort_embed(self, texts: List[str]):
+        import numpy as np
+        with self._tok_lock:
+            enc = self._tokenizer(texts, padding=True, truncation=True, max_length=512, return_tensors="np")
+        feeds = {}
+        for name in self._ort_inputs:
+            arr = enc.get(name)
+            feeds[name] = (arr if arr is not None else np.zeros_like(enc["input_ids"])).astype(np.int64)
+        hidden = self._ort.run(None, feeds)[0]
+        mask = enc["attention_mask"][..., None].astype(np.float32)
+        pooled = (hidden * mask).sum(1) / np.clip(mask.sum(1), 1e-9, None)
+        return pooled / np.clip(np.linalg.norm(pooled, axis=1, keepdims=True), 1e-12, None)
 
     def _mean_pooling(self, model_output, attention_mask):
         token_embeddings = model_output[0]
@@ -72,14 +148,17 @@ class LocalEmbedder:
         return [x / (mag + 1e-9) for x in vec]
 
     def embed_query(self, text: str) -> List[float]:
+        if self._ort is not None:
+            return self._ort_embed([text])[0].tolist()
         if self._model and self._tokenizer:
-            encoded = self._tokenizer(
-                [text],
-                padding=True,
-                truncation=True,
-                max_length=512,
-                return_tensors="pt"
-            ).to(self.device)
+            with self._tok_lock:
+                encoded = self._tokenizer(
+                    [text],
+                    padding=True,
+                    truncation=True,
+                    max_length=512,
+                    return_tensors="pt"
+                ).to(self.device)
 
             with self._torch.no_grad():
                 out = self._model(**encoded)
@@ -94,18 +173,24 @@ class LocalEmbedder:
         return self._fallback_vector(text)
 
     def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        if self._ort is not None and texts:
+            out: List[List[float]] = []
+            for i in range(0, len(texts), 32):
+                out.extend(self._ort_embed(texts[i:i + 32]).tolist())
+            return out
         if self._model and self._tokenizer and texts:
             all_vecs = []
             batch_size = 32
             for i in range(0, len(texts), batch_size):
                 batch = texts[i : i + batch_size]
-                encoded = self._tokenizer(
-                    batch,
-                    padding=True,
-                    truncation=True,
-                    max_length=512,
-                    return_tensors="pt"
-                ).to(self.device)
+                with self._tok_lock:
+                    encoded = self._tokenizer(
+                        batch,
+                        padding=True,
+                        truncation=True,
+                        max_length=512,
+                        return_tensors="pt"
+                    ).to(self.device)
 
                 with self._torch.no_grad():
                     out = self._model(**encoded)

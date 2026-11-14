@@ -1,4 +1,4 @@
-.PHONY: help setup download-models dev prod-up prod-down prod-status prod-restart prod-restart-vllm prod-down-vllm vllm-check chat-up chat-down chat-restart chat-status chat-logs chat-code test-smtp cache-stats cache-clear otp-clear queue-stats redis-up redis-down redis-status redis-watch up down logs ingest-pdfs query ask rag-answer serve-slm serve-gpu serve-router generate-dataset eval load-test load-test-cold test test-intensive clean
+.PHONY: help setup download-models dev prod-up prod-down prod-status prod-restart prod-restart-vllm prod-down-vllm vllm-check chat-up chat-down chat-restart chat-status chat-logs chat-code test-smtp cache-stats cache-clear otp-clear queue-stats redis-up redis-down redis-status redis-watch up down logs ingest-pdfs query ask rag-answer serve-slm serve-gpu serve-router generate-dataset eval load-test load-test-cold load-test-cache cache-check export-onnx test test-intensive clean
 
 -include .env
 export
@@ -12,7 +12,8 @@ MODEL_7B_PATH ?= models/llm_7b/qwen2.5-7b-instruct
 help:
 	@echo "Available commands:"
 	@echo "  make setup          - Create virtualenv and install dependencies"
-	@echo "  make download-models - Download AI models to models/ (Embeddings, CPU SLM, GPU 7B)"
+	@echo "  make download-models - Download AI models to models/ (Embeddings, CPU SLM, GPU 7B) and export the ONNX embedder"
+	@echo "  make export-onnx    - Export MiniLM to ONNX (verified identical to PyTorch); the gateway uses it automatically"
 	@echo "  make dev            - Run Gateway service locally on port 8080 with live reload"
 	@echo "  make prod-up        - Start production stack (Gateway 6 workers, CPU SLM 6x16, vLLM, Redis)"
 	@echo "  make prod-status    - Display status and health of all production services"
@@ -37,13 +38,15 @@ help:
 	@echo "  make query Q=\"...\"  - Perform semantic search query against the Redis vector index"
 	@echo "  make ask Q=\"...\"    - Query the running Gateway with clean formatted answer output"
 	@echo "  make rag-answer Q=\"...\" - Answer query using retrieved context + dual-tier routing"
-	@echo "  make serve-slm      - Start Qwen 2.5 3B CPU SLM server (6 workers x 16 threads = 96 cores)"
+	@echo "  make serve-slm      - Start Qwen 2.5 3B CPU SLM server (1 process, 6 slots x 16 threads = 96 cores)"
 	@echo "  make serve-gpu      - Start Qwen 2.5 7B vLLM on 127.0.0.1:8000 (GPU = VLLM_GPU, needs VLLM_API_KEY)"
 	@echo "  make serve-router   - Start MLP Router microservice on port 8090"
 	@echo "  make generate-dataset - Generate synthetic multi-chunk dataset with scripts/dataset_generator.py"
 	@echo "  make eval           - Run offline router complexity & threshold evaluation"
 	@echo "  make load-test      - Run mixed concurrency load test against running gateway"
 	@echo "  make load-test-cold - Run 100 uncached cold requests load test (0% cache hits) under C=10"
+	@echo "  make load-test-cache [QPS=100 DURATION=600 FRESH=0] - NFR-1: cache-hit load (+ optional fresh questions/s), pass/fail on semantic p99 <= 35 ms"
+	@echo "  make cache-check    - Live cache safety check: intent guard, owner scoping, exact sharing, regenerate tokens"
 	@echo "  make test           - Run integration, security & admission queue test suites"
 	@echo "  make clean          - Remove caches and build artifacts"
 
@@ -55,6 +58,10 @@ setup:
 
 download-models:
 	$(PYTHON) scripts/download_models.py
+	$(PYTHON) scripts/export_embedder_onnx.py
+
+export-onnx:
+	$(PYTHON) scripts/export_embedder_onnx.py
 
 dev:
 	uvicorn gateway.main:app --host 0.0.0.0 --port 8080 --reload
@@ -154,7 +161,7 @@ rag-answer:
 	$(PYTHON) -m pipeline.rag_chain "$(Q)"
 
 serve-slm:
-	$(PYTHON) -m pipeline.serve_cpu_slm --port 8082 --workers 6 --threads 16
+	$(PYTHON) -m pipeline.serve_cpu_slm --port 8082 --slots 6 --threads 16
 
 # Always launch vLLM through scripts/serve_vllm.py: stock vLLM 0.6.3 ignores --host and binds 0.0.0.0.
 serve-gpu:
@@ -182,10 +189,19 @@ load-test:
 load-test-cold:
 	PYTHONPATH=. $(PYTHON) scripts/run_100_uncached_load_test.py
 
+QPS ?= 100
+DURATION ?= 600
+FRESH ?= 0
+load-test-cache:
+	PYTHONPATH=. $(PYTHON) scripts/load_test_cache.py --qps $(QPS) --duration $(DURATION) --fresh-rate $(FRESH)
+
+cache-check:
+	PYTHONPATH=. $(PYTHON) scripts/check_cache_isolation.py
+
 test:
 	PYTHONPATH=. $(PYTHON) tests/test_admission_queue.py
 	PYTHONPATH=. $(PYTHON) -m pytest tests/test_single_port_security.py
-	PYTHONPATH=. $(PYTHON) -m pytest tests/test_vllm_launcher.py tests/test_dispatcher_threshold.py
+	PYTHONPATH=. $(PYTHON) -m pytest tests/test_vllm_launcher.py tests/test_dispatcher_threshold.py tests/test_cache_owner_scoping.py tests/test_cache_regenerate.py tests/test_premise_rules.py tests/test_premise_routing.py tests/test_topic_retrieval.py tests/test_topic_speller.py tests/test_slm_slots.py tests/test_retrieval_warmup.py tests/test_refusal_mixed.py tests/test_embedder_onnx.py tests/test_cache_index_alter.py
 	PYTHONPATH=. $(PYTHON) -m pytest tests/test_cache_intent_guard.py tests/test_cache_intent_guard_extensive.py
 	PYTHONPATH=. $(PYTHON) tests/test_injection_fence.py
 	PYTHONPATH=. $(PYTHON) tests/test_rate_limiting.py

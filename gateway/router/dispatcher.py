@@ -1,5 +1,7 @@
 from enum import Enum
 from typing import Any, Dict, Optional
+
+from gateway.router.premise_check import premise_check_reason
 try:
     from pydantic import BaseModel
 except ImportError:
@@ -27,14 +29,18 @@ class RequestDispatcher:
         self.vllm_model_name = vllm_model_name
         self.fallback_enabled = fallback_enabled
 
-    def decide(self, score: float, gpu_saturated: bool = False, force_tier=None) -> RouteDecision:
+    def decide(self, score: float, gpu_saturated: bool = False, force_tier=None, query: Optional[str] = None) -> RouteDecision:
         if force_tier:
             return RouteDecision(target_tier=force_tier, score=score, alpha=self.alpha, target_model=self.slm_model_name if force_tier == ModelTier.CPU_SLM else self.vllm_model_name, reason=f"Manual: {force_tier}")
         # FR-2: P(hard) >= alpha routes to the Tier-2 GPU LLM, so a score exactly at alpha is GPU-bound.
         # Same rule as QueryRouter (prob >= threshold) and serve_router (score >= threshold).
-        if score < self.alpha:
+        # Loaded "why" claims (e.g. "Why does X always...?") go to the GPU tier even when the score is low:
+        # the 3B model tends to confirm the embedded false premise (PRD L12).
+        premise = premise_check_reason(query) if (query and score < self.alpha) else None
+        if score < self.alpha and not premise:
             return RouteDecision(target_tier=ModelTier.CPU_SLM, score=score, alpha=self.alpha, target_model=self.slm_model_name, reason="Score < Alpha")
         else:
             if gpu_saturated and self.fallback_enabled:
                 return RouteDecision(target_tier=ModelTier.CPU_SLM, score=score, alpha=self.alpha, target_model=self.slm_model_name, reason="GPU saturated", fallback_applied=True)
-            return RouteDecision(target_tier=ModelTier.GPU_LLM, score=score, alpha=self.alpha, target_model=self.vllm_model_name, reason="Score >= Alpha")
+            reason = f"Premise check: {premise}" if premise else "Score >= Alpha"
+            return RouteDecision(target_tier=ModelTier.GPU_LLM, score=score, alpha=self.alpha, target_model=self.vllm_model_name, reason=reason)

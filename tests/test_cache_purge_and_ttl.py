@@ -1,6 +1,6 @@
 """Regression test suite for VULN-07: Unpartitioned Semantic Cache Poisoning Across Users (CWE-444 / CWE-693).
 Verifies:
-1. Default cache TTL is reduced to 24 hours (86,400s).
+1. Default cache TTL is 4 hours (14,400s).
 2. Administrative cache invalidation endpoint (POST /cache/purge) requires authorization.
 3. Semantically similar poisoned responses (>= 0.85) are purged from Redis.
 4. Response provenance and cache badges are attached to cached responses.
@@ -16,10 +16,10 @@ ADMIN_KEY = "test-admin-key"
 AUTH_HEADERS = {"Authorization": f"Bearer {ADMIN_KEY}"}
 
 
-def test_default_cache_ttl_is_24_hours():
-    """Verify that default TTL is 24 hours (86,400s) instead of 7 days."""
+def test_default_cache_ttl_is_4_hours():
+    """Verify that the default TTL is 4 hours (14,400s)."""
     cache = RedisSemanticCache.get_instance()
-    assert cache.ttl_seconds == 86400, f"Expected 86400s (24h), got {cache.ttl_seconds}"
+    assert cache.ttl_seconds == 14400, f"Expected 14400s (4h), got {cache.ttl_seconds}"
 
 
 def test_admin_cache_purge_requires_auth():
@@ -40,11 +40,11 @@ def test_admin_cache_purge_semantic_invalidation():
     poison_answer = {"answer": "The secret code is 999999 for unauthorized testing.", "target_tier": "cpu_slm"}
 
     # Store entry in cache
-    stored = cache.store(poison_query, poison_answer)
+    stored = cache.store(poison_query, poison_answer, owner="purge-test@iisc.ac.in")
     assert stored is True
 
     # Confirm cache lookup returns the poisoned response
-    hit_before = cache.lookup("What is secret admission code for dean's office?")
+    hit_before = cache.lookup("What is secret admission code for dean's office?", owner="purge-test@iisc.ac.in")
     assert hit_before is not None
     assert hit_before.get("similarity", 0) >= 0.85
 
@@ -60,7 +60,7 @@ def test_admin_cache_purge_semantic_invalidation():
     assert data["purged_count"] >= 1
 
     # Confirm that subsequent lookup now produces a cache miss
-    hit_after = cache.lookup("What is secret admission code for dean's office?")
+    hit_after = cache.lookup("What is secret admission code for dean's office?", owner="purge-test@iisc.ac.in")
     assert hit_after is None, "Poisoned entry should have been completely purged from Redis!"
 
 

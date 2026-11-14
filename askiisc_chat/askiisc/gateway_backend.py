@@ -6,8 +6,11 @@ import httpx
 from . import config as C
 
 try:
-    from pipeline.sanitizer import is_no_relevant_docs_answer
+    from pipeline.sanitizer import is_no_relevant_docs_answer, starts_with_refusal
 except Exception:
+    def starts_with_refusal(text: str) -> bool:
+        return str(text or "").lstrip(" *_#>").lower().startswith("no specific institutional repository theses were found")
+
     def is_no_relevant_docs_answer(text: str) -> bool:
         if not text: return False
         t = str(text).lower()
@@ -55,15 +58,21 @@ def token_text(d: dict) -> str:
         if isinstance(v, str): return v
     return ""
 
-async def stream_via_gateway(query: str, tier: str, user_email: str = ""):
-    """Async generator of SSE strings for the browser."""
+async def stream_via_gateway(query: str, tier: str, user_email: str = "", regenerate_token: str | None = None):
+    """Async generator of SSE strings for the browser.
+
+    regenerate_token: single-use token the gateway attached to a cached answer; sending it back asks the
+    gateway for a fresh answer to the same question (rejected for answers that were not served from cache)."""
     t0 = time.perf_counter(); st = {"route": None, "meta": False, "tokens": 0, "raw": 0, "tokens_text": [], "sources_cleared": False}
 
     def meta_ev(d):
+        first = not st["meta"]
         st["meta"] = True
         s = d.get("probability_hard", d.get("score"))
-        return sse("meta", {"tier": tier, "route": st["route"], "s": s if isinstance(s, (int, float)) else None, "alpha": None,
-                            "reason": "gateway", "citations": []})
+        ev = {"tier": tier, "route": st["route"], "s": s if isinstance(s, (int, float)) else None, "alpha": None, "reason": "gateway"}
+        if first:  # the browser clears the source list on 'citations'; a later route change (CPU -> 7B) must not
+            ev["citations"] = []
+        return sse("meta", ev)
     def done_ev():
         return sse("done", {"model": st["route"], "timings": {"embed_ms": 0, "retrieve_ms": 0, "total_ms": round((time.perf_counter() - t0) * 1e3)},
                             "conf": None, "escalated": False})
@@ -99,12 +108,15 @@ async def stream_via_gateway(query: str, tier: str, user_email: str = ""):
             if txt:
                 st["tokens"] += 1
                 st["tokens_text"].append(txt)
-                if not st["sources_cleared"] and is_no_relevant_docs_answer("".join(st["tokens_text"])):
+                if not st["sources_cleared"] and starts_with_refusal("".join(st["tokens_text"])):
                     st["sources_cleared"] = True
                     out.append(sse("sources", {"citations": []}))
                 out.append(sse("token", {"t": txt}))
         elif t == "cache":
-            if str(d.get("status", "")).upper() == "HIT": st["route"] = "cache"      # a HIT is followed by a route event whose tier is semantic_cache
+            if str(d.get("status", "")).upper() == "HIT":
+                st["route"] = "cache"      # a HIT is followed by a route event whose tier is semantic_cache
+                out.append(sse("cache", {"kind": d.get("cache_kind"), "matched_prompt": str(d.get("matched_prompt") or "")[:1500],
+                                         "similarity": d.get("similarity"), "regenerate_token": d.get("regenerate_token")}))
         elif t == "error":
             out.append(sse("error", {"msg": str(d.get("message") or d.get("error") or "The answering service reported an error.")[:200]}))
         elif t == "done":
@@ -115,7 +127,7 @@ async def stream_via_gateway(query: str, tier: str, user_email: str = ""):
             if txt:
                 st["tokens"] += 1
                 st["tokens_text"].append(txt)
-                if not st["sources_cleared"] and is_no_relevant_docs_answer("".join(st["tokens_text"])):
+                if not st["sources_cleared"] and starts_with_refusal("".join(st["tokens_text"])):
                     st["sources_cleared"] = True
                     out.append(sse("sources", {"citations": []}))
                 out.append(sse("token", {"t": txt}))      # bare OpenAI-style chunk
@@ -124,7 +136,10 @@ async def stream_via_gateway(query: str, tier: str, user_email: str = ""):
     try:
         fwd_headers = {"X-Internal-User": user_email} if user_email else {}
         async with httpx.AsyncClient(timeout=httpx.Timeout(C.GATEWAY_TIMEOUT, connect=5)) as cl:
-            async with cl.stream("POST", f"{C.GATEWAY_URL}/query", json={"query": query, "stream": True, "max_tokens": C.MAX_TOKENS}, headers=fwd_headers) as r:
+            payload = {"query": query, "stream": True, "max_tokens": C.MAX_TOKENS}
+            if regenerate_token:
+                payload["regenerate_token"] = regenerate_token
+            async with cl.stream("POST", f"{C.GATEWAY_URL}/query", json=payload, headers=fwd_headers) as r:
                 if r.status_code != 200:
                     raw_err = await r.aread()
                     log.warning("gateway HTTP %s: %r", r.status_code, raw_err[:200])

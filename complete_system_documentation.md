@@ -139,7 +139,7 @@ sequenceDiagram
 | :--- | :---: | :---: | :--- | :--- |
 | **Unified Campus Gateway & UI** | `8080` | `0.0.0.0` | **Public Facing (Intranet)**; Session Cookies, CSRF, Token-Bucket Admission | FastAPI, Uvicorn (6 workers) |
 | **Redis Stack Server** | `6379` | `127.0.0.1` | **Loopback Only**; Password Protected (`REDIS_PASSWORD`) | RediSearch + RedisJSON + HNSW |
-| **CPU SLM Daemon** | `8082` | `127.0.0.1` | **Loopback Only**; Internal microservice | FastAPI, `llama.cpp` (6 workers $\times$ 16 threads) |
+| **CPU SLM Daemon** | `8082` | `127.0.0.1` | **Loopback Only**; Internal microservice | FastAPI, `llama.cpp` (1 process, 6 model slots $\times$ 16 threads; 503 when busy, gateway overflows to GPU) |
 | **vLLM GPU Engine** | `8000` | `127.0.0.1` | **Loopback Only**; Internal microservice | vLLM OpenAI API Server, CUDA 12.1 |
 
 ---
@@ -184,12 +184,13 @@ Implemented in [`gateway/cache/redis_semantic_cache.py`](file:///data2/home/ritu
 2. Query text is embedded into a 384-dimensional dense vector using [`all-MiniLM-L6-v2`](file:///data2/home/ritujmanware/onprem-rag-gateway/models/embeddings/all-MiniLM-L6-v2) on CPU (< 4ms).
 3. Performs HNSW cosine similarity search against index `semantic_cache_idx` (key prefix `semcache:`) using RediSearch `FT.SEARCH` with `EF_RUNTIME 64`.
 4. **Cache Hit Decision:**
-   - Exact L0 hash match, **or** cosine similarity $\ge 0.90$ (cosine distance $\le 0.10$) **and** the intent-equivalence guard (`RedisSemanticCache.check_entity_conflict`) confirms both queries ask the same question. The guard rejects differences in numbers/years, negation, question type (*why* vs. yes/no vs. *what/how*), opposite terms, quantifiers, and swapped roles of two terms. Known limits: PRD §9.1.
+   - Exact L0 hash match (shared across users), **or**, among the requesting user's **own** entries only (owner-scoped KNN pre-filter), cosine similarity $\ge 0.90$ (cosine distance $\le 0.10$) **and** the intent-equivalence guard (`RedisSemanticCache.check_entity_conflict`) confirms both queries ask the same question. The guard rejects differences in numbers/years, negation, question type (*why* vs. yes/no vs. *what/how*), opposite terms, quantifiers, and swapped roles of two terms. Known limits: PRD §9.1.
      - Returns pre-generated response immediately (< 1ms exact, < 35ms semantic).
      - Emits token deltas via SSE streaming with `cache_hit=True` metadata.
 5. **Cache Miss Decision:**
    - If similarity $< 0.90$ or the intent guard rejects the candidate, dispatches to the cold RAG pipeline.
-6. **Provenance:** Every stored entry carries a keyed HMAC owner tag (`owner`) of the creating user for audit and targeted purge. The cache remains shared across users; lookups do not filter on the tag.
+7. **Regenerate (Sub-FR-1.5):** Cache hits carry a single-use regenerate token (bound to user and question, 15 min). The UI shows the reused question and a *Generate a fresh answer* button only on cached answers. A regenerated answer to a shared exact hit becomes a private per-user override (`semcache:uexact:<owner>:<hash>`); the shared entry is evicted after 3 distinct users regenerate it. Shared exact entries are never overwritten by normal stores (`SET NX`). Limits: `REGEN_MAX_PER_HOUR`, `REGEN_TOKEN_TTL`, `REGEN_EVICT_USERS`.
+6. **Owner scoping:** Every stored entry carries a keyed HMAC owner tag (`owner`, RediSearch `TAG`). Semantic lookups are pre-filtered to the requester's tag, so near-duplicate answers are never shared between users (NFR-6 measured 0/255 cross-user poisonings). Exact-text matches remain shared. Requests or entries without an owner use the exact path only.
 
 ### Refusal & Anti-Pollution Shield (NFR-6)
 - [`RedisSemanticCache.is_cacheable_response`](file:///data2/home/ritujmanware/onprem-rag-gateway/gateway/cache/redis_semantic_cache.py):

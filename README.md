@@ -62,7 +62,7 @@ The platform runs behind a single-port secure perimeter (**Port 8080**) featurin
      Easy (P < 0.65)                   Hard (P >= 0.65)
            ▼                                 ▼
  CPU SLM :8082 (Qwen2.5-3B)        GPU LLM :8000 (vLLM Qwen2.5-7B)
- (6 workers x 16 threads)          (NVIDIA A100 80GB, PagedAttention)
+ (6 slots x 16 threads)            (NVIDIA A100 80GB, PagedAttention)
            │                                 │
            │                       (SLA Timeout / 5xx Error)
            │                                 ▼
@@ -138,7 +138,10 @@ REDIS_DB=0
 REDIS_PASSWORD=<YOUR_REDIS_PASSWORD>
 REDIS_URL=redis://:<YOUR_REDIS_PASSWORD>@localhost:6379/0
 REDIS_INDEX_NAME=rag_documents_idx
-SEMANTIC_CACHE_TTL=86400
+SEMANTIC_CACHE_TTL=14400     # cached answers live 4 hours
+REGEN_TOKEN_TTL=900          # "Generate a fresh answer" token lifetime (cached answers only)
+REGEN_MAX_PER_HOUR=20        # regenerations per user per hour
+REGEN_EVICT_USERS=3          # distinct users regenerating a shared answer before it is evicted
 
 # Model Service Endpoints
 SLM_BASE_URL=http://localhost:8082/v1
@@ -343,8 +346,8 @@ wget -O models/slm_gguf/qwen2.5-3b-instruct-q4_k_m.gguf \
 # Via Make:
 make serve-slm
 
-# Via Native Command (6 parallel workers, 16 OpenMP threads each):
-python -m pipeline.serve_cpu_slm --port 8082 --workers 6 --threads 16
+# Via Native Command (one process, 6 model slots, 16 threads each; busy -> 503 after SLM_QUEUE_TIMEOUT):
+python -m pipeline.serve_cpu_slm --port 8082 --slots 6 --threads 16
 ```
 
 ### Testing CPU SLM Endpoint
@@ -530,7 +533,7 @@ make otp-clear
 | Port | Service Component | Host Binding | Access Restriction |
 | :---: | :--- | :---: | :--- |
 | **`8080`** | **Unified Gateway & AskIISc Web UI** | `0.0.0.0` | **Public/Campus Facing**; Session Auth, CSRF, Token-Bucket Admission |
-| **`8082`** | **CPU SLM Daemon (Qwen 2.5 3B)** | `127.0.0.1` | **Internal Loopback Only**; 6 workers $\times$ 16 threads |
+| **`8082`** | **CPU SLM Daemon (Qwen 2.5 3B)** | `127.0.0.1` | **Internal Loopback Only**; 1 process, 6 slots $\times$ 16 threads |
 | **`8000`** | **GPU LLM Engine (vLLM Qwen 2.5 7B)** | `127.0.0.1` | **Internal Loopback Only**; PagedAttention v2 on NVIDIA A100 |
 | **`6379`** | **Redis Stack Server (Vector DB & Cache)** | `127.0.0.1` | **Internal Loopback Only**; Protected by `REDIS_PASSWORD` |
 
@@ -550,7 +553,7 @@ make otp-clear
 | **vLLM: `No available memory for the cache blocks`** | vLLM 0.6.3 counts other users' memory changes on a shared GPU during start-up profiling. | Choose a GPU with steady usage and ~19 GB free (`nvidia-smi`), set `VLLM_GPU` in `.env`, then `make prod-restart-vllm`. |
 | **vLLM: `Address already in use` on restart** | Previous server's connections on port 8000 still closing. | Already handled by `scripts/serve_vllm.py` (`SO_REUSEADDR`); if it persists, check `ss -ltnp \| grep :8000` for a stray process. |
 | **`make vllm-check` fails / 🚨 warning in `make prod-status`** | vLLM was started without `scripts/serve_vllm.py`, so it is bound to `0.0.0.0` without an API key. | `make prod-restart-vllm`, then `make vllm-check`. |
-| **Cached answer not reused for a rephrased question** | The semantic-cache intent guard rejected the match (different question type, opposite terms, quantifiers, swapped roles) or similarity < 0.90. | Expected behaviour; the gateway logs `rejected by entity/intent guard: <reason>`. See PRD §9.1. |
+| **Cached answer not reused for a rephrased question** | Near-duplicate hits are per user (another user's entry is never reused; only exact repeats are shared), or the intent guard rejected the match (different question type, opposite terms, quantifiers, swapped roles), or similarity < 0.90. | Expected behaviour; the gateway logs `rejected by entity/intent guard: <reason>`. See PRD §9.1. |
 | **CSRF Error: 403 Forbidden** | Missing or mismatched CSRF cookie/header. | Ensure client passes `X-CSRF-Token` header matching the `csrftoken` cookie issued by `GET /me` or `GET /`. |
 
 ---

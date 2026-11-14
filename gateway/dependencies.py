@@ -1,4 +1,5 @@
 import os
+import os
 from gateway.cache.redis_semantic_cache import RedisSemanticCache
 from gateway.router.complexity_scorer import ComplexityScorer
 from gateway.router.dispatcher import RequestDispatcher
@@ -10,7 +11,7 @@ class ServiceContainer:
     def __init__(self):
         self.semantic_cache = RedisSemanticCache.get_instance()
         self.scorer = ComplexityScorer()
-        self.dispatcher = RequestDispatcher()
+        self.dispatcher = RequestDispatcher(alpha=float(os.getenv("ROUTING_ALPHA", "0.65")))  # FR-2 alpha
         self.admission = AdmissionController()
         self.slm_client = CPUSLMClient()
         self.vllm_client = VLLMClient()

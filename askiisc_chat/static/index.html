@@ -161,6 +161,20 @@
     .slm { color: var(--slm); }
     .llm { color: var(--llm); }
     .cache { color: var(--cache); }
+    .regen { color: var(--ac); }
+    .cache-note { margin: -4px 0 8px 0; font-style: italic; }
+    .regen-btn {
+      background: transparent;
+      border: 1px solid var(--bd);
+      color: var(--ac);
+      padding: 4px 12px;
+      border-radius: 6px;
+      font-size: 12px;
+      margin-top: 8px;
+      cursor: pointer;
+    }
+    .regen-btn:hover { border-color: var(--ac); }
+    .regen-btn:disabled { opacity: 0.6; cursor: wait; }
     .note { color: var(--mut); font-size: 12px; margin-top: 8px; }
     details {
       margin-top: 10px;
@@ -739,9 +753,46 @@
       const q = $('#q').value.trim();
       if (!q) return;
       $('#q').value = '';
+      await ask(q);
+    };
+
+    // Tell the user where a cached answer came from (text only, never HTML).
+    function showCacheNote(head, d) {
+      const n = document.createElement('div');
+      n.className = 'note cache-note';
+      if (d.kind === 'semantic') {
+        n.textContent = 'Reused answer from your earlier question: \u201c' + (d.matched_prompt || '') + '\u201d';
+      } else if (d.kind === 'override') {
+        n.textContent = 'Your previously regenerated answer to this question.';
+      } else {
+        n.textContent = 'Reused answer to an identical earlier question.';
+      }
+      head.after(n);
+    }
+
+    // Offered ONLY on answers served from the cache: the gateway attaches a single-use token to cached answers.
+    function addRegenerateButton(foot, q, token) {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'regen-btn';
+      b.textContent = '\u21bb Generate a fresh answer';
+      b.title = 'This answer came from the cache. Ask the model again if it does not fit your question.';
+      b.onclick = async () => {
+        if ($('#go').disabled) return;
+        b.disabled = true;
+        b.textContent = 'Generating a fresh answer\u2026';
+        await ask(q, { regenerateToken: token });
+        b.remove();
+      };
+      foot.after(b);
+    }
+
+    // Ask a question. opts.regenerateToken: request a fresh answer for a cached one.
+    async function ask(q, opts = {}) {
+      if ($('#go').disabled) return;
       $('#go').disabled = true;
 
-      el('msg user', q);
+      if (!opts.regenerateToken) el('msg user', q);
       const box = el('msg');
       const head = document.createElement('div');
       const body = document.createElement('div');
@@ -750,10 +801,20 @@
       box.append(head, body, foot);
       let text = '';
       let dtEl = null;
+      let cacheInfo = null;
 
+      // Mirrors pipeline/sanitizer.py is_no_relevant_docs_answer: an answer IS a refusal only if it is the refusal
+      // sentence on its own or a short text; a long answer that mentions a gap in passing keeps its sources.
+      const REFUSAL_RE = /^\W*no\s+specific\s+institutional\s+repository\s+thes[ie]s\s+(?:were|was)\s+found\b[^.!?\n]{0,40}[.!?]?\W*/i;
+      const startsWithRefusal = s => !!s && REFUSAL_RE.test(s);
       const isNoDocsAnswer = s => {
         if (!s) return false;
-        const low = s.toLowerCase();
+        const low = s.toLowerCase().trim();
+        if (low.includes('based on general academic knowledge') || low.includes('based on general technical knowledge') ||
+            low.includes('retrieval failed')) return true;
+        const m = low.match(REFUSAL_RE);
+        if (m) return low.slice(m[0].length).split(/\s+/).filter(Boolean).length < 12;
+        if (low.split(/\s+/).filter(Boolean).length > 60) return false;
         return low.includes('no specific institutional repository') ||
                low.includes('no institutional repository') ||
                low.includes('no relevant document') ||
@@ -837,7 +898,8 @@
             message: q,
             history,
             thesis_id: $('#thesis').value || null,
-            force: $('#force').value || null
+            force: $('#force').value || null,
+            regenerate_token: opts.regenerateToken || null
           })
         });
 
@@ -874,8 +936,13 @@
 
             if (ev === 'meta') {
               head.innerHTML = d.route ? `<span class="badge ${escapeHTML(d.route)}">${d.route === 'slm' ? 'SLM' : d.route === 'cache' ? 'Cached answer' : 'LLM'}</span>` : '';
+              if (opts.regenerateToken) head.innerHTML += '<span class="badge regen">Fresh answer</span>';
               if (DEBUG && d.s != null) head.innerHTML += `<span class="badge" style="color:var(--mut)">P(hard)=${d.s} / α=${d.alpha}</span>`;
               if (d.citations) showSources(d.citations);
+            }
+            else if (ev === 'cache') {
+              cacheInfo = d;
+              showCacheNote(head, d);
             }
             else if (ev === 'sources' || ev === 'chunks') {
               if (d.citations) showSources(d.citations);
@@ -887,7 +954,7 @@
               if (delta) {
                 text += delta;
                 body.innerHTML = renderMathAndMarkdown(text);
-                if (dtEl && isNoDocsAnswer(text)) {
+                if (dtEl && startsWithRefusal(text)) {
                   dtEl.remove();
                   dtEl = null;
                 }
@@ -952,9 +1019,10 @@
         body.style.color = 'crimson';
       }
 
+      if (cacheInfo && cacheInfo.regenerate_token && text) addRegenerateButton(foot, q, cacheInfo.regenerate_token);
       $('#go').disabled = false;
       $('#q').focus();
-    };
+    }
   </script>
 </body>
 </html>

@@ -15,8 +15,10 @@ and the model API listens on 0.0.0.0:8000 without authentication.
 This launcher accepts exactly the same arguments as
 ``python -m vllm.entrypoints.openai.api_server`` and adds two controls:
 
-1. The pre-bound socket honours ``--host`` (and the bind is verified). Binding
-   to a non-loopback address is refused unless VLLM_ALLOW_NON_LOOPBACK=1.
+1. The pre-bound socket honours ``--host`` and is STRICTLY loopback-only: ``--host``
+   must resolve to a loopback address (127.0.0.0/8), there is no override, and the
+   address actually bound is re-checked before serving. Exposing the model on the
+   network is not supported; all access goes through the :8080 gateway (FR-4).
 2. Startup is refused unless an API key is configured (VLLM_API_KEY env var,
    preferred, or --api-key). vLLM then requires
    ``Authorization: Bearer <key>`` on every /v1/* route, so the model stays
@@ -40,8 +42,8 @@ from pathlib import Path
 ROOT_DIR = Path(__file__).resolve().parent.parent
 
 
-def resolve_bind_host(host: str | None, allow_non_loopback: bool = False) -> str:
-    """Resolve --host to an IPv4 address and enforce the loopback-only perimeter."""
+def resolve_bind_host(host: str | None) -> str:
+    """Resolve --host to an IPv4 loopback address; anything else is refused (no override)."""
     if not host:
         raise ValueError(
             "--host is empty, which binds every interface. Pass --host 127.0.0.1."
@@ -52,11 +54,10 @@ def resolve_bind_host(host: str | None, allow_non_loopback: bool = False) -> str
         raise ValueError(f"cannot resolve --host {host!r} to an IPv4 address: {exc}") from exc
 
     addr = ipaddress.ip_address(resolved)
-    if not addr.is_loopback and not allow_non_loopback:
+    if not addr.is_loopback:
         raise ValueError(
             f"--host {host!r} ({resolved}) is not a loopback address. The GPU model "
-            "server must stay internal behind the :8080 gateway. Set "
-            "VLLM_ALLOW_NON_LOOPBACK=1 only if you really intend to expose it."
+            "server is loopback-only and must stay internal behind the :8080 gateway."
         )
     return resolved
 
@@ -77,10 +78,10 @@ def make_host_bound_socket_module(host: str) -> types.ModuleType:
             self.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             super().bind(address)
             bound_host = self.getsockname()[0]
-            if bound_host != host:
+            if bound_host != host or not ipaddress.ip_address(bound_host).is_loopback:
                 self.close()
                 raise RuntimeError(
-                    f"vLLM socket bound to {bound_host!r}, expected {host!r}; refusing to serve."
+                    f"vLLM socket bound to {bound_host!r}, expected loopback {host!r}; refusing to serve."
                 )
 
     shim = types.ModuleType("socket")
@@ -112,9 +113,11 @@ def main() -> None:
     args = parser.parse_args()
     validate_parsed_serve_args(args)
 
-    allow_non_loopback = os.getenv("VLLM_ALLOW_NON_LOOPBACK", "").strip() == "1"
+    if "VLLM_ALLOW_NON_LOOPBACK" in os.environ:
+        sys.exit("[serve_vllm] refusing to start: VLLM_ALLOW_NON_LOOPBACK is no longer supported; "
+                 "the model server is strictly loopback-only. Remove it from the environment/.env.")
     try:
-        args.host = resolve_bind_host(args.host, allow_non_loopback)
+        args.host = resolve_bind_host(args.host)
     except ValueError as exc:
         sys.exit(f"[serve_vllm] refusing to start: {exc}")
 
