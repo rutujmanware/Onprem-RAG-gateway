@@ -43,6 +43,39 @@ from pipeline.sanitizer import sanitize_and_fence_prompt, PromptInjectionAlert, 
 
 logger = logging.getLogger("gateway.main")
 
+
+_STREAM_END = object()
+
+
+async def closing_stream(gen):
+    """Serve a sync generator from a worker thread and ALWAYS close it, client disconnect included.
+
+    Starlette iterates sync generators in a thread but never closes them when the browser goes away,
+    so their finally blocks (admission.release(), closing the upstream model stream) only ran at
+    garbage collection, leaving model slots busy (DEFECT-17). Closing here runs them immediately.
+    """
+    import threading
+    import anyio
+    lock = threading.Lock()  # close() must wait for a next() still running in its thread
+
+    def step():
+        with lock:
+            return next(gen, _STREAM_END)
+
+    def close():
+        with lock:
+            gen.close()
+
+    try:
+        while True:
+            item = await anyio.to_thread.run_sync(step)
+            if item is _STREAM_END:
+                return
+            yield item
+    finally:
+        with anyio.CancelScope(shield=True):
+            await anyio.to_thread.run_sync(close)
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Initialize container (creates Redis semantic cache index, etc.)
@@ -55,6 +88,15 @@ async def lifespan(app: FastAPI):
             logger.info(f"Startup sanitized Redis cache: purged {purged} uncacheable entries.")
     except Exception as e:
         logger.warning(f"Container initialization warning: {e}")
+    # Load router, embedder, retriever and spell dictionaries now, not on a user's first question
+    # (the spell dictionaries alone take ~2.5 s per worker process).
+    try:
+        from pipeline.rag_chain import warm_up
+        t_warm = time.time()
+        await run_in_threadpool(warm_up)
+        logger.info(f"Retrieval warm-up done in {time.time() - t_warm:.2f}s")
+    except Exception as e:
+        logger.warning(f"Retrieval warm-up skipped: {e}")
     yield
     try:
         await container.shutdown()
@@ -157,6 +199,8 @@ class DirectQueryRequest(BaseModel):
     max_tokens: Optional[int] = Field(default=2048, ge=1, le=8192)
     stream: Optional[bool] = False
     bypass_cache: Optional[bool] = False
+    # Single-use token issued only with a cached answer; requests a fresh answer for that same question.
+    regenerate_token: Optional[str] = Field(default=None, max_length=128)
 
 @app.get("/healthz", include_in_schema=False)
 @app.get("/health", include_in_schema=False)
@@ -172,6 +216,7 @@ async def cache_stats(cache: RedisSemanticCache = Depends(get_semantic_cache)):
         "index_name": cache.index_name,
         "key_prefix": cache.key_prefix,
         "similarity_threshold": cache.similarity_threshold,
+        "regenerations_logged": cache.regen_event_count(),
         "vector_dim": cache.vector_dim,
         "cached_queries_count": count,
     }
@@ -253,9 +298,9 @@ async def chat_completions(
 
     # Step 0: Semantic Vector Cache Lookup
     try:
-        hit = await cache.alookup(query)
+        hit = await cache.alookup(query, owner=client_id)
         if hit is None and query != raw_query:
-            hit = await cache.alookup(raw_query)
+            hit = await cache.alookup(raw_query, owner=client_id)
     except Exception:
         hit = None
 
@@ -331,7 +376,7 @@ async def chat_completions(
 
     # Step 1: Neural Complexity Routing (MLP Router)
     score = await scorer.score(query)
-    decision = dispatcher.decide(score)
+    decision = dispatcher.decide(score, query=query)
 
     if req.stream:
         await admission.acquire(client_id)
@@ -343,6 +388,7 @@ async def chat_completions(
             try:
                 full_ans = []
                 collected_chunks = []
+                incomplete = False
                 for event in rag.answer_query_stream(
                     query,
                     max_new_tokens=req.max_tokens,
@@ -366,6 +412,7 @@ async def chat_completions(
                     elif event.get("type") == "chunks":
                         collected_chunks = event.get("chunks", [])
                     elif event.get("type") == "done":
+                        incomplete = bool(event.get("incomplete"))
                         final_chunk = {
                             "id": cmpl_id,
                             "object": "chat.completion.chunk",
@@ -381,7 +428,7 @@ async def chat_completions(
 
                 # Save generated completion to cache only when document chunks were retrieved
                 complete_text = "".join(full_ans)
-                if complete_text and collected_chunks:
+                if complete_text and collected_chunks and not incomplete:
                     try:
                         cache.store(query, {"answer": complete_text, "chunks": collected_chunks}, owner=client_id)
                         if query != raw_query:
@@ -393,7 +440,7 @@ async def chat_completions(
                 admission.release()
 
         return StreamingResponse(
-            sse_chat_generator(),
+            closing_stream(sse_chat_generator()),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
@@ -567,13 +614,29 @@ async def query_endpoint(
         if u and isinstance(u, dict) and u.get("email"):
             client_id = u["email"]
 
+    # "Regenerate": only valid with a token that was issued together with a cached answer to this user
+    # for this exact question. Capped per user; regenerating a SHARED answer only creates a private
+    # override, and the shared entry is evicted once enough distinct users regenerate it.
+    regen = None
+    if req.regenerate_token:
+        if not await cache.aregen_quota_ok(client_id):
+            raise HTTPException(status_code=429, detail="Regenerate limit reached. Please try again later.")
+        regen = await cache.aconsume_regen_token(req.regenerate_token, client_id, raw_query)
+        if regen is None:
+            raise HTTPException(status_code=403, detail="Regenerate is only available for an answer that was served from the cache.")
+        evicted = await cache.arecord_shared_regen(regen["matched_prompt"], client_id) if regen["kind"] == "exact" else False
+        await cache.alog_regen_event(regen, client_id, evicted)
+    regen_kind = regen["kind"] if regen else None
+    use_cache = (not req.bypass_cache) and regen is None
+    may_store = (not req.bypass_cache) or regen is not None
+
     # Step 0: Check Semantic Vector Cache in Redis (Fast path < 5ms bypasses admission queue)
     hit = None
-    if not req.bypass_cache:
+    if use_cache:
         try:
-            hit = await cache.alookup(query)
+            hit = await cache.alookup(query, owner=client_id)
             if hit is None and query != raw_query:
-                hit = await cache.alookup(raw_query)
+                hit = await cache.alookup(raw_query, owner=client_id)
         except Exception:
             hit = None
 
@@ -587,11 +650,13 @@ async def query_endpoint(
 
         sim = hit.get("similarity", 1.0)
         matched_prompt = hit.get("matched_prompt", query)
+        cache_kind = "override" if hit.get("override") else ("exact" if hit.get("fast_exact") else "semantic")
+        regen_token = await cache.aissue_regen_token(client_id, raw_query, cache_kind, matched_prompt, sim)
 
         if req.stream:
             def cached_stream():
                 # Yield cache hit notification event
-                yield f"data: {json.dumps({'type': 'cache', 'status': 'HIT', 'similarity': sim, 'matched_prompt': matched_prompt, 'badge': 'Cached answer', 'cached_at': cached_resp.get('cached_at', time.time())})}\n\n"
+                yield f"data: {json.dumps({'type': 'cache', 'status': 'HIT', 'similarity': sim, 'matched_prompt': matched_prompt, 'badge': 'Cached answer', 'cache_kind': cache_kind, 'regenerate_token': regen_token, 'cached_at': cached_resp.get('cached_at', time.time())})}\n\n"
                 # Yield route event
                 yield f"data: {json.dumps({'type': 'route', 'route': cached_resp.get('route', 'cached'), 'target_tier': 'semantic_cache', 'probability_hard': 0.0})}\n\n"
                 # Yield chunks event
@@ -623,6 +688,8 @@ async def query_endpoint(
         cached_resp["cached"] = True
         cached_resp["cache_hit"] = True
         cached_resp["badge"] = "Cached answer"
+        cached_resp["cache_kind"] = cache_kind
+        cached_resp["regenerate_token"] = regen_token
         cached_resp["query"] = raw_query
         if query != raw_query:
             cached_resp["normalized_query"] = query
@@ -647,6 +714,7 @@ async def query_endpoint(
                 collected_answer = []
                 collected_chunks = []
                 route_info = {}
+                incomplete = False
                 for event in rag.answer_query_stream(
                     query,
                     top_k=req.top_k,
@@ -661,6 +729,8 @@ async def query_endpoint(
                         collected_chunks = event["chunks"]
                     elif etype == "route":
                         route_info = event
+                    elif etype == "done":
+                        incomplete = bool(event.get("incomplete"))
                     yield f"data: {json.dumps(event)}\n\n"
 
                 full_text = "".join(collected_answer)
@@ -669,7 +739,7 @@ async def query_endpoint(
                     yield f"data: {json.dumps({'type': 'chunks', 'chunks': []})}\n\n"
 
                 # Only cache responses when document chunks were successfully retrieved and not a refusal
-                if full_text and collected_chunks and not is_no_relevant_docs_answer(full_text):
+                if may_store and full_text and not incomplete and collected_chunks and not is_no_relevant_docs_answer(full_text):
                     try:
                         cache_payload = {
                             "query": raw_query,
@@ -680,9 +750,9 @@ async def query_endpoint(
                         }
                         if query != raw_query:
                             cache_payload["normalized_query"] = query
-                        cache.store(query, cache_payload, owner=client_id)
+                        cache.store(query, cache_payload, owner=client_id, regen_kind=regen_kind)
                         if query != raw_query:
-                            cache.store(raw_query, cache_payload, owner=client_id)
+                            cache.store(raw_query, cache_payload, owner=client_id, regen_kind=regen_kind)
                     except Exception:
                         pass
                 yield "data: [DONE]\n\n"
@@ -690,7 +760,7 @@ async def query_endpoint(
                 admission.release()
 
         return StreamingResponse(
-            event_stream(),
+            closing_stream(event_stream()),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
@@ -714,7 +784,7 @@ async def query_endpoint(
         score, candidate_chunks = await asyncio.gather(score_task, retrieval_task)
         pre_duration = round(time.time() - t0_pre, 3)
 
-        decision = dispatcher.decide(score)
+        decision = dispatcher.decide(score, query=query)
         is_hard = (decision.target_tier == ModelTier.GPU_LLM)
 
         # Step 2: Dynamic In-Memory Tier Document Slicing
@@ -778,10 +848,10 @@ async def query_endpoint(
                     }
                     if query != raw_query:
                         res["normalized_query"] = query
-                    if not req.bypass_cache and served_chunks and not is_no_relevant_docs_answer(answer_text):
-                        await cache.astore(query, res, owner=client_id)
+                    if may_store and served_chunks and not is_no_relevant_docs_answer(answer_text):
+                        await cache.astore(query, res, owner=client_id, regen_kind=regen_kind)
                         if query != raw_query:
-                            await cache.astore(raw_query, res, owner=client_id)
+                            await cache.astore(raw_query, res, owner=client_id, regen_kind=regen_kind)
                     return res
                 except Exception:
                     pass
@@ -805,10 +875,10 @@ async def query_endpoint(
                 res["normalized_query"] = query
             res["cached"] = False
             res["routing_time_seconds"] = round(time.time() - t0, 4)
-            if not req.bypass_cache and res.get("chunks") and not is_no_relevant_docs_answer(res.get("answer", "")):
-                await cache.astore(query, res, owner=client_id)
+            if may_store and res.get("chunks") and not is_no_relevant_docs_answer(res.get("answer", "")):
+                await cache.astore(query, res, owner=client_id, regen_kind=regen_kind)
                 if query != raw_query:
-                    await cache.astore(raw_query, res, owner=client_id)
+                    await cache.astore(raw_query, res, owner=client_id, regen_kind=regen_kind)
             return res
 
         # Route: Easy -> CPU SLM
@@ -836,10 +906,10 @@ async def query_endpoint(
         res["score"] = round(score, 4)
         res["cached"] = False
         res["routing_time_seconds"] = round(time.time() - t0, 4)
-        if not req.bypass_cache and res.get("chunks") and not is_no_relevant_docs_answer(res.get("answer", "")):
-            await cache.astore(query, res, owner=client_id)
+        if may_store and res.get("chunks") and not is_no_relevant_docs_answer(res.get("answer", "")):
+            await cache.astore(query, res, owner=client_id, regen_kind=regen_kind)
             if query != raw_query:
-                await cache.astore(raw_query, res, owner=client_id)
+                await cache.astore(raw_query, res, owner=client_id, regen_kind=regen_kind)
         return res
 
 
@@ -873,6 +943,7 @@ if STATIC_DIR.exists():
         history: Optional[List[Dict[str, Any]]] = Field(default=[], max_length=50)
         thesis_id: Optional[str] = Field(default=None, max_length=100)
         force: Optional[str] = Field(default=None, max_length=20)
+        regenerate_token: Optional[str] = Field(default=None, max_length=128)
 
     CSRF_COOKIE_NAME = "csrftoken"
     CSRF_HEADER_NAME = "x-csrf-token"
@@ -1028,7 +1099,7 @@ if STATIC_DIR.exists():
             )
         user_email = u.get("email", "")
         return StreamingResponse(
-            stream_via_gateway(req.message, "internal", user_email=user_email),
+            stream_via_gateway(req.message, "internal", user_email=user_email, regenerate_token=req.regenerate_token),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",

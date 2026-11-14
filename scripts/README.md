@@ -20,6 +20,10 @@ This directory contains standalone execution, cluster batch, and data engineerin
   Post-restart verification (`make vllm-check`): loopback-only bind, 401 without/with a wrong key, 200 with `VLLM_API_KEY`, unreachable via the host's network IPs.
 - **`prod_stack.py`**:
   Production orchestrator (`make prod-up/prod-status/prod-restart/prod-down`). `--with-vllm` also stops/restarts the vLLM engine (process-group stop so GPU memory is released); `VLLM_GPU` in `.env` selects the GPU.
+- **`measure_cache_poisoning.py`**:
+  NFR-6 measurement: generates a frozen, LLM-written cache-poisoning attack set against corpus-derived victim questions, then runs it end-to-end on the live gateway with separate attacker/victim identities and reports success rates with 95% confidence intervals. Results in `logs/nfr6/<run>/` (git-ignored).
+- **`build_spell_dictionary.py`**:
+  Builds `models/spell/thesis_title_terms.txt` (words in thesis titles with the number of theses containing them) used by the topic-question spell checker (symspellpy). Re-run after ingesting new theses.
 - **`run_slurm.sh`**:
   Slurm batch job submission script designed to run high-throughput dataset generation across multiple GPUs with automatic memory detection, temporary RAM-disk caching, and logging to `logs/llm_dataset.log`.
 

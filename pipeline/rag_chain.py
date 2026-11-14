@@ -12,8 +12,11 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import json
+import logging
 import os
+import re
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -24,8 +27,12 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from pipeline.retriever import RedisChunkRetriever, retrieve_chunks, sanitize_chunks
-from pipeline.sanitizer import is_no_relevant_docs_answer
+from pipeline.sanitizer import (is_no_relevant_docs_answer, starts_with_refusal, strip_mixed_refusal,
+                                strip_mixed_refusal_text)
 from pipeline.slm_runner import CPUSLMEngine
+
+
+logger = logging.getLogger("pipeline.rag_chain")
 
 
 def _vllm_auth_headers() -> Dict[str, str]:
@@ -34,10 +41,136 @@ def _vllm_auth_headers() -> Dict[str, str]:
     return {"Authorization": f"Bearer {key}"} if key else {}
 
 
+# --- Upstream LLM daemons (DEFECT-17: CPU-tier ~90 s stalls) -------------------------------------
+# The CPU SLM server answers 503 within SLM_QUEUE_TIMEOUT when all its slots are busy. Generation
+# then overflows to the GPU daemon (if healthy) and only then to the in-process SLM. An answer that
+# has already started streaming is never restarted: it is finished with PARTIAL_ANSWER_NOTE and
+# flagged "incomplete" so the gateway does not cache it.
+PARTIAL_ANSWER_NOTE = "\n\n[Generation was interrupted. This answer is incomplete.]"
+
+
+class UpstreamBusy(RuntimeError):
+    """The upstream model server has no free slot (HTTP 503)."""
+
+
+# When a 3B refusal is re-asked to the 7B tier. Re-asking every refusal sent ~28% of ordinary questions to
+# the GPU, and the 7B model refused 15 of 22 of those too. Re-ask only when relevant theses probably exist
+# (strong best match) or for yes/no questions, the form the 3B model mishandles (on-topic theses that do
+# not literally say yes or no). Measured on 35 escalations: 16/18 useful kept, 12/17 wasted dropped.
+ESCALATE_MIN_SIMILARITY = float(os.getenv("ESCALATE_MIN_SIMILARITY", "0.65"))
+_YES_NO_RE = re.compile(r"^\W*(?:is|are|was|were|does|do|did|can|could|will|would|should|has|have|had|may|might|must)\b",
+                        re.IGNORECASE)
+
+
+def should_escalate_refusal(query: str, chunks: List[Dict[str, Any]]) -> bool:
+    """Re-ask a 3B refusal to the 7B tier only for yes/no questions or a strong retrieval match."""
+    if _YES_NO_RE.match(query or ""):
+        return True
+    top = max((float(c.get("similarity") or 0.0) for c in chunks or []), default=0.0)
+    return top >= ESCALATE_MIN_SIMILARITY
+
+
+class SLMRefused(RuntimeError):
+    """The 3B model gave the bare refusal although retrieval returned documents. The 3B model cannot
+    reliably tell 'documents on the topic that do not answer the exact (yes/no) claim' from 'documents not
+    about the topic' (red-team: on-topic plasmid theses, 3B refused), so such questions are re-asked to the
+    7B model before anything is shown. Carries the refusal text for when the 7B tier is unavailable."""
+
+    def __init__(self, text: str):
+        super().__init__("CPU SLM refused with retrieved documents")
+        self.text = text
+
+
+def _slm_timeout(streaming: bool = True):
+    import httpx
+    # Streaming: read = longest gap between chunks (covers prompt processing before the first token).
+    # Non-streaming: the whole answer arrives at once, so allow the full generation time.
+    # Busy servers answer 503 within SLM_QUEUE_TIMEOUT, so neither limit is spent waiting in a queue.
+    read = float(os.getenv("SLM_READ_TIMEOUT", "30")) if streaming else 60.0
+    return httpx.Timeout(connect=2.0, read=read, write=10.0, pool=2.0)
+
+
+def _gpu_timeout():
+    import httpx
+    return httpx.Timeout(connect=2.0, read=60.0, write=10.0, pool=2.0)
+
+
+def _iter_sse_deltas(response):
+    """Content deltas from an OpenAI-style chat completion SSE stream."""
+    for line in response.iter_lines():
+        if not line or not line.startswith("data: "):
+            continue
+        data_str = line[6:].strip()
+        if data_str == "[DONE]":
+            return
+        try:
+            choice = (json.loads(data_str).get("choices") or [{}])[0]
+        except Exception:
+            continue
+        delta = (choice.get("delta") or {}).get("content", "")
+        if delta:
+            yield delta
+
+
+def _stream_chat_http(url: str, payload: Dict[str, Any], headers: Optional[Dict[str, str]] = None, timeout=None):
+    """Stream content deltas from an OpenAI-compatible server. Raises UpstreamBusy on 503."""
+    import httpx
+    with httpx.stream("POST", url, json={**payload, "stream": True}, headers=headers or {},
+                      timeout=timeout if timeout is not None else _gpu_timeout()) as response:
+        if response.status_code == 503:
+            raise UpstreamBusy(f"{url} busy")
+        response.raise_for_status()
+        yield from _iter_sse_deltas(response)
+
+
+def _complete_chat_http(url: str, payload: Dict[str, Any], headers: Optional[Dict[str, str]] = None, timeout=None):
+    """Non-streaming chat completion. Returns (text, completion_tokens, model). Raises UpstreamBusy on 503."""
+    import httpx
+    resp = httpx.post(url, json=payload, headers=headers or {}, timeout=timeout if timeout is not None else _gpu_timeout())
+    if resp.status_code == 503:
+        raise UpstreamBusy(f"{url} busy")
+    resp.raise_for_status()
+    data = resp.json()
+    text = data["choices"][0]["message"]["content"]
+    return text, data.get("usage", {}).get("completion_tokens", len(text.split())), data.get("model")
+
+
+from gateway.router.premise_check import premise_check_reason
+
 try:
     from gateway.router.mlp_router.inference import QueryRouter
 except Exception:
     QueryRouter = None
+
+
+# Per-process shared retriever and router. The gateway creates a RAGQAPipeline per fresh request;
+# building a router and a retriever each time cost ~110 ms (model reloads). Both are read-only after
+# construction and safe to share across request threads.
+_SHARED: Dict[Any, Any] = {}
+_SHARED_LOCK = threading.Lock()
+
+
+def _shared(key, factory):
+    obj = _SHARED.get(key)
+    if obj is None:
+        with _SHARED_LOCK:
+            obj = _SHARED.get(key)
+            if obj is None:
+                obj = factory()
+                _SHARED[key] = obj
+    return obj
+
+
+def warm_up() -> None:
+    """Load everything a first request would otherwise load (router, embedder, retriever, spell
+    dictionaries) so no user pays it. Called at gateway startup."""
+    from pipeline.text_processing.topic_speller import TopicSpeller
+    TopicSpeller.get_instance()
+    p = RAGQAPipeline()
+    if p.router is not None:
+        p.router.predict("warm up query")
+    p.retriever.search("explain transformers")  # keyword route: spell check + lemmas + title KNN
+    p.retriever.search("What is the role of mycorrhizal fungi in plant nutrition?")  # dense route
 
 
 class RAGQAPipeline:
@@ -66,19 +199,22 @@ class RAGQAPipeline:
         self.router = router
         if self.router is None and QueryRouter is not None:
             try:
-                self.router = QueryRouter()
+                # FR-2 alpha (ROUTING_ALPHA, default 0.65); QueryRouter's own default is 0.5
+                alpha = float(os.getenv("ROUTING_ALPHA", "0.65"))
+                self.router = _shared(("router", alpha), lambda: QueryRouter(threshold=alpha))
             except Exception:
                 self.router = None
 
     @property
     def retriever(self) -> RedisChunkRetriever:
         if self._retriever is None:
-            self._retriever = RedisChunkRetriever(
+            params = (self.min_similarity, self.score_margin, self.max_knee_drop, self.dynamic)
+            self._retriever = _shared(("retriever",) + params, lambda: RedisChunkRetriever(
                 min_similarity=self.min_similarity,
                 score_margin=self.score_margin,
                 max_knee_drop=self.max_knee_drop,
                 dynamic=self.dynamic,
-            )
+            ))
         return self._retriever
 
     @property
@@ -95,13 +231,28 @@ class RAGQAPipeline:
         return self._gpu_engine
 
     def route_query(self, query: str) -> Dict[str, Any]:
-        """Classify query using the Two-Tower MLP router."""
+        """Classify query using the Two-Tower MLP router, escalating loaded 'why' claims to the GPU tier."""
+        decision = {"query": query, "route": "easy", "target_tier": "cpu_slm", "probability_hard": 0.0}
         if self.router is not None:
             try:
-                return self.router.predict(query)
+                decision = self.router.predict(query)
             except Exception:
                 pass
-        return {"query": query, "route": "easy", "target_tier": "cpu_slm", "probability_hard": 0.0}
+        if decision.get("route") != "hard":
+            reason = premise_check_reason(query)
+            if reason and self._gpu_daemon_healthy():
+                decision = {**decision, "route": "hard", "target_tier": "gpu_vllm", "escalation": f"premise_check: {reason}"}
+        return decision
+
+    @staticmethod
+    def _gpu_daemon_healthy() -> bool:
+        """Escalate only when the vLLM daemon is up, never into the in-process GPU fallback."""
+        try:
+            import httpx
+            root = os.getenv("VLLM_BASE_URL", "http://localhost:8000/v1").rstrip("/").rsplit("/v1", 1)[0]
+            return httpx.get(f"{root}/health", timeout=1.0).status_code == 200
+        except Exception:
+            return False
 
     def answer_query(
         self,
@@ -234,7 +385,7 @@ class RAGQAPipeline:
                     data = resp.json()
                     gen_duration = time.time() - t0_gen
                     total_duration = time.time() - t_start
-                    ans_text = data["choices"][0]["message"]["content"]
+                    ans_text = strip_mixed_refusal_text(data["choices"][0]["message"]["content"])
                     tok_count = data.get("usage", {}).get("completion_tokens", len(ans_text.split()))
                     tok_s = round(tok_count / max(gen_duration, 0.001), 2)
                     served_chunks = [] if is_no_relevant_docs_answer(ans_text) else sanitize_chunks(chunks)
@@ -268,7 +419,7 @@ class RAGQAPipeline:
             )
             gen_duration = time.time() - t0_gen
             total_duration = time.time() - t_start
-            ans_text = gen_result["text"]
+            ans_text = strip_mixed_refusal_text(gen_result["text"])
             served_chunks = [] if is_no_relevant_docs_answer(ans_text) else sanitize_chunks(chunks)
 
             return {
@@ -303,58 +454,89 @@ class RAGQAPipeline:
                 "total_time_seconds": round(time.time() - t_start, 2),
             }
 
-        # Step 2: Generate grounded answer via CPU SLM
-        # Option A: Fast HTTP path if CPU SLM daemon is running on port 8082
+        # Step 2: Generate grounded answer (DEFECT-17).
+        # Order: CPU SLM daemon -> GPU daemon overflow (SLM busy/down) -> in-process CPU SLM.
         slm_server_url = os.getenv("SLM_BASE_URL", "http://localhost:8082/v1").rstrip("/")
         server_root = slm_server_url.rsplit("/v1", 1)[0]
+        tokens_to_gen = max_new_tokens or 160
+        backends = []
         try:
             import httpx
-            from pipeline.slm_runner import CPUSLMEngine
-            messages = CPUSLMEngine.build_rag_messages(query, chunks)
-            tokens_to_gen = max_new_tokens or 160
-            h_check = httpx.get(f"{server_root}/healthz", timeout=1.0)
-            if h_check.status_code == 200:
-                t0_gen = time.time()
-                resp = httpx.post(
-                    f"{slm_server_url}/chat/completions",
-                    json={
-                        "messages": messages,
-                        "max_tokens": tokens_to_gen,
-                        "temperature": temperature,
-                    },
-                    timeout=60.0,
-                )
-                resp.raise_for_status()
-                data = resp.json()
-                gen_duration = time.time() - t0_gen
-                total_duration = time.time() - t_start
-                ans_text = data["choices"][0]["message"]["content"]
-                tok_count = data.get("usage", {}).get("completion_tokens", len(ans_text.split()))
-                tok_s = round(tok_count / max(gen_duration, 0.001), 2)
-                served_chunks = [] if is_no_relevant_docs_answer(ans_text) else sanitize_chunks(chunks)
-                return {
-                    "query": query,
-                    "answer": ans_text,
-                    "route": "easy",
-                    "target_tier": "cpu_slm",
-                    "probability_hard": easy_prob,
-                    "chunks": served_chunks,
-                    "stats": {
-                        "retrieval_seconds": round(retrieval_duration, 3),
-                        "generation_seconds": round(gen_duration, 3),
-                        "total_seconds": round(total_duration, 3),
-                        "num_tokens": tok_count,
-                        "tokens_per_second": tok_s,
-                        "model": data.get("model", "qwen2.5-3b-instruct-q4_k_m.gguf"),
-                        "server": "cpu-daemon-port-8082",
-                    },
-                }
+            if httpx.get(f"{server_root}/healthz", timeout=1.0).status_code == 200:
+                backends.append((
+                    "cpu-daemon-port-8082", "qwen2.5-3b-instruct-q4_k_m.gguf",
+                    lambda: _complete_chat_http(
+                        f"{slm_server_url}/chat/completions",
+                        {"messages": CPUSLMEngine.build_rag_messages(query, chunks),
+                         "max_tokens": tokens_to_gen, "temperature": temperature},
+                        timeout=_slm_timeout(streaming=False),
+                    ),
+                ))
         except Exception:
             pass
 
-        # Option B: Fallback to in-process CPU SLM
+        def gpu_overflow():
+            from pipeline.gpu_llm_runner import GPULLMEngine
+            gpu_server_url = os.getenv("VLLM_BASE_URL", "http://localhost:8000/v1").rstrip("/")
+            return _complete_chat_http(
+                f"{gpu_server_url}/chat/completions",
+                {"model": "Qwen/Qwen2.5-7B-Instruct", "messages": GPULLMEngine.build_rag_messages(query, chunks),
+                 "max_tokens": tokens_to_gen, "temperature": temperature},
+                headers=_vllm_auth_headers(),
+                timeout=_gpu_timeout(),
+            )
+
+        backends.append(("gpu-daemon-port-8000 (cpu-slm-overflow)", "Qwen/Qwen2.5-7B-Instruct", gpu_overflow))
+        slm_refusal = None
+        for server, default_model, call in backends:
+            if server.startswith("gpu") and not self._gpu_daemon_healthy():
+                continue
+            try:
+                t0_gen = time.time()
+                ans_text, tok_count, model = call()
+                ans_text = strip_mixed_refusal_text(ans_text)
+            except Exception as exc:
+                logger.warning("%s could not answer (%s)", server, exc)
+                continue
+            if (server.startswith("cpu") and is_no_relevant_docs_answer(ans_text)
+                    and should_escalate_refusal(query, chunks) and self._gpu_daemon_healthy()):
+                # 3B refused although documents were retrieved: re-ask the 7B tier (see SLMRefused)
+                slm_refusal = (ans_text, tok_count, model, time.time() - t0_gen)
+                continue
+            if server.startswith("gpu") and slm_refusal is not None:
+                server = "gpu-daemon-port-8000 (cpu-slm-refusal)"
+            gen_duration = time.time() - t0_gen
+            served_chunks = [] if is_no_relevant_docs_answer(ans_text) else sanitize_chunks(chunks)
+            return {
+                "query": query,
+                "answer": ans_text,
+                "route": "easy",
+                "target_tier": "cpu_slm",
+                "probability_hard": easy_prob,
+                "chunks": served_chunks,
+                "stats": {
+                    "retrieval_seconds": round(retrieval_duration, 3),
+                    "generation_seconds": round(gen_duration, 3),
+                    "total_seconds": round(time.time() - t_start, 3),
+                    "num_tokens": tok_count,
+                    "tokens_per_second": round(tok_count / max(gen_duration, 0.001), 2),
+                    "model": model or default_model,
+                    "server": server,
+                },
+            }
+
+        if slm_refusal is not None:
+            ans_text, tok_count, model, gen_duration = slm_refusal
+            return {
+                "query": query, "answer": ans_text, "route": "easy", "target_tier": "cpu_slm",
+                "probability_hard": easy_prob, "chunks": [],
+                "stats": {"retrieval_seconds": round(retrieval_duration, 3), "generation_seconds": round(gen_duration, 3),
+                          "total_seconds": round(time.time() - t_start, 3), "num_tokens": tok_count,
+                          "model": model or "qwen2.5-3b-instruct-q4_k_m.gguf", "server": "cpu-daemon-port-8082"},
+            }
+
+        # Option B: last resort, in-process CPU SLM
         t0_gen = time.time()
-        tokens_to_gen = max_new_tokens or 160
         gen_result = self.slm_engine.answer_rag(
             question=query,
             context_chunks=chunks,
@@ -364,7 +546,7 @@ class RAGQAPipeline:
         gen_duration = time.time() - t0_gen
 
         total_duration = time.time() - t_start
-        ans_text = gen_result["text"]
+        ans_text = strip_mixed_refusal_text(gen_result["text"])
         served_chunks = [] if is_no_relevant_docs_answer(ans_text) else sanitize_chunks(chunks)
 
         return {
@@ -402,6 +584,7 @@ class RAGQAPipeline:
 
         # Step 0: Parallel Fan-Out (Routing + Database Retrieval concurrently)
         pre_duration = 0.001
+        candidate_chunks = chunks  # full retrieval list (the CPU tier uses the first 3)
         if route_decision is None or chunks is None:
             t0_pre = time.time()
             retrieval_error = None
@@ -449,6 +632,60 @@ class RAGQAPipeline:
             prob = route_decision.get("probability_hard", 1.0 if is_hard else 0.0)
 
         retrieval_duration = pre_duration
+
+        def relay(deltas, model: str, server: str, escalate_refusal: bool = False):
+            """Yield token events then the done event. Raises only if nothing was streamed yet
+            (SLMRefused when escalate_refusal and the whole answer is the bare refusal)."""
+            t0_gen = time.time()
+            parts: List[str] = []
+            token_count = 0
+            ttft = None
+            incomplete = False
+            try:
+                try:
+                    for delta in strip_mixed_refusal(deltas):
+                        if escalate_refusal and not token_count and starts_with_refusal(delta) \
+                                and is_no_relevant_docs_answer(delta):
+                            raise SLMRefused(delta)
+                        if ttft is None:
+                            ttft = round(time.time() - t0_gen, 3)
+                        token_count += 1
+                        parts.append(delta)
+                        yield {"type": "token", "delta": delta}
+                except Exception as exc:
+                    if not token_count:
+                        raise
+                    logger.warning("%s failed mid-answer after %d tokens: %s", server, token_count, exc)
+                    incomplete = True
+                    parts.append(PARTIAL_ANSWER_NOTE)
+                    yield {"type": "token", "delta": PARTIAL_ANSWER_NOTE}
+            finally:
+                close = getattr(deltas, "close", None)
+                if close:
+                    close()  # releases the upstream HTTP stream right away (client gone or done)
+            gen_duration = time.time() - t0_gen
+            full_ans = "".join(parts)
+            refused = is_no_relevant_docs_answer(full_ans)
+            if refused:
+                yield {"type": "chunks", "chunks": []}
+            done = {
+                "type": "done",
+                "full_answer": full_ans,
+                "chunks": [] if refused else sanitize_chunks(chunks),
+                "stats": {
+                    "retrieval_seconds": round(retrieval_duration, 3),
+                    "generation_seconds": round(gen_duration, 3),
+                    "total_seconds": round(time.time() - t_start, 3),
+                    "ttft_seconds": ttft or 0.0,
+                    "num_tokens": token_count,
+                    "tokens_per_second": round(token_count / max(gen_duration, 0.001), 2),
+                    "model": model,
+                    "server": server,
+                },
+            }
+            if incomplete:
+                done["incomplete"] = True
+            yield done
 
         if is_hard:
             yield {
@@ -505,62 +742,17 @@ class RAGQAPipeline:
                 stream_via_http = False
 
             if stream_via_http:
-                t0_gen = time.time()
-                token_count = 0
-                full_response = []
-                ttft = None
-                with httpx.stream(
-                    "POST",
-                    f"{gpu_server_url}/chat/completions",
-                    headers=_vllm_auth_headers(),
-                    json={
-                        "model": "Qwen/Qwen2.5-7B-Instruct",
-                        "messages": messages,
-                        "max_tokens": tokens_to_gen,
-                        "temperature": temperature,
-                        "stream": True,
-                    },
-                    timeout=90.0,
-                ) as response:
-                    for line in response.iter_lines():
-                        if not line or not line.startswith("data: "):
-                            continue
-                        data_str = line[6:].strip()
-                        if data_str == "[DONE]":
-                            break
-                        try:
-                            d = json.loads(data_str)
-                            delta = d["choices"][0]["delta"].get("content", "")
-                            if delta:
-                                if ttft is None:
-                                    ttft = round(time.time() - t0_gen, 3)
-                                token_count += 1
-                                full_response.append(delta)
-                                yield {"type": "token", "delta": delta}
-                        except Exception:
-                            continue
-
-                gen_duration = time.time() - t0_gen
-                total_duration = time.time() - t_start
-                tok_per_sec = round(token_count / max(gen_duration, 0.001), 2)
-                full_ans = "".join(full_response)
-                if is_no_relevant_docs_answer(full_ans):
-                    yield {"type": "chunks", "chunks": []}
-                yield {
-                    "type": "done",
-                    "full_answer": full_ans,
-                    "chunks": [] if is_no_relevant_docs_answer(full_ans) else sanitize_chunks(chunks),
-                    "stats": {
-                        "retrieval_seconds": round(retrieval_duration, 3),
-                        "generation_seconds": round(gen_duration, 3),
-                        "total_seconds": round(total_duration, 3),
-                        "ttft_seconds": ttft or 0.0,
-                        "num_tokens": token_count,
-                        "tokens_per_second": tok_per_sec,
-                        "model": "Qwen/Qwen2.5-7B-Instruct",
-                        "server": "gpu-daemon-port-8000",
-                    },
-                }
+                yield from relay(
+                    _stream_chat_http(
+                        f"{gpu_server_url}/chat/completions",
+                        {"model": "Qwen/Qwen2.5-7B-Instruct", "messages": messages,
+                         "max_tokens": tokens_to_gen, "temperature": temperature},
+                        headers=_vllm_auth_headers(),
+                        timeout=90.0,
+                    ),
+                    model="Qwen/Qwen2.5-7B-Instruct",
+                    server="gpu-daemon-port-8000",
+                )
                 return
 
             # Option B: Fallback to in-process streaming
@@ -569,11 +761,11 @@ class RAGQAPipeline:
             full_response = []
             ttft = None
 
-            for delta in self.gpu_engine.generate_chat_stream(
+            for delta in strip_mixed_refusal(self.gpu_engine.generate_chat_stream(
                 messages,
                 max_new_tokens=tokens_to_gen,
                 temperature=temperature,
-            ):
+            )):
                 if ttft is None:
                     ttft = round(time.time() - t0_gen, 3)
                 token_count += 1
@@ -638,102 +830,99 @@ class RAGQAPipeline:
             }
             return
 
-        # Step 2: Generate grounded answer via CPU SLM
-        # Option A: Fast HTTP streaming path if CPU SLM daemon is running on port 8082
+        # Step 2: Generate the grounded answer (DEFECT-17).
+        # Order: CPU SLM daemon -> GPU daemon overflow (SLM busy/down) -> in-process CPU SLM.
+        # An answer that has started streaming is never restarted on another backend.
+        tokens_to_gen = min(max_new_tokens or 512, 1024)
+
+
+        # Option A: CPU SLM daemon (port 8082). It answers 503 quickly when all slots are busy.
         slm_server_url = os.getenv("SLM_BASE_URL", "http://localhost:8082/v1").rstrip("/")
         server_root = slm_server_url.rsplit("/v1", 1)[0]
-        stream_via_slm_http = False
+        slm_up = False
         try:
             import httpx
-            h_check = httpx.get(f"{server_root}/healthz", timeout=1.0)
-            if h_check.status_code == 200:
-                stream_via_slm_http = True
+            slm_up = httpx.get(f"{server_root}/healthz", timeout=1.0).status_code == 200
         except Exception:
-            stream_via_slm_http = False
+            slm_up = False
 
-        if stream_via_slm_http:
-            t0_gen = time.time()
-            token_count = 0
-            full_response = []
-            ttft = None
+        slm_refusal: Optional[str] = None
+        if slm_up:
             try:
-                from pipeline.slm_runner import CPUSLMEngine
-                messages = CPUSLMEngine.build_rag_messages(query, chunks)
-                tokens_to_gen = min(max_new_tokens or 512, 1024)
-                with httpx.stream(
-                    "POST",
-                    f"{slm_server_url}/chat/completions",
-                    json={
-                        "messages": messages,
-                        "max_tokens": tokens_to_gen,
-                        "temperature": temperature,
-                        "stream": True,
-                    },
-                    timeout=90.0,
-                ) as response:
-                    for line in response.iter_lines():
-                        if not line or not line.startswith("data: "):
-                            continue
-                        chunk_str = line[6:].strip()
-                        if chunk_str == "[DONE]":
-                            break
-                        try:
-                            chunk_data = json.loads(chunk_str)
-                            delta = chunk_data["choices"][0]["delta"].get("content", "")
-                            if delta:
-                                if ttft is None:
-                                    ttft = round(time.time() - t0_gen, 3)
-                                token_count += 1
-                                full_response.append(delta)
-                                yield {"type": "token", "delta": delta}
-                        except Exception:
-                            continue
-
-                gen_duration = time.time() - t0_gen
-                total_duration = time.time() - t_start
-                tok_per_sec = round(token_count / max(gen_duration, 0.001), 2)
-                full_ans = "".join(full_response)
-                if is_no_relevant_docs_answer(full_ans):
-                    yield {"type": "chunks", "chunks": []}
-                yield {
-                    "type": "done",
-                    "full_answer": full_ans,
-                    "chunks": [] if is_no_relevant_docs_answer(full_ans) else sanitize_chunks(chunks),
-                    "stats": {
-                        "retrieval_seconds": round(retrieval_duration, 3),
-                        "generation_seconds": round(gen_duration, 3),
-                        "total_seconds": round(total_duration, 3),
-                        "ttft_seconds": ttft or 0.0,
-                        "num_tokens": token_count,
-                        "tokens_per_second": tok_per_sec,
-                        "model": "qwen2.5-3b-instruct-q4_k_m.gguf",
-                        "server": "cpu-daemon-port-8082",
-                    },
-                }
+                yield from relay(
+                    _stream_chat_http(
+                        f"{slm_server_url}/chat/completions",
+                        {"messages": CPUSLMEngine.build_rag_messages(query, chunks),
+                         "max_tokens": tokens_to_gen, "temperature": temperature},
+                        timeout=_slm_timeout(),
+                    ),
+                    model="qwen2.5-3b-instruct-q4_k_m.gguf",
+                    server="cpu-daemon-port-8082",
+                    escalate_refusal=should_escalate_refusal(query, candidate_chunks or chunks),
+                )
                 return
-            except Exception:
-                pass
+            except SLMRefused as ref:
+                slm_refusal = ref.text
+                logger.info("CPU SLM refused with %d retrieved chunks; re-asking the GPU tier", len(chunks))
+            except Exception as exc:
+                logger.warning("CPU SLM daemon could not answer (%s); trying GPU overflow", exc)
 
-        # Option B: Fallback to in-process CPU SLM streaming
+        # Option A2: GPU daemon when the CPU tier refused with documents, is busy, or is down.
+        if self._gpu_daemon_healthy():
+            reason = "cpu_slm_refusal" if slm_refusal is not None else "cpu_slm_overflow"
+            yield {"type": "route", "route": "hard", "target_tier": "gpu_vllm",
+                   "probability_hard": route_decision.get("probability_hard", 0.0), "escalation": reason}
+            # The 7B tier gets the same context it would on a direct route (up to 8 chunks); relay's done
+            # event reads `chunks`, so the served sources follow.
+            wider = (candidate_chunks or chunks)[:8]
+            if len(wider) > len(chunks):
+                chunks = wider
+                yield {"type": "chunks", "chunks": sanitize_chunks(chunks), "retrieval_seconds": round(retrieval_duration, 3)}
+            try:
+                from pipeline.gpu_llm_runner import GPULLMEngine
+                gpu_server_url = os.getenv("VLLM_BASE_URL", "http://localhost:8000/v1").rstrip("/")
+                yield from relay(
+                    _stream_chat_http(
+                        f"{gpu_server_url}/chat/completions",
+                        {"model": "Qwen/Qwen2.5-7B-Instruct",
+                         "messages": GPULLMEngine.build_rag_messages(query, chunks),
+                         "max_tokens": tokens_to_gen, "temperature": temperature},
+                        headers=_vllm_auth_headers(),
+                        timeout=_gpu_timeout(),
+                    ),
+                    model="Qwen/Qwen2.5-7B-Instruct",
+                    server=f"gpu-daemon-port-8000 ({reason.replace('_', '-')})",
+                )
+                return
+            except Exception as exc:
+                logger.warning("GPU tier could not answer (%s)", exc)
+
+        if slm_refusal is not None:  # the 3B answer stands (GPU tier unavailable)
+            yield from relay(iter([slm_refusal]), model="qwen2.5-3b-instruct-q4_k_m.gguf", server="cpu-daemon-port-8082")
+            return
+
+        # Option B: last resort, in-process CPU SLM streaming
         t0_gen = time.time()
         first_token_time = None
         full_text = []
+        incomplete = False
 
         try:
-            for delta in self.slm_engine.answer_rag_stream(
+            for delta in strip_mixed_refusal(self.slm_engine.answer_rag_stream(
                 question=query,
                 context_chunks=chunks,
-                max_new_tokens=min(max_new_tokens or 512, 1024),
+                max_new_tokens=tokens_to_gen,
                 temperature=temperature,
-            ):
+            )):
                 if first_token_time is None:
                     first_token_time = time.time() - t0_gen
                 full_text.append(delta)
                 yield {"type": "token", "delta": delta}
         except Exception as opt_b_err:
-            fallback_note = f"\n\n[Inference complete. Partial response recorded.]"
-            full_text.append(fallback_note)
-            yield {"type": "token", "delta": fallback_note}
+            logger.warning("In-process SLM failed: %s", opt_b_err)
+            incomplete = True
+            full_text.append(PARTIAL_ANSWER_NOTE)
+            yield {"type": "token", "delta": PARTIAL_ANSWER_NOTE}
 
         gen_duration = time.time() - t0_gen
         total_duration = time.time() - t_start
@@ -742,7 +931,7 @@ class RAGQAPipeline:
         if is_no_relevant_docs_answer(final_answer):
             yield {"type": "chunks", "chunks": []}
 
-        yield {
+        done = {
             "type": "done",
             "full_answer": final_answer,
             "chunks": [] if is_no_relevant_docs_answer(final_answer) else sanitize_chunks(chunks),
@@ -753,8 +942,12 @@ class RAGQAPipeline:
                 "total_seconds": round(total_duration, 3),
                 "approx_tokens": approx_tokens,
                 "tokens_per_second": round(approx_tokens / max(gen_duration, 0.001), 2),
+                "server": "in-process",
             },
         }
+        if incomplete:
+            done["incomplete"] = True
+        yield done
 
 
 def main():

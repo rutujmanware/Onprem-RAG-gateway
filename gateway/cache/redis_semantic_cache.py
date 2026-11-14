@@ -19,6 +19,7 @@ import time
 import uuid
 import hashlib
 import hmac
+import secrets
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -58,7 +59,29 @@ DEFAULT_REDIS_URL = os.getenv(
 DEFAULT_INDEX_NAME = os.getenv("REDIS_CACHE_INDEX_NAME", "semantic_cache_idx")
 DEFAULT_KEY_PREFIX = os.getenv("REDIS_CACHE_KEY_PREFIX", "semcache:")
 DEFAULT_SIMILARITY_THRESHOLD = float(os.getenv("SEMANTIC_CACHE_THRESHOLD", "0.90"))
-DEFAULT_TTL_SECONDS = int(os.getenv("SEMANTIC_CACHE_TTL", str(24 * 3600)))  # 24 hours (86,400s)
+DEFAULT_TTL_SECONDS = int(os.getenv("SEMANTIC_CACHE_TTL", str(4 * 3600)))  # 4 hours (14,400s)
+
+# "Regenerate" for cached answers: single-use tokens issued only with cache hits.
+REGEN_PREFIX = os.getenv("REDIS_REGEN_KEY_PREFIX", "semregen:")
+REGEN_TOKEN_TTL = int(os.getenv("REGEN_TOKEN_TTL", "900"))          # token valid for 15 minutes
+REGEN_MAX_PER_HOUR = int(os.getenv("REGEN_MAX_PER_HOUR", "20"))     # per user
+# Index names whose 'owner' TAG field is known to exist in this process (see _ensure_owner_field).
+_OWNER_FIELD_READY: set = set()
+REGEN_EVICT_USERS = int(os.getenv("REGEN_EVICT_USERS", "3"))        # distinct users before a shared entry is evicted
+REGEN_KINDS = ("exact", "override", "semantic")
+
+# NFR-1: a small dedicated pool for query embeddings. The default executor lets many embeddings run
+# concurrently inside one worker, each using all torch threads, which inflates semantic-hit p99 under load.
+EMBED_CONCURRENCY = int(os.getenv("EMBED_CONCURRENCY", "2"))
+_EMBED_POOL = None
+
+
+def _embed_executor():
+    global _EMBED_POOL
+    if _EMBED_POOL is None:
+        from concurrent.futures import ThreadPoolExecutor
+        _EMBED_POOL = ThreadPoolExecutor(max_workers=max(1, EMBED_CONCURRENCY), thread_name_prefix="semcache-embed")
+    return _EMBED_POOL
 
 
 class RedisSemanticCache:
@@ -146,6 +169,7 @@ class RedisSemanticCache:
             indexes = client.execute_command("FT._LIST")
             indexes_str = [idx.decode() if isinstance(idx, bytes) else str(idx) for idx in indexes]
             if self.index_name in indexes_str:
+                self._ensure_owner_field(client.execute_command)
                 self._index_initialized = True
                 return True
 
@@ -162,6 +186,7 @@ class RedisSemanticCache:
                 "DIM", str(self.vector_dim),
                 "DISTANCE_METRIC", "COSINE",
                 "created_at", "NUMERIC",
+                "owner", "TAG",
             )
             self._index_initialized = True
             logger.info("✅ Semantic cache index [%s] initialized successfully!", self.index_name)
@@ -173,6 +198,47 @@ class RedisSemanticCache:
             logger.warning("Failed to initialize semantic cache index: %s", e)
             return False
 
+    # NEVER call FT.INFO on these indexes. In this RediSearch build (Redis Stack 7.2.0-v9) FT.INFO on a
+    # vector index takes the tiered-HNSW write lock (IndexSpec_VectorIndexSize -> TieredHNSWIndex::info ->
+    # pthread_rwlock_wrlock) and deadlocked the whole server on 2026-11-14 (crash report in
+    # logs/redis_deadlock/). A search cannot probe the schema either: querying a field that is not in it
+    # returns 0 results, not an error. So we simply send FT.ALTER and treat "Duplicate field" as present.
+    _ALTER_OWNER = ("SCHEMA", "ADD", "owner", "TAG")
+
+    def _owner_alter_result(self, err: Optional[Exception]) -> None:
+        if err is None:
+            logger.info("Added 'owner' TAG field to existing index [%s].", self.index_name)
+            _OWNER_FIELD_READY.add(self.index_name)
+        elif "duplicate field" in str(err).lower():
+            _OWNER_FIELD_READY.add(self.index_name)
+        else:  # e.g. LOADING or a connection error: retried on the next cache object
+            logger.warning("Could not ensure 'owner' field on index [%s]: %s", self.index_name, err)
+
+    def _ensure_owner_field(self, execute) -> None:
+        """Make sure an index created before owner-scoped lookups has the 'owner' TAG field.
+
+        At most once per process per index. When the field exists, FT.ALTER fails immediately with
+        "Duplicate field in schema" (no rescan); when it is missing, it is added and RediSearch rescans
+        in the background (~7 s for 2.26 M keys). Without the field, owner-filtered lookups match nothing,
+        which is safe (no cross-user hits) but disables semantic hits.
+        """
+        if self.index_name in _OWNER_FIELD_READY:
+            return
+        try:
+            execute("FT.ALTER", self.index_name, *self._ALTER_OWNER)
+            self._owner_alter_result(None)
+        except Exception as e:
+            self._owner_alter_result(e)
+
+    async def _aensure_owner_field(self, client) -> None:
+        if self.index_name in _OWNER_FIELD_READY:
+            return
+        try:
+            await client.execute_command("FT.ALTER", self.index_name, *self._ALTER_OWNER)
+            self._owner_alter_result(None)
+        except Exception as e:
+            self._owner_alter_result(e)
+
     async def ainit_index(self) -> bool:
         """Async variant of index initialization."""
         if self._index_initialized:
@@ -182,6 +248,7 @@ class RedisSemanticCache:
             indexes = await client.execute_command("FT._LIST")
             indexes_str = [idx.decode() if isinstance(idx, bytes) else str(idx) for idx in indexes]
             if self.index_name in indexes_str:
+                await self._aensure_owner_field(client)
                 self._index_initialized = True
                 return True
 
@@ -198,6 +265,7 @@ class RedisSemanticCache:
                 "DIM", str(self.vector_dim),
                 "DISTANCE_METRIC", "COSINE",
                 "created_at", "NUMERIC",
+                "owner", "TAG",
             )
             self._index_initialized = True
             return True
@@ -286,48 +354,64 @@ class RedisSemanticCache:
         self,
         query: str,
         threshold: Optional[float] = None,
+        owner: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
-        """Synchronously lookup semantically similar cached query from Redis."""
+        """Synchronously lookup a cached answer.
+
+        Exact (normalized-text) matches are shared across users. Semantic (near-duplicate) matches are
+        owner-scoped: only entries stored by the same ``owner`` are considered, so one user can never
+        poison another user's answers through a near-duplicate question (NFR-6). Without an owner the
+        semantic path is skipped entirely (fail closed).
+        """
         self.init_index()
         th = threshold or self.similarity_threshold
 
         # Fast path 0: Exact normalized text hash match (< 1ms in Redis, 0 CPU compute)
+        # A user's own regenerated answer (override) takes precedence over the shared exact entry.
         norm_q = query.strip().lower()
-        exact_key = f"{self.key_prefix}exact:{hashlib.sha256(norm_q.encode('utf-8')).hexdigest()}"
-        try:
-            raw_exact = self.sync_client.get(exact_key)
-            if raw_exact:
-                exact_data = json.loads(raw_exact.decode("utf-8") if isinstance(raw_exact, bytes) else raw_exact)
-                exact_resp = exact_data.get("response", {})
-                cacheable, cache_reason = self.is_cacheable_response(exact_resp)
-                if not cacheable:
-                    logger.info("Exact match found but rejected as uncacheable: %s", cache_reason)
-                    try:
-                        self.sync_client.delete(exact_key)
-                    except Exception:
-                        pass
-                else:
-                    return {
-                        "cached": True,
-                        "similarity": 1.0,
-                        "matched_prompt": exact_data.get("prompt", query),
-                        "response": exact_resp,
-                        "fast_exact": True,
-                    }
-        except Exception:
-            pass
+        q_hash = hashlib.sha256(norm_q.encode('utf-8')).hexdigest()
+        exact_candidates = [(f"{self.key_prefix}exact:{q_hash}", False)]
+        if self.owner_tag(owner):
+            exact_candidates.insert(0, (f"{self.key_prefix}uexact:{self.owner_tag(owner)}:{q_hash}", True))
+        for exact_key, is_override in exact_candidates:
+            try:
+                raw_exact = self.sync_client.get(exact_key)
+                if raw_exact:
+                    exact_data = json.loads(raw_exact.decode("utf-8") if isinstance(raw_exact, bytes) else raw_exact)
+                    exact_resp = exact_data.get("response", {})
+                    cacheable, cache_reason = self.is_cacheable_response(exact_resp)
+                    if not cacheable:
+                        logger.info("Exact match found but rejected as uncacheable: %s", cache_reason)
+                        try:
+                            self.sync_client.delete(exact_key)
+                        except Exception:
+                            pass
+                    else:
+                        return {
+                            "cached": True,
+                            "similarity": 1.0,
+                            "matched_prompt": exact_data.get("prompt", query),
+                            "response": exact_resp,
+                            "fast_exact": True,
+                            "override": is_override,
+                        }
+            except Exception:
+                continue
+
+        owner_tag = self.owner_tag(owner)
+        if not owner_tag:
+            return None  # semantic matches are owner-scoped; no owner -> exact matches only
 
         try:
             query_vec = self.embedder.embed_query(query)
             vec_bytes = np.array(query_vec, dtype=np.float32).tobytes()
 
-            search_query = "*=>[KNN 1 @vector $vec EF_RUNTIME 64 AS score]"
             res = self.sync_client.execute_command(
                 "FT.SEARCH", self.index_name,
-                search_query,
+                self._owner_knn_query(owner_tag),
                 "PARAMS", "2", "vec", vec_bytes,
                 "SORTBY", "score", "ASC",
-                "RETURN", "3", "prompt", "response", "score",
+                "RETURN", "4", "prompt", "response", "score", "owner",
                 "DIALECT", "2",
             )
 
@@ -336,7 +420,10 @@ class RedisSemanticCache:
             if match is None:
                 return None
 
-            cosine_dist, matched_prompt, response_str = match
+            cosine_dist, matched_prompt, response_str = match[:3]
+            if match[3] != owner_tag:  # defence in depth: never serve another user's entry
+                logger.warning("Semantic cache returned an entry of a different owner; ignoring it.")
+                return None
             similarity = round(1.0 - cosine_dist, 4)
 
             if similarity >= th:
@@ -373,51 +460,61 @@ class RedisSemanticCache:
         self,
         query: str,
         threshold: Optional[float] = None,
+        owner: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
-        """Asynchronously lookup semantically similar cached query from Redis."""
+        """Async variant of :meth:`lookup` (exact matches shared, semantic matches owner-scoped)."""
         await self.ainit_index()
         th = threshold or self.similarity_threshold
 
         # Fast path 0: Exact normalized text hash match (< 1ms in Redis, 0 CPU compute)
+        # A user's own regenerated answer (override) takes precedence over the shared exact entry.
         norm_q = query.strip().lower()
-        exact_key = f"{self.key_prefix}exact:{hashlib.sha256(norm_q.encode('utf-8')).hexdigest()}"
-        try:
-            raw_exact = await self.async_client.get(exact_key)
-            if raw_exact:
-                exact_data = json.loads(raw_exact.decode("utf-8") if isinstance(raw_exact, bytes) else raw_exact)
-                exact_resp = exact_data.get("response", {})
-                cacheable, cache_reason = self.is_cacheable_response(exact_resp)
-                if not cacheable:
-                    logger.info("Async exact match found but rejected as uncacheable: %s", cache_reason)
-                    try:
-                        await self.async_client.delete(exact_key)
-                    except Exception:
-                        pass
-                else:
-                    return {
-                        "cached": True,
-                        "similarity": 1.0,
-                        "matched_prompt": exact_data.get("prompt", query),
-                        "response": exact_resp,
-                        "fast_exact": True,
-                    }
-        except Exception:
-            pass
+        q_hash = hashlib.sha256(norm_q.encode('utf-8')).hexdigest()
+        exact_candidates = [(f"{self.key_prefix}exact:{q_hash}", False)]
+        if self.owner_tag(owner):
+            exact_candidates.insert(0, (f"{self.key_prefix}uexact:{self.owner_tag(owner)}:{q_hash}", True))
+        for exact_key, is_override in exact_candidates:
+            try:
+                raw_exact = await self.async_client.get(exact_key)
+                if raw_exact:
+                    exact_data = json.loads(raw_exact.decode("utf-8") if isinstance(raw_exact, bytes) else raw_exact)
+                    exact_resp = exact_data.get("response", {})
+                    cacheable, cache_reason = self.is_cacheable_response(exact_resp)
+                    if not cacheable:
+                        logger.info("Async exact match found but rejected as uncacheable: %s", cache_reason)
+                        try:
+                            await self.async_client.delete(exact_key)
+                        except Exception:
+                            pass
+                    else:
+                        return {
+                            "cached": True,
+                            "similarity": 1.0,
+                            "matched_prompt": exact_data.get("prompt", query),
+                            "response": exact_resp,
+                            "fast_exact": True,
+                            "override": is_override,
+                        }
+            except Exception:
+                continue
+
+        owner_tag = self.owner_tag(owner)
+        if not owner_tag:
+            return None  # semantic matches are owner-scoped; no owner -> exact matches only
 
         try:
             # Vector embedding in thread to preserve async event loop
             import asyncio
             loop = asyncio.get_running_loop()
-            query_vec = await loop.run_in_executor(None, self.embedder.embed_query, query)
+            query_vec = await loop.run_in_executor(_embed_executor(), self.embedder.embed_query, query)
             vec_bytes = np.array(query_vec, dtype=np.float32).tobytes()
 
-            search_query = "*=>[KNN 1 @vector $vec EF_RUNTIME 64 AS score]"
             res = await self.async_client.execute_command(
                 "FT.SEARCH", self.index_name,
-                search_query,
+                self._owner_knn_query(owner_tag),
                 "PARAMS", "2", "vec", vec_bytes,
                 "SORTBY", "score", "ASC",
-                "RETURN", "3", "prompt", "response", "score",
+                "RETURN", "4", "prompt", "response", "score", "owner",
                 "DIALECT", "2",
             )
 
@@ -425,7 +522,10 @@ class RedisSemanticCache:
             if match is None:
                 return None
 
-            cosine_dist, matched_prompt, response_str = match
+            cosine_dist, matched_prompt, response_str = match[:3]
+            if match[3] != owner_tag:  # defence in depth: never serve another user's entry
+                logger.warning("Semantic cache returned an entry of a different owner; ignoring it.")
+                return None
             similarity = round(1.0 - cosine_dist, 4)
 
             if similarity >= th:
@@ -465,6 +565,7 @@ class RedisSemanticCache:
         query_vec: Optional[List[float]] = None,
         ttl_seconds: Optional[int] = None,
         owner: Optional[str] = None,
+        regen_kind: Optional[str] = None,
     ) -> bool:
         """Synchronously store query and generated answer in Redis semantic cache."""
         cacheable, cache_reason = self.is_cacheable_response(response)
@@ -495,7 +596,7 @@ class RedisSemanticCache:
             }
             owner_tag = self.owner_tag(owner)
             if owner_tag:
-                payload["owner"] = owner_tag  # audit / targeted purge only; lookups stay shared
+                payload["owner"] = owner_tag  # semantic lookups only consider entries with the asking user's tag (NFR-6)
 
             self.sync_client.hset(key, mapping=payload)
             self.sync_client.expire(key, ttl)
@@ -504,7 +605,12 @@ class RedisSemanticCache:
             try:
                 norm_q = query.strip().lower()
                 exact_key = f"{self.key_prefix}exact:{hashlib.sha256(norm_q.encode('utf-8')).hexdigest()}"
-                self.sync_client.set(exact_key, json.dumps({"prompt": query, "response": response, "owner": owner_tag}), ex=ttl)
+                exact_doc = json.dumps({"prompt": query, "response": response, "owner": owner_tag})
+                if regen_kind in ("exact", "override"):
+                    if owner_tag:  # fresh answer for a shared exact hit: private override, shared entry untouched
+                        self.sync_client.set(self._user_exact_key(norm_q, owner_tag), exact_doc, ex=ttl)
+                else:  # never overwrite an existing shared answer (prevents "re-generation lotteries")
+                    self.sync_client.set(exact_key, exact_doc, ex=ttl, nx=True)
             except Exception:
                 pass
             return True
@@ -519,6 +625,7 @@ class RedisSemanticCache:
         query_vec: Optional[List[float]] = None,
         ttl_seconds: Optional[int] = None,
         owner: Optional[str] = None,
+        regen_kind: Optional[str] = None,
     ) -> bool:
         """Asynchronously store query and generated answer in Redis semantic cache."""
         cacheable, cache_reason = self.is_cacheable_response(response)
@@ -537,7 +644,7 @@ class RedisSemanticCache:
             if query_vec is None:
                 import asyncio
                 loop = asyncio.get_running_loop()
-                query_vec = await loop.run_in_executor(None, self.embedder.embed_query, query)
+                query_vec = await loop.run_in_executor(_embed_executor(), self.embedder.embed_query, query)
 
             vec_bytes = np.array(query_vec, dtype=np.float32).tobytes()
             key_id = uuid.uuid4().hex[:16]
@@ -551,7 +658,7 @@ class RedisSemanticCache:
             }
             owner_tag = self.owner_tag(owner)
             if owner_tag:
-                payload["owner"] = owner_tag  # audit / targeted purge only; lookups stay shared
+                payload["owner"] = owner_tag  # semantic lookups only consider entries with the asking user's tag (NFR-6)
 
             await self.async_client.hset(key, mapping=payload)
             await self.async_client.expire(key, ttl)
@@ -560,7 +667,12 @@ class RedisSemanticCache:
             try:
                 norm_q = query.strip().lower()
                 exact_key = f"{self.key_prefix}exact:{hashlib.sha256(norm_q.encode('utf-8')).hexdigest()}"
-                await self.async_client.set(exact_key, json.dumps({"prompt": query, "response": response, "owner": owner_tag}), ex=ttl)
+                exact_doc = json.dumps({"prompt": query, "response": response, "owner": owner_tag})
+                if regen_kind in ("exact", "override"):
+                    if owner_tag:  # fresh answer for a shared exact hit: private override, shared entry untouched
+                        await self.async_client.set(self._user_exact_key(norm_q, owner_tag), exact_doc, ex=ttl)
+                else:  # never overwrite an existing shared answer (prevents "re-generation lotteries")
+                    await self.async_client.set(exact_key, exact_doc, ex=ttl, nx=True)
             except Exception:
                 pass
             return True
@@ -568,28 +680,198 @@ class RedisSemanticCache:
             logger.warning("Failed to async store semantic cache entry: %s", err)
             return False
 
-    def count(self) -> int:
-        """Return the count of keys currently in the semantic cache."""
+    def _user_exact_key(self, norm_q: str, owner_tag: str) -> str:
+        return f"{self.key_prefix}uexact:{owner_tag}:{hashlib.sha256(norm_q.strip().lower().encode('utf-8')).hexdigest()}"
+
+    # ------------------------------------------------------------------------------------------
+    # "Regenerate" for cached answers
+    #   * a single-use token is issued ONLY with a cache hit, bound to the user and the question;
+    #   * a regenerated answer to a SHARED exact hit is stored as that user's private override;
+    #   * the shared entry is evicted only after REGEN_EVICT_USERS distinct users regenerate it;
+    #   * per-user hourly cap; every regenerate is logged as quality feedback.
+    # ------------------------------------------------------------------------------------------
+    @staticmethod
+    def _query_hash(text: str) -> str:
+        return hashlib.sha256((text or "").strip().lower().encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _regen_token_key(token: str) -> str:
+        return f"{REGEN_PREFIX}tok:{hashlib.sha256(token.encode('utf-8')).hexdigest()}"
+
+    def _regen_record(self, owner, query, kind, matched_prompt, similarity) -> str:
+        return json.dumps({"owner": self.owner_tag(owner), "query": self._query_hash(query), "kind": kind,
+                           "matched_prompt": matched_prompt or "", "similarity": similarity, "issued_at": time.time()})
+
+    def _check_regen_record(self, raw, owner, query) -> Optional[Dict[str, Any]]:
+        if not raw:
+            return None
         try:
-            keys = self.sync_client.keys(f"{self.key_prefix}*")
-            return len(keys)
+            rec = json.loads(raw.decode("utf-8") if isinstance(raw, bytes) else raw)
+        except Exception:
+            return None
+        tag = self.owner_tag(owner)
+        if not tag or not secrets.compare_digest(str(rec.get("owner", "")), tag):
+            return None
+        if rec.get("query") != self._query_hash(query) or rec.get("kind") not in REGEN_KINDS:
+            return None
+        return rec
+
+    def issue_regen_token(self, owner, query, kind, matched_prompt, similarity=1.0) -> Optional[str]:
+        if not self.owner_tag(owner) or kind not in REGEN_KINDS:
+            return None
+        token = secrets.token_urlsafe(24)
+        try:
+            self.sync_client.set(self._regen_token_key(token), self._regen_record(owner, query, kind, matched_prompt, similarity), ex=REGEN_TOKEN_TTL)
+            return token
+        except Exception as e:
+            logger.warning("Could not issue regenerate token: %s", e)
+            return None
+
+    async def aissue_regen_token(self, owner, query, kind, matched_prompt, similarity=1.0) -> Optional[str]:
+        if not self.owner_tag(owner) or kind not in REGEN_KINDS:
+            return None
+        token = secrets.token_urlsafe(24)
+        try:
+            await self.async_client.set(self._regen_token_key(token), self._regen_record(owner, query, kind, matched_prompt, similarity), ex=REGEN_TOKEN_TTL)
+            return token
+        except Exception as e:
+            logger.warning("Could not issue regenerate token: %s", e)
+            return None
+
+    def consume_regen_token(self, token, owner, query) -> Optional[Dict[str, Any]]:
+        """Single use: the token is deleted on the first attempt, whether or not it matches."""
+        if not token or len(token) > 128:
+            return None
+        try:
+            raw = self.sync_client.getdel(self._regen_token_key(token))
+        except Exception:
+            return None
+        return self._check_regen_record(raw, owner, query)
+
+    async def aconsume_regen_token(self, token, owner, query) -> Optional[Dict[str, Any]]:
+        if not token or len(token) > 128:
+            return None
+        try:
+            raw = await self.async_client.getdel(self._regen_token_key(token))
+        except Exception:
+            return None
+        return self._check_regen_record(raw, owner, query)
+
+    def _quota_key(self, owner) -> str:
+        return f"{REGEN_PREFIX}quota:{self.owner_tag(owner)}:{int(time.time() // 3600)}"
+
+    def regen_quota_ok(self, owner) -> bool:
+        if not self.owner_tag(owner):
+            return False
+        try:
+            key = self._quota_key(owner)
+            n = self.sync_client.incr(key)
+            if n == 1:
+                self.sync_client.expire(key, 3600)
+            return n <= REGEN_MAX_PER_HOUR
+        except Exception:
+            return False  # fail closed
+
+    async def aregen_quota_ok(self, owner) -> bool:
+        if not self.owner_tag(owner):
+            return False
+        try:
+            key = self._quota_key(owner)
+            n = await self.async_client.incr(key)
+            if n == 1:
+                await self.async_client.expire(key, 3600)
+            return n <= REGEN_MAX_PER_HOUR
+        except Exception:
+            return False  # fail closed
+
+    def record_shared_regen(self, matched_prompt, owner) -> bool:
+        """Count distinct users who regenerated a SHARED exact entry; evict it at REGEN_EVICT_USERS. Returns True if evicted."""
+        h = self._query_hash(matched_prompt)
+        flags = f"{REGEN_PREFIX}flags:{h}"
+        try:
+            self.sync_client.sadd(flags, self.owner_tag(owner))
+            self.sync_client.expire(flags, self.ttl_seconds)
+            if self.sync_client.scard(flags) >= REGEN_EVICT_USERS:
+                self.sync_client.delete(f"{self.key_prefix}exact:{h}", flags)
+                logger.warning("Evicted shared cache entry after %d distinct users regenerated it.", REGEN_EVICT_USERS)
+                return True
+        except Exception as e:
+            logger.warning("Could not record shared regenerate: %s", e)
+        return False
+
+    async def arecord_shared_regen(self, matched_prompt, owner) -> bool:
+        h = self._query_hash(matched_prompt)
+        flags = f"{REGEN_PREFIX}flags:{h}"
+        try:
+            await self.async_client.sadd(flags, self.owner_tag(owner))
+            await self.async_client.expire(flags, self.ttl_seconds)
+            if await self.async_client.scard(flags) >= REGEN_EVICT_USERS:
+                await self.async_client.delete(f"{self.key_prefix}exact:{h}", flags)
+                logger.warning("Evicted shared cache entry after %d distinct users regenerated it.", REGEN_EVICT_USERS)
+                return True
+        except Exception as e:
+            logger.warning("Could not record shared regenerate: %s", e)
+        return False
+
+    def _regen_event(self, record, owner, evicted) -> Dict[str, str]:
+        return {"ts": str(round(time.time(), 3)), "owner": self.owner_tag(owner), "kind": str(record.get("kind")),
+                "similarity": str(record.get("similarity")), "matched_prompt": str(record.get("matched_prompt", ""))[:500],
+                "evicted_shared": "1" if evicted else "0"}
+
+    def log_regen_event(self, record, owner, evicted=False) -> None:
+        try:
+            self.sync_client.xadd(f"{REGEN_PREFIX}events", self._regen_event(record, owner, evicted), maxlen=10000, approximate=True)
+        except Exception:
+            pass
+
+    async def alog_regen_event(self, record, owner, evicted=False) -> None:
+        try:
+            await self.async_client.xadd(f"{REGEN_PREFIX}events", self._regen_event(record, owner, evicted), maxlen=10000, approximate=True)
+        except Exception:
+            pass
+
+    def regen_event_count(self) -> int:
+        try:
+            return int(self.sync_client.xlen(f"{REGEN_PREFIX}events"))
+        except Exception:
+            return 0
+
+    # KEYS walks the whole keyspace (2.26 M thesis chunks) in one blocking step; it was called on every
+    # /cache/stats and by every gateway worker at startup. Counting uses the small cache index; bulk
+    # operations iterate with SCAN, which never blocks the server for long.
+    def _scan_keys(self) -> List[bytes]:
+        return list(self.sync_client.scan_iter(match=f"{self.key_prefix}*", count=2000))
+
+    async def _ascan_keys(self) -> List[bytes]:
+        return [k async for k in self.async_client.scan_iter(match=f"{self.key_prefix}*", count=2000)]
+
+    @staticmethod
+    def _search_total(res) -> int:
+        if isinstance(res, dict):
+            return int(res.get("total_results") or res.get(b"total_results") or 0)
+        return int(res[0]) if res else 0
+
+    def count(self) -> int:
+        """Number of cached answers (semantic entries; exact-text pointers are not counted)."""
+        try:
+            self.init_index()
+            return self._search_total(self.sync_client.execute_command("FT.SEARCH", self.index_name, "*", "LIMIT", "0", "0"))
         except Exception:
             return 0
 
     async def acount(self) -> int:
-        """Return count of keys asynchronously."""
         try:
-            keys = await self.async_client.keys(f"{self.key_prefix}*")
-            return len(keys)
+            await self.ainit_index()
+            return self._search_total(await self.async_client.execute_command("FT.SEARCH", self.index_name, "*", "LIMIT", "0", "0"))
         except Exception:
             return 0
 
     def clear(self) -> bool:
         """Delete all cached entries and re-initialize index."""
         try:
-            keys = self.sync_client.keys(f"{self.key_prefix}*")
-            if keys:
-                self.sync_client.delete(*keys)
+            keys = self._scan_keys()
+            for i in range(0, len(keys), 500):
+                self.sync_client.delete(*keys[i:i + 500])
             try:
                 self.sync_client.execute_command("FT.DROPINDEX", self.index_name, "DD")
             except Exception:
@@ -604,9 +886,9 @@ class RedisSemanticCache:
     async def aclear(self) -> bool:
         """Async delete all cached entries and re-initialize index."""
         try:
-            keys = await self.async_client.keys(f"{self.key_prefix}*")
-            if keys:
-                await self.async_client.delete(*keys)
+            keys = await self._ascan_keys()
+            for i in range(0, len(keys), 500):
+                await self.async_client.delete(*keys[i:i + 500])
             try:
                 await self.async_client.execute_command("FT.DROPINDEX", self.index_name, "DD")
             except Exception:
@@ -622,7 +904,7 @@ class RedisSemanticCache:
         """Scan all cached entries in Redis and delete any containing insufficient data, unretrieved docs, or errors."""
         purged = 0
         try:
-            keys = self.sync_client.keys(f"{self.key_prefix}*")
+            keys = self._scan_keys()
             for k in keys:
                 try:
                     k_type = self.sync_client.type(k)
@@ -659,7 +941,7 @@ class RedisSemanticCache:
         """Asynchronously scan all cached entries in Redis and delete uncacheable entries."""
         purged = 0
         try:
-            keys = await self.async_client.keys(f"{self.key_prefix}*")
+            keys = await self._ascan_keys()
             for k in keys:
                 try:
                     k_type = await self.async_client.type(k)
@@ -706,6 +988,8 @@ class RedisSemanticCache:
             exact_key = f"{self.key_prefix}exact:{q_hash}"
             if self.sync_client.delete(exact_key):
                 purged += 1
+            for uk in list(self.sync_client.scan_iter(match=f"{self.key_prefix}uexact:*:{q_hash}", count=500)):
+                purged += self.sync_client.delete(uk)
 
             query_vec = self.embedder.embed_query(query)
             vec_bytes = np.array(query_vec, dtype=np.float32).tobytes()
@@ -783,10 +1067,12 @@ class RedisSemanticCache:
             del_exact = await self.async_client.delete(exact_key)
             if del_exact:
                 purged += 1
+            async for uk in self.async_client.scan_iter(match=f"{self.key_prefix}uexact:*:{q_hash}", count=500):
+                purged += await self.async_client.delete(uk)
 
             import asyncio
             loop = asyncio.get_running_loop()
-            query_vec = await loop.run_in_executor(None, self.embedder.embed_query, query)
+            query_vec = await loop.run_in_executor(_embed_executor(), self.embedder.embed_query, query)
             vec_bytes = np.array(query_vec, dtype=np.float32).tobytes()
 
             search_query = "*=>[KNN 50 @vector $vec EF_RUNTIME 64 AS score]"
@@ -848,8 +1134,8 @@ class RedisSemanticCache:
             return purged
 
     @staticmethod
-    def _extract_match_from_ft_search(res: Any) -> Optional[Tuple[float, str, str]]:
-        """Parse raw RediSearch response into (score, prompt, response)."""
+    def _extract_match_from_ft_search(res: Any) -> Optional[Tuple[float, str, str, str]]:
+        """Parse raw RediSearch response into (score, prompt, response, owner_tag)."""
         if not res:
             return None
 
@@ -870,7 +1156,9 @@ class RedisSemanticCache:
             score = float(score_raw)
             prompt = prompt_raw.decode("utf-8", errors="replace") if isinstance(prompt_raw, bytes) else str(prompt_raw)
             response = resp_raw.decode("utf-8", errors="replace") if isinstance(resp_raw, bytes) else str(resp_raw)
-            return score, prompt, response
+            owner_raw = extra.get(b"owner") or extra.get("owner") or b""
+            owner = owner_raw.decode("utf-8", errors="replace") if isinstance(owner_raw, bytes) else str(owner_raw)
+            return score, prompt, response, owner
 
         # Legacy RediSearch list format: [total, doc_id, [k1, v1, k2, v2, ...]]
         if isinstance(res, (list, tuple)) and len(res) >= 3:
@@ -887,15 +1175,24 @@ class RedisSemanticCache:
                 score = float(fields.get("score", 1.0))
                 prompt = fields.get("prompt", "")
                 response = fields.get("response", "{}")
-                return score, prompt, response
+                return score, prompt, response, fields.get("owner", "")
 
         return None
 
     @staticmethod
-    def owner_tag(owner: Optional[str]) -> str:
-        """Keyed, non-reversible tag of the user who created a cache entry (audit / targeted purge).
+    def _owner_knn_query(owner_tag: str) -> str:
+        """KNN restricted (pre-filtered) to one owner's entries. Tags are hex, so no escaping needed."""
+        if not re.fullmatch(r"[0-9a-f]{16}", owner_tag):
+            raise ValueError("invalid owner tag")
+        return f"(@owner:{{{owner_tag}}})=>[KNN 1 @vector $vec EF_RUNTIME 64 AS score]"
 
-        The cache stays shared across users; the tag is recorded, never used to filter lookups.
+    @staticmethod
+    def owner_tag(owner: Optional[str]) -> str:
+        """Keyed, non-reversible tag (HMAC-SHA256 with SESSION_SECRET, 16 hex chars) of a user.
+
+        Stored on every semantic entry; semantic lookups are pre-filtered to the asking user's tag, so a
+        near-duplicate question can only reuse that user's own answers (NFR-6). Exact-text entries stay
+        shared. The e-mail address itself is never stored in the cache.
         """
         if not owner:
             return ""

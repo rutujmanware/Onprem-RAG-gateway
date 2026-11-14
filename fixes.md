@@ -19,7 +19,7 @@
 | **VULN-07** | **Unpartitioned Semantic Cache Poisoning Across Users** | **MEDIUM (CVSS 5.3)** | **RESOLVED & VERIFIED** | [`gateway/cache/redis_semantic_cache.py`](gateway/cache/redis_semantic_cache.py) & [`gateway/main.py`](gateway/main.py) |
 | **VULN-08** | **Timing Analysis on `ADMIN_KEY` & Cleartext Cookies** | **LOW (CVSS 3.7)** | **RESOLVED & VERIFIED** | [`gateway/main.py`](gateway/main.py), [`.env`](.env), [`.env.example`](.env.example) |
 | **VULN-09** | **Unauthenticated GPU Model API Reachable Beyond the `:8080` Perimeter (vLLM 0.6.3 ignores `--host`)** | **HIGH** | **RESOLVED & VERIFIED** | [`scripts/serve_vllm.py`](scripts/serve_vllm.py), [`scripts/prod_stack.py`](scripts/prod_stack.py), [`Makefile`](Makefile), vLLM clients |
-| **VULN-10** | **Semantic Cache Intent Collisions (near-duplicate questions reuse each other's answers)** | **MEDIUM** | **MITIGATED (known limits documented)** | [`gateway/cache/redis_semantic_cache.py`](gateway/cache/redis_semantic_cache.py), [`gateway/main.py`](gateway/main.py) |
+| **VULN-10** | **Semantic Cache Intent Collisions (near-duplicate questions reuse each other's answers)** | **MEDIUM** | **RESOLVED & VERIFIED (NFR-6 measured 0/255 cross-user)** | [`gateway/cache/redis_semantic_cache.py`](gateway/cache/redis_semantic_cache.py), [`gateway/main.py`](gateway/main.py) |
 
 ---
 
@@ -1227,7 +1227,7 @@ tests/test_constant_time_and_cookie_security.py::test_secrets_compare_digest_tim
 - Upgrading vLLM was not an option because other workloads depend on 0.6.3.
 
 ### 2. Changes Applied
-1. [`scripts/serve_vllm.py`](scripts/serve_vllm.py): drop-in launcher (same arguments as the stock entrypoint) that rebinds the pre-bound socket to `--host`, verifies the bound address, refuses non-loopback hosts unless `VLLM_ALLOW_NON_LOOPBACK=1`, sets `SO_REUSEADDR` for quick restarts, and **refuses to start without `VLLM_API_KEY`**. vLLM then enforces `Authorization: Bearer <key>` on `/v1/*`.
+1. [`scripts/serve_vllm.py`](scripts/serve_vllm.py): drop-in launcher (same arguments as the stock entrypoint) that rebinds the pre-bound socket to `--host`, verifies the bound address is loopback, refuses any non-loopback host with no override (strictly loopback-only), sets `SO_REUSEADDR` for quick restarts, and **refuses to start without `VLLM_API_KEY`**. vLLM then enforces `Authorization: Bearer <key>` on `/v1/*`.
 2. All vLLM clients send the key: [`pipeline/rag_chain.py`](pipeline/rag_chain.py), [`gateway/clients/vllm_client.py`](gateway/clients/vllm_client.py), [`askiisc_chat/askiisc/config.py`](askiisc_chat/askiisc/config.py).
 3. [`scripts/prod_stack.py`](scripts/prod_stack.py) and `make serve-gpu` use the launcher; `restart --with-vllm` stops the whole vLLM process group (so GPU memory is released); `status`/`start` warn when an unauthenticated vLLM is running; `VLLM_GPU` selects the GPU.
 4. New Make targets: `prod-restart-vllm`, `prod-down-vllm`, `vllm-check` ([`scripts/check_vllm_security.sh`](scripts/check_vllm_security.sh)).
@@ -1261,6 +1261,13 @@ tests/test_constant_time_and_cookie_security.py::test_secrets_compare_digest_tim
 - This is a curated suite, not a population rate: the NFR-6 target ($\le 5\%$ successful poisoning) is **not yet measured**.
 - Residual limits recorded as `xfail` and in PRD §9.1 (L1–L8), notably same-structure substitutions (*"Who supervised…"* vs. *"Who wrote…"*), English-only heuristics, and the shared cache namespace.
 
+### 4. NFR-6 Measurement and Owner-Scoped Semantic Hits (follow-up)
+- **Measurement 1 (shared cache, intent guard only):** [`scripts/measure_cache_poisoning.py`](scripts/measure_cache_poisoning.py), 150 corpus-derived victim questions, 2 LLM-written attacks each (frozen set), run end-to-end on the live gateway: **41/247 = 16.6% successful poisonings (95% CI 12.5–21.7%)**, all 41 manually confirmed. Dominant pattern: one entity/attribute swapped in the same slot (e.g. *Stokes'* vs. *Newton's* law), which rules cannot enumerate. NFR-6 (≤ 5%) **not met**.
+- **Fix:** semantic (near-duplicate) hits are now **owner-scoped**: the KNN search is pre-filtered to the requester's own entries (`owner` indexed as a RediSearch `TAG`, added to the live index with `FT.ALTER`), with a defence-in-depth owner check on the result. Exact-text matches stay shared. No owner → no semantic hit (fail closed). All gateway lookups pass `owner=client_id`.
+- **Measurement 2 (owner-scoped, fresh attack set, separate attacker and victim accounts):** **0/255 = 0.0% (95% CI 0–1.5%)**; 0/104 when the attacker's answer was cached; 0/147 victims affected. NFR-6 **met**.
+- **Tests:** [`tests/test_cache_owner_scoping.py`](tests/test_cache_owner_scoping.py) (18 tests: same/other/no owner, shared exact path, legacy entries, attacker flooding, async path, hostile owner strings, gateway call-site check, live gateway with two users).
+- **Remaining:** the guard's same-slot gap still applies within one user's own history (answer quality, PRD §9.1 L1).
+
 ---
 
 ## DEFECT-12: Routing Boundary Off-by-One at `P(hard) == alpha` (FR-2)
@@ -1270,6 +1277,106 @@ tests/test_constant_time_and_cookie_security.py::test_secrets_compare_digest_tim
 - **Defect:** FR-2 specifies $P(\text{hard}) \ge \alpha$ routes to the Tier-2 GPU LLM, but [`gateway/router/dispatcher.py`](gateway/router/dispatcher.py) used `score <= self.alpha` for the CPU branch, so a score exactly at $\alpha = 0.65$ was sent to the CPU SLM. The MLP router (`prob >= threshold`) and the router microservice (`score >= threshold`) already used the correct boundary, so the gateway disagreed with its own router at equality.
 - **Fix:** CPU branch is now `score < self.alpha`; reasons renamed to `Score < Alpha` / `Score >= Alpha`. The GPU-saturation fallback still applies at equality.
 - **Verification:** [`tests/test_dispatcher_threshold.py`](tests/test_dispatcher_threshold.py) (20 tests: equality, just-below, custom alphas, saturation fallback, forced tier, and a 1,001-point sweep checking agreement with the router rule). 10 of these fail on the previous code and all 20 pass after the fix. Added to `make test`.
+
+---
+
+## DEFECT-13: Shared Cached Answers Could Be Overwritten ("Re-generation Lottery") + Regenerate Feature
+
+- **Defect:** the streaming `/query` path stored answers even when `bypass_cache=true`, and `store()` overwrote the shared exact-match entry with a plain `SET`. Any signed-in user could re-ask a question with `bypass_cache` until the model produced an answer they preferred (or a hallucination) and replace the shared answer every user receives for that exact question.
+- **Fix:** the streaming path now respects `bypass_cache` (`may_store`), and shared exact entries are written with `SET NX`: created once per TTL, removed only by admin purge or multi-user eviction.
+- **Feature (PRD Sub-FR-1.5):** cached answers show where they came from and offer **"Generate a fresh answer"**, available only for cache hits via a single-use, user- and question-bound token (15 min). Regenerating a shared answer creates a private override; the shared entry is evicted after 3 distinct users regenerate it; 20 regenerations per user per hour; each regenerate is logged (`semregen:events`, `/cache/stats`).
+- **Files:** [`gateway/cache/redis_semantic_cache.py`](gateway/cache/redis_semantic_cache.py), [`gateway/main.py`](gateway/main.py), [`askiisc_chat/askiisc/gateway_backend.py`](askiisc_chat/askiisc/gateway_backend.py), [`askiisc_chat/static/index.html`](askiisc_chat/static/index.html).
+- **Verification:** [`tests/test_cache_regenerate.py`](tests/test_cache_regenerate.py), 23 tests (token single-use / user / question / expiry / forgery, no overwrite of shared answers, private overrides, eviction only by distinct users, quota, feedback log, gateway and UI wiring, live gateway gating, live web-chat bridge).
+
+---
+
+## DEFECT-14: Loaded Questions Answered by Confirming a False Premise
+
+- **Finding:** for *"Why does X always…?"* questions the 3B model explained why the false claim is true (e.g. *"Quantum tunneling can violate conservation of energy because…"*), citing unrelated theses, while the neutral form of the same question (*"Does X…?"*) was correctly refused on the **same** retrieved chunks (retrieval scores were near-identical, so this is a generation issue, not retrieval and not chat memory: the gateway does not pass chat history to the model). Some refusals also continued with *"However, based on the provided context…"*. Four such answers had been cached as shared exact entries and were purged.
+- **Fix:** shared `PREMISE_RULES` added to both RAG prompts ([`pipeline/sanitizer.py`](pipeline/sanitizer.py), [`pipeline/slm_runner.py`](pipeline/slm_runner.py), [`pipeline/gpu_llm_runner.py`](pipeline/gpu_llm_runner.py)): check built-in assumptions and say first when the documents do not support them; never explain why an unsupported claim is true; either answer or refuse, never both.
+- **Measured (same 28 questions, before → after):** loaded premises challenged 0/9 → 6/9 (+1 partial) on the 3B model, 9/9 on the 7B model; half-refusals 2 → 0; true-premise controls: 1 over-hedged answer on 3B. Remaining limits: PRD §9.1b (L12–L14).
+- **Tests:** [`tests/test_premise_rules.py`](tests/test_premise_rules.py).
+
+---
+
+## DEFECT-15: Streaming Path Routed at alpha = 0.5 Instead of 0.65 (FR-2) + Premise Escalation
+
+- **Defect:** the web UI uses the streaming `/query` path, where the RAG pipeline routes by itself with `QueryRouter()`, whose default threshold is **0.5**; the non-streaming path uses the dispatcher with **0.65** (FR-2). The gateway dispatcher also hard-coded 0.65 instead of reading `ROUTING_ALPHA`. The two paths therefore disagreed for scores in [0.5, 0.65).
+- **Fix:** both paths read `ROUTING_ALPHA` (default 0.65) ([`pipeline/rag_chain.py`](pipeline/rag_chain.py), [`gateway/dependencies.py`](gateway/dependencies.py)).
+- **Premise escalation (follow-up to DEFECT-14):** [`gateway/router/premise_check.py`](gateway/router/premise_check.py) flags loaded "why" claims (*why* + *always / never / every / all / only / guarantee / must / cannot*, or *"why can …"*); both the dispatcher and the streaming pipeline route them to the 7B model (only while the vLLM daemon is healthy, never into the in-process GPU fallback; CPU fallback under GPU saturation unchanged). The premise rule was refined to challenge only contradicted, absolute or scientifically false claims.
+- **Measured:** red-team loaded questions confirmed 2/9 (+1 partial) → **0/9**; fresh frozen set (24 questions, SHA-256 in `logs/premise/fresh_set.sha256`): false premises confirmed 0/12, true premises over-hedged **4/12 → 1/12**. New limit: 7B refusal-plus-explanation pattern (PRD L15).
+- **Tests:** [`tests/test_premise_routing.py`](tests/test_premise_routing.py) (detector, dispatcher escalation, saturation fallback, streaming path with healthy/unhealthy daemon, alpha wiring), [`tests/test_premise_rules.py`](tests/test_premise_rules.py).
+
+---
+
+## DEFECT-16: Short Topic Questions Answered or Refused Depending on Phrasing + Cache Lifetime 4 h
+
+- **Report:** "what is transformers" was answered but "explain transformers" returned "No specific institutional repository theses…".
+- **Root cause:** pure vector retrieval with a fixed 0.52 floor. A 1–2 word ambiguous topic produces near-random, flat similarities (0.49–0.63): "what is transformers" passed with three **unrelated** chunks (the 3B model then answered about electrical transformers from general knowledge, and that answer was cached and shared), while "explain transformers" scored just under the floor. Keyword search existed only for catalog questions.
+- **Fix ([`pipeline/retriever.py`](pipeline/retriever.py)):** keyword-assisted retrieval for short topic questions: KNN restricted to chunks whose title/content contains the exact topic word(s) (`VERBATIM`, so *transformer* no longer matches *transformation*), title matches first; the lower 0.45 floor applies only to title matches of specific topics (≤ 5,000 title chunks), so out-of-domain questions (*"what is the meaning of life"*) are still refused. Falls back to normal vector search when no keyword chunk qualifies. The ungrounded cached answer was purged.
+- **Typos and plural/singular (follow-up):** "explain transformerss" (extra *s*), "explain transfomers" and "explain gmress" were still refused, and singular "transformer" missed the transformer theses. Topic words now go through [`pipeline/text_processing/topic_speller.py`](pipeline/text_processing/topic_speller.py): **symspellpy** (edit distance, then frequency) over the English dictionary plus a thesis-**title** dictionary ([`scripts/build_spell_dictionary.py`](scripts/build_spell_dictionary.py) → `models/spell/thesis_title_terms.txt`, 9,194 theses / 12,488 words, so OCR junk from thesis bodies is never a correction target) and **lemminflect** for base words and singular/plural forms (no stemming). Title-matched theses get their own search, and the user's question is embedded with the corrected word. Tests: [`tests/test_topic_speller.py`](tests/test_topic_speller.py).
+- **Cache lifetime:** `SEMANTIC_CACHE_TTL` 24 h → **4 h** (code default, `.env`, `.env.example`, PRD FR-3); the 21 existing entries were shortened to ≤ 4 h.
+- **Tests:** [`tests/test_topic_retrieval.py`](tests/test_topic_retrieval.py) (topic detection, both phrasings retrieve the same transformer theses, no stemming noise, title-first ranking, sync = async, full questions unchanged, unknown topics fall back, common/out-of-domain topics keep the 0.52 floor); `test_default_cache_ttl_is_4_hours`.
+
+---
+
+## DEFECT-17: CPU-Tier Answers Stalled ~90 s
+
+- **Finding (red-team prompt timing run):** 6 of 13 CPU-routed fresh answers started after 91–93 s instead of ~2 s, even with requests sent one at a time. The SLM log showed more requests received than completed, one worker had dozens of extra blocked threads, and the gateway left a half-closed connection to the SLM server.
+- **Root cause:** the SLM server ran 6 uvicorn worker processes, each with one model behind a lock that was held across streamed yields. The kernel handed each connection to whichever worker accepted it, busy or not; a request then waited on that lock with no limit. A stream abandoned by its client stayed suspended *inside* the lock until garbage collection, so a worker could stay blocked indefinitely. On the gateway side, Starlette never closes sync generators on disconnect, so upstream streams and admission slots were also held until garbage collection; after its 90 s timeout the gateway fell back to an in-process 3B model, appending that answer after any partial text already streamed.
+- **Fix:**
+  - [`pipeline/serve_cpu_slm.py`](pipeline/serve_cpu_slm.py): one process with a pool of `SLM_SLOTS` (6) model slots (weights shared via mmap); a request takes any free slot or gets **503 + Retry-After** after `SLM_QUEUE_TIMEOUT` (3 s); generation runs in its own thread and stops within one token when the client disconnects or the response is dropped; the slot is returned only after the model lock is released. `/healthz` reports free slots, busy rejections, cancellations. `--workers` is kept as an alias of `--slots`.
+  - [`pipeline/rag_chain.py`](pipeline/rag_chain.py): order CPU daemon → **GPU daemon overflow** (busy/down) → in-process SLM; connect timeout 2 s, read timeout `SLM_READ_TIMEOUT` (30 s) between chunks; an answer that has started is never restarted on another backend: it ends with a note and is flagged `incomplete`.
+  - [`gateway/main.py`](gateway/main.py): `closing_stream()` serves the sync SSE generators and always closes them (client disconnect included), so admission slots and upstream streams are released at once; `incomplete` answers are not cached.
+- **Measured:** 13/13 CPU-routed red-team prompts TTFT 1.5–4.6 s (was 6/13 at 91–93 s). Direct: 6 clients disconnecting after the first token → all slots free 0.11 s later; 12 simultaneous requests on 6 slots → 6 answered, 6 got 503 at 3.0 s. Through the gateway: 14 simultaneous fresh questions → 8 CPU + 6 GPU overflow, max TTFT 18.1 s, 0 incomplete.
+- **Tests:** [`tests/test_slm_slots.py`](tests/test_slm_slots.py) (pool timeout, stop/cancel/drop release the lock and slot, engine errors, slot concurrency, HTTP 503, fallback order, no restart after partial output, upstream closed on disconnect, gateway `closing_stream`).
+
+---
+
+## DEFECT-18: Models Reloaded on Every Fresh Request; Spell Dictionaries Loaded on a User's First Question
+
+- **Finding:** retrieval felt slower after spell checking was added. Measured: the spell check itself costs ~0.2 ms per question, but (1) the gateway builds a `RAGQAPipeline` for every fresh request and each build reloaded the MLP router and the MiniLM embedding model from disk (~54 + ~53 ms per request), and (2) the symspellpy/lemminflect dictionaries (~2.5 s) loaded on the first topic question handled by each of the 6 gateway workers after every restart.
+- **Fix:** [`pipeline/embeddings/embedder.py`](pipeline/embeddings/embedder.py) loads each embedding model once per process and shares it across all `LocalEmbedder` instances (router, retriever, semantic cache), serializing only tokenization (fast tokenizers are not safe for concurrent calls); [`pipeline/rag_chain.py`](pipeline/rag_chain.py) reuses one router and one retriever per process; `warm_up()` loads router, embedder, retriever and spell dictionaries at gateway startup ([`gateway/main.py`](gateway/main.py) lifespan, ~5.7 s per worker before it accepts traffic).
+- **Measured:** pipeline setup + first search per fresh request 124 ms → 14 ms; first misspelled topic question on a worker 2.5 s → 18 ms; through the gateway right after a restart, 12 simultaneous first topic questions had routing + retrieval in 0.09–0.23 s. 64 concurrent requests on the shared models: 0 errors.
+- **Tests:** [`tests/test_retrieval_warmup.py`](tests/test_retrieval_warmup.py).
+
+---
+
+## DEFECT-19: "No Theses Found" Although On-Topic Theses Were Retrieved (Sources Hidden)
+
+- **Report (red-team screenshot):** *"Why are bacterial plasmids always essential for the survival of all bacteria?"* → 7B: *"No specific institutional repository theses were found on this topic. The provided documents discuss…"*; *"Are bacterial plasmids always essential for bacterial survival?"* → 3B: the bare refusal. Retrieval had returned on-topic plasmid theses (similarity 0.65–0.70); no sources were shown for either answer.
+- **Root cause:** rule 3 of both RAG prompts told the models to give the refusal sentence whenever the documents did not *sufficiently answer* the question, which merges "no document is about the topic" with "on-topic documents do not answer the exact yes/no claim". The refusal detector then matched the sentence (and any refusal phrase anywhere in an answer, whatever its length) and removed the sources and blocked caching.
+- **Fix:**
+  - [`pipeline/sanitizer.py`](pipeline/sanitizer.py): `REFUSAL_RULE` (both prompts): answer directly from relevant documents, mention uncovered points briefly after the answer, give the refusal sentence on its own only when no document is about the topic. `strip_mixed_refusal` / `strip_mixed_refusal_text` drop a leading refusal sentence that is followed by an explanation (streaming: only output that begins with the sentence is held back, ≤ ~12 words). `is_no_relevant_docs_answer` now means the answer *is* a refusal (the sentence alone, or a short text; ungrounded markers always count), so long answers that mention a gap keep their sources.
+  - [`pipeline/rag_chain.py`](pipeline/rag_chain.py): the 3B model cannot reliably make the on-topic judgement (one wording made it hedge on true claims, the other made it refuse neutral questions), so a bare 3B refusal while documents were retrieved is re-asked to the 7B tier (healthy daemon only) with the 8-chunk context, before anything is shown; a `route` event marks the escalation. The 7B streaming path now goes through the same relay.
+  - [`askiisc_chat/askiisc/gateway_backend.py`](askiisc_chat/askiisc/gateway_backend.py), [`askiisc_chat/static/index.html`](askiisc_chat/static/index.html): same refusal rule in the browser; sources are cleared mid-stream only for a leading refusal sentence, otherwise when the answer is complete; a second route event no longer clears the source list.
+- **Escalation rule (follow-up):** re-asking *every* 3B refusal sent 28% of 80 ordinary research questions to the GPU, and the 7B model refused 15 of those 22 too. A refusal is now re-asked only for yes/no questions or when the best retrieved chunk has similarity ≥ `ESCALATE_MIN_SIMILARITY` (0.65): on the 35 observed escalations this keeps 16/18 useful ones and drops 12/17 wasted ones (threshold chosen on the same data). Re-measured on 80 ordinary research questions: CPU tier 60% → 76%, re-asked 28% → 12%, wasted re-asks 15 → 5; the 52 premise questions are unchanged (0 refusal-plus-explanation). Live end-to-end cache check afterwards: red-team follow-ups served a different question's cached answer 0/11, rephrased seeds served from the same user's cache 11/11.
+- **Measured:** see PRD §9 L15 (52 premise questions: 0 refusal-plus-explanation, neutral 10/11 answered with sources, controls and true premises answered, false premises challenged; off-corpus 38/40 refused).
+- **Tests:** [`tests/test_refusal_mixed.py`](tests/test_refusal_mixed.py).
+
+---
+
+## DEFECT-20: Semantic Cache Hits Over the NFR-1 Latency Target at 100 QPS
+
+- **Finding:** at the committed 100 QPS for 10 minutes, semantic (similar-question) cache hits had p99 37.8 ms end to end against the 35 ms target (exact hits were within target). Most of each hit is embedding the question with MiniLM on the shared CPU.
+- **Fix:** [`scripts/export_embedder_onnx.py`](scripts/export_embedder_onnx.py) exports MiniLM to `models/embeddings/all-MiniLM-L6-v2/onnx/model.onnx` and refuses to finish unless the vectors match PyTorch (worst cosine 0.9999999, fp32, no quantisation), so the 2.26 M-chunk document index, the cache and the router stay valid. [`pipeline/embeddings/embedder.py`](pipeline/embeddings/embedder.py) uses ONNX Runtime when that file exists (`EMBED_BACKEND=auto|onnx|torch`), one shared session per process, `EMBED_NUM_THREADS` intra-op threads, idle-thread spinning off (`EMBED_ORT_SPIN=0`); PyTorch remains the fallback. Export needs `onnx==1.16.2` (added to requirements); serving needs only `onnxruntime`.
+- **Measured:** query embedding ~2x faster (2 concurrent: p50 6.7 → 3.0–3.6 ms). 10 min at 100 QPS: semantic p99 37.8 → **18.1 ms**, p50 19.4 → 8.0 ms; exact p99 11.0 ms. Retrieval on the 244-question set: identical results for 244/244 questions, p50 13.8 → 8.1 ms.
+- **Tests:** [`tests/test_embedder_onnx.py`](tests/test_embedder_onnx.py) (backend selection, ONNX = PyTorch vectors for queries and batches, unit length, shared thread-safe session, forced ONNX without a model fails loudly).
+
+---
+
+## DEFECT-21: Redis Deadlocked (Whole Stack Down) — FT.INFO on a Vector Index; Blocking KEYS Calls
+
+- **Incident (2026-11-14, during the full test campaign):** Redis stopped answering even `PING`; cache, retrieval and logins failed. All Redis threads were parked on locks (not busy). A `SIGSEGV` crash report (`logs/redis_deadlock/crash_report.txt`) shows the main thread blocked in **`FT.INFO`**: `IndexInfoCommand → IndexSpec_VectorIndexSize → TieredHNSWIndex::info → pthread_rwlock_wrlock`, i.e. a lock-ordering deadlock in this RediSearch build (Redis Stack 7.2.0-v9) between `FT.INFO` and the background vector-indexing threads. The first check that hung was the full-stack test's `FT.INFO rag_documents_idx`.
+- **Recovery:** forced kill and reload from `dump.rdb` (2026-11-09; `save ""` means no newer snapshot exists). Reloading takes ~1 h (vector index rebuild). Lost: cache entries, OTP/rate-limit counters, regenerate logs written since 2026-11-12.
+- **Fix:**
+  - No code calls `FT.INFO` any more ([`gateway/cache/redis_semantic_cache.py`](gateway/cache/redis_semantic_cache.py), [`pipeline/indexer.py`](pipeline/indexer.py), [`askiisc_chat/deploy/redis_index.py`](askiisc_chat/deploy/redis_index.py), tests): index existence via `FT._LIST`, counts via `FT.SEARCH … LIMIT 0 0`.
+  - The cache no longer sends `FT.ALTER` on every cache-object creation: once per process per index. If the field exists, Redis answers "Duplicate field in schema" at once (no rescan); if it is missing, it is added (background rescan, ~7 s).
+  - Follow-up found during the re-run: a first version probed the field with `FT.SEARCH @owner:{…}`. That is no probe, because on a field missing from the schema RediSearch returns 0 results, not an error. After the restore from the 11-09 snapshot (which predates the field) the probe reported "present", the field was never added, and every owner-filtered semantic lookup matched nothing. That was safe (no cross-user hits) but semantic hits were disabled. `make test` caught it, and the probe was replaced by the ALTER-and-accept-duplicate logic above.
+  - No `KEYS` (a blocking walk over all 2.26 M keys, previously run on every `/cache/stats` and by every gateway worker at startup): `SCAN` iteration instead; `count()` now counts cached answers via the cache index.
+  - `tests/test_intensive_full_stack.py` exits non-zero when checks fail (it reported 8 failures with exit code 0).
+- **Tests:** [`tests/test_cache_index_alter.py`](tests/test_cache_index_alter.py) (ALTER-once logic, duplicate-field detection, retry when Redis is loading, a guard against reintroducing a search probe, and a code scan that fails if `FT.INFO` or `KEYS` reappears).
+- **Open (ops decisions):** upgrade Redis Stack to a release with the RediSearch fix; enable persistence (`save` or AOF) so a restart does not roll back days of state; the ~1 h reload time is an availability risk.
 
 ---
 

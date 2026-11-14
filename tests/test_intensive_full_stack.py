@@ -282,8 +282,9 @@ except Exception as e:
 # 4.1 Index Verification
 try:
     r_decoded = redis.from_url(REDIS_URL, decode_responses=True)
-    idx_info = r_decoded.ft("rag_documents_idx").info()
-    num_docs = int(float(idx_info.get("num_docs", 0)))
+    # Count via FT.SEARCH, never FT.INFO: FT.INFO on the vector index deadlocked Redis on 2026-11-14.
+    _res = r_decoded.execute_command("FT.SEARCH", "rag_documents_idx", "*", "LIMIT", "0", "0")
+    num_docs = int(_res["total_results"] if isinstance(_res, dict) else _res[0])  # RESP3 dict or RESP2 list
     record_result("Redis Core", "Index Verification (rag_documents_idx)", num_docs > 1000000, f"Indexed Vectors: {num_docs:,} documents")
 except Exception as e:
     record_result("Redis Core", "Index Verification", False, str(e))
@@ -295,7 +296,7 @@ cache.lookup("Warmup query for cache model")
 
 def cleanup_probe_keys(prompt_str=None):
     try:
-        for k in r_sync.keys(f"{cache.key_prefix}*"):
+        for k in r_sync.scan_iter(match=f"{cache.key_prefix}*", count=2000):
             k_type = r_sync.type(k)
             if k_type == b"hash":
                 p = r_sync.hget(k, "prompt")
@@ -328,7 +329,7 @@ sample_resp = {
         {"title": "Topological Quasi-particles", "department": "Physics", "content": "Sample text", "similarity": 0.88}
     ]
 }
-stored = cache.store(test_prompt, sample_resp)
+stored = cache.store(test_prompt, sample_resp, owner="intensive-test@iisc.ac.in")
 record_result("Semantic Cache", "Store Entry", stored is True, "Cached query and response in Redis")
 
 # Exact Hit
@@ -341,7 +342,7 @@ record_result("Semantic Cache", "Exact Cache Hit (< 35ms)", hit_ok and (exact_la
 
 # Paraphrase Hit
 t0 = time.time()
-para_hit = cache.lookup(paraphrase_prompt)
+para_hit = cache.lookup(paraphrase_prompt, owner="intensive-test@iisc.ac.in")  # semantic hits are owner-scoped
 para_lat_ms = (time.time() - t0) * 1000.0
 para_ok = para_hit is not None and para_hit.get("similarity", 0) >= 0.88
 record_result("Semantic Cache", "Semantic Paraphrase Hit", para_ok, f"Latency: {para_lat_ms:.2f}ms | Sim: {para_hit.get('similarity', 0) if para_hit else 0.0:.4f}")
@@ -490,3 +491,13 @@ if failed_checks == 0:
 else:
     print(f"⚠️ {failed_checks} CHECKS FAILED. PLEASE REVIEW LOGS ABOVE.")
 print("=" * 80 + "\n")
+# Purge every cache entry this run created through the gateway (keeps the shared cache clean)
+try:
+    import re as _re
+    _qs = set(_re.findall(r'"query": "([^"]+)"', open(__file__).read()))
+    _purged = sum(cache.purge(q, threshold=0.995) for q in _qs)
+    print(f"purged {_purged} cache entries created by this run")
+except Exception as _e:
+    print(f"cache purge failed: {_e}")
+import sys as _sys
+_sys.exit(1 if failed_checks else 0)  # non-zero so `make test-intensive` and CI see failures

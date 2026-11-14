@@ -159,6 +159,143 @@ class RedisChunkRetriever:
         self.dynamic = dynamic if dynamic is not None else self.DEFAULT_DYNAMIC
         self.enable_metadata_filter = enable_metadata_filter if enable_metadata_filter is not None else self.DEFAULT_METADATA_FILTER
 
+    # ------------------------------------------------------------------------------------------------
+    # Keyword-assisted retrieval for short topic questions ("explain transformers", "what is X")
+    #   A 1-3 word topic gives near-random dense similarities (0.49-0.63 against mostly unrelated
+    #   chunks), so whether the 0.52 floor lets anything through depends on phrasing. For such
+    #   questions the vector search is restricted to chunks whose title or text contains the exact
+    #   topic word(s) (VERBATIM: no stemming, so 'transformer' does not match 'transformation'),
+    #   title matches are ranked first, and a lower floor applies because the keyword is evidence.
+    # ------------------------------------------------------------------------------------------------
+    KEYWORD_MIN_SIMILARITY: float = float(os.getenv("RETRIEVAL_KEYWORD_MIN_SIMILARITY", "0.45"))
+    # The lower floor applies only to TITLE matches of a SPECIFIC topic (few title chunks contain all the
+    # topic words), e.g. 'transformer' (1,820) or 'gmres' (503), not 'life' (12,606) or 'energy' (21,190);
+    # otherwise the normal floor applies, so out-of-domain questions ("meaning of life") are still refused.
+    KEYWORD_SPECIFIC_MAX_TITLE_CHUNKS: int = int(os.getenv("RETRIEVAL_KEYWORD_SPECIFIC_MAX_TITLE_CHUNKS", "5000"))
+    TOPIC_MAX_TERMS: int = 3
+    _TOPIC_PREFIX = re.compile(
+        r"^(?:(?:please|kindly)\s+|(?:can|could|would)\s+you\s+(?:please\s+)?)*"
+        r"(?:explain|describe|define|summari[sz]e|elaborate\s+on|tell\s+me\s+about|tell\s+me|"
+        r"give\s+(?:me\s+)?an?\s+overview\s+of|overview\s+of|introduction\s+to|meaning\s+of|"
+        r"what\s+(?:is|are|was|were)|what's|who\s+(?:is|are))\s+(?:the\s+|a\s+|an\s+)?",
+        re.IGNORECASE,
+    )
+    _TOPIC_STOP = {
+        "the", "a", "an", "of", "in", "on", "for", "and", "to", "about", "me", "please", "briefly", "detail",
+        "detailed", "simple", "terms", "concept", "topic", "is", "are", "what", "explain", "describe", "define",
+        "meaning", "overview", "introduction", "basics", "basic", "with", "examples", "example", "simply",
+        "working", "workings", "principle", "principles", "how", "does", "work", "works",
+        # "What is known about X in the theses / IISc research?": framing words, not topic words. Every topic
+        # term must appear in a thesis title, so one of these left in made the question match nothing.
+        "known", "thesis", "theses", "dissertation", "dissertations", "research", "iisc",
+    }
+
+    @classmethod
+    def topic_terms(cls, query: str) -> Optional[List[str]]:
+        """Return the 1-3 content words of a short topic question, else None."""
+        text = (query or "").lower().replace("\u2019", "'").strip().rstrip("?.! ")
+        stripped = cls._TOPIC_PREFIX.sub("", text)
+        # Hyphenated words are split: the index tokenizes 'lithium-ion' as 'lithium' + 'ion'.
+        tokens = [t for t in re.findall(r"[a-z][a-z0-9]+", stripped) if t not in cls._TOPIC_STOP and len(t) >= 3]
+        if not tokens or len(tokens) > cls.TOPIC_MAX_TERMS:
+            return None
+        if stripped == text and len(re.findall(r"[a-z0-9]+", text)) > cls.TOPIC_MAX_TERMS:
+            return None  # a full question without an instruction prefix is not a topic query
+        return tokens
+
+    @staticmethod
+    def _term_variants(term: str) -> List[str]:
+        """Word, lemma and singular/plural forms via lemminflect (no stemming: 'transformation' stays separate)."""
+        from pipeline.text_processing.topic_speller import TopicSpeller
+        return TopicSpeller.get_instance().variants(re.sub(r"[^a-z0-9]", "", term.lower()))
+
+    def _title_all_terms_query(self, terms: List[str]) -> str:
+        return " ".join(f"@title:({'|'.join(self._term_variants(t))})" for t in terms)
+
+    def _is_specific(self, title_chunk_count: int) -> bool:
+        return 0 < title_chunk_count <= self.KEYWORD_SPECIFIC_MAX_TITLE_CHUNKS
+
+    @staticmethod
+    def _total(results: Any) -> int:
+        if isinstance(results, dict):
+            return int(results.get(b"total_results", results.get("total_results", 0)) or 0)
+        return int(results[0]) if isinstance(results, (list, tuple)) and results else 0
+
+    @staticmethod
+    def _apply_corrections(text: str, corrections: Dict[str, str]) -> str:
+        """Embed the user's own question with misspelled topic words replaced (not the bare word)."""
+        for wrong, right in corrections.items():
+            text = re.sub(rf"\b{re.escape(wrong)}\b", right, text, flags=re.IGNORECASE)
+        return text
+
+    @staticmethod
+    def _merge_hits(*hit_lists: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        seen, merged = set(), []
+        for hits in hit_lists:
+            for h in hits:
+                key = (h.get("doc_id"), h.get("chunk_index"), str(h.get("content", ""))[:80])
+                if key not in seen:
+                    seen.add(key)
+                    merged.append(h)
+        return merged
+
+    def _keyword_filter(self, terms: List[str]) -> str:
+        clauses = []
+        for t in terms:
+            alts = "|".join(self._term_variants(t))
+            clauses.append(f"(@title:({alts}) | @content:({alts}))")
+        return " ".join(clauses)
+
+    def _rank_keyword_hits(self, hits: List[Dict[str, Any]], terms: List[str], max_k: int,
+                           specific: bool = False) -> List[Dict[str, Any]]:
+        words = {v for t in terms for v in self._term_variants(t)}
+        title_floor = self.KEYWORD_MIN_SIMILARITY if specific else self.min_similarity
+        kept = []
+        for c in hits:
+            sim = float(c.get("similarity", 0))
+            title = str(c.get("title") or "").lower()
+            title_match = any(re.search(rf"\b{re.escape(w)}\b", title) for w in words)
+            if sim < (title_floor if title_match else self.min_similarity):
+                continue
+            c["keyword_title_match"] = title_match
+            c["retrieval_mode"] = "keyword_assisted"
+            kept.append(c)
+        kept.sort(key=lambda c: (c["keyword_title_match"], float(c.get("similarity", 0))), reverse=True)
+        return kept[:max_k]
+
+    def _execute_keyword_knn(self, r: Any, text: str, terms: List[str], k: int):
+        """Returns (hits, specific, resolved_terms, corrections)."""
+        k = min(max(1, int(k)), 50)
+        from pipeline.text_processing.topic_speller import TopicSpeller
+        terms, corrections = TopicSpeller.get_instance().correct_terms(terms)
+        vec_bytes = np.array(self.embedder.embed_query(self._apply_corrections(text, corrections)), dtype=np.float32).tobytes()
+        knn = f"=>[KNN {k} @vector $vec EF_RUNTIME {self.ef_runtime} AS score]"
+        hit_lists = []
+        for flt in (self._title_all_terms_query(terms), self._keyword_filter(terms)):  # title matches get their own search
+            res = r.execute_command("FT.SEARCH", self.index_name, f"({flt}){knn}", "VERBATIM",
+                                    "PARAMS", "2", "vec", vec_bytes, "SORTBY", "score", "ASC", "DIALECT", "2")
+            hit_lists.append(self._parse_results(res))
+        count = r.execute_command("FT.SEARCH", self.index_name, self._title_all_terms_query(terms), "VERBATIM",
+                                  "LIMIT", "0", "0", "DIALECT", "2")
+        return self._merge_hits(*hit_lists), self._is_specific(self._total(count)), terms, corrections
+
+    async def _aexecute_keyword_knn(self, r: Any, text: str, terms: List[str], k: int):
+        k = min(max(1, int(k)), 50)
+        from pipeline.text_processing.topic_speller import TopicSpeller
+        terms, corrections = TopicSpeller.get_instance().correct_terms(terms)
+        loop = asyncio.get_running_loop()
+        vec = await loop.run_in_executor(None, self.embedder.embed_query, self._apply_corrections(text, corrections))
+        vec_bytes = np.array(vec, dtype=np.float32).tobytes()
+        knn = f"=>[KNN {k} @vector $vec EF_RUNTIME {self.ef_runtime} AS score]"
+        hit_lists = []
+        for flt in (self._title_all_terms_query(terms), self._keyword_filter(terms)):
+            res = await r.execute_command("FT.SEARCH", self.index_name, f"({flt}){knn}", "VERBATIM",
+                                          "PARAMS", "2", "vec", vec_bytes, "SORTBY", "score", "ASC", "DIALECT", "2")
+            hit_lists.append(self._parse_results(res))
+        count = await r.execute_command("FT.SEARCH", self.index_name, self._title_all_terms_query(terms), "VERBATIM",
+                                        "LIMIT", "0", "0", "DIALECT", "2")
+        return self._merge_hits(*hit_lists), self._is_specific(self._total(count)), terms, corrections
+
     def _build_filter_expression(self, filter_dict: Optional[Dict[str, Any]] = None) -> str:
         """Format optional metadata filter dictionary into RediSearch query clauses.
 
@@ -651,6 +788,7 @@ class RedisChunkRetriever:
         r = redis.from_url(self.redis_url, encoding="utf-8", decode_responses=False)
         fallback_triggered = False
         raw_hits = []
+        keyword_chunks: List[Dict[str, Any]] = []
         is_catalog_path = bool(
             extracted_meta and (
                 extracted_meta.is_catalog_query
@@ -672,7 +810,15 @@ class RedisChunkRetriever:
                     fallback_triggered = True
                     raw_hits = self._execute_knn_search(r, search_text or query, fetch_k, filter_dict=None)
             else:
-                raw_hits = self._execute_knn_search(r, search_text or query, fetch_k, effective_filter)
+                terms = self.topic_terms(query) if not effective_filter else None
+                if terms:
+                    kw_hits, specific, terms, corrections = self._execute_keyword_knn(r, query, terms, fetch_k)
+                    keyword_chunks = self._rank_keyword_hits(kw_hits, terms, top_k or 5, specific)
+                    for c in keyword_chunks:
+                        if corrections:
+                            c["keyword_corrections"] = corrections
+                if not keyword_chunks:
+                    raw_hits = self._execute_knn_search(r, search_text or query, fetch_k, effective_filter)
 
                 # 3. Stage 2: Hybrid Fallback Check
                 # If filtered search produced 0 matches, fall back to unconstrained search on raw query!
@@ -686,7 +832,9 @@ class RedisChunkRetriever:
         finally:
             r.close()
 
-        if is_catalog_path:
+        if keyword_chunks:
+            final_chunks = keyword_chunks
+        elif is_catalog_path:
             final_chunks = raw_hits[:top_k] if (top_k and not use_dynamic) else raw_hits
         elif not use_dynamic:
             final_chunks = raw_hits[:top_k] if top_k else raw_hits
@@ -752,6 +900,7 @@ class RedisChunkRetriever:
         r = aioredis.from_url(self.redis_url, encoding="utf-8", decode_responses=False)
         fallback_triggered = False
         raw_hits = []
+        keyword_chunks: List[Dict[str, Any]] = []
         is_catalog_path = bool(
             extracted_meta and (
                 extracted_meta.is_catalog_query
@@ -773,7 +922,15 @@ class RedisChunkRetriever:
                     fallback_triggered = True
                     raw_hits = await self._aexecute_knn_search(r, search_text or query, fetch_k, filter_dict=None)
             else:
-                raw_hits = await self._aexecute_knn_search(r, search_text or query, fetch_k, effective_filter)
+                terms = self.topic_terms(query) if not effective_filter else None
+                if terms:
+                    kw_hits, specific, terms, corrections = await self._aexecute_keyword_knn(r, query, terms, fetch_k)
+                    keyword_chunks = self._rank_keyword_hits(kw_hits, terms, top_k or 5, specific)
+                    for c in keyword_chunks:
+                        if corrections:
+                            c["keyword_corrections"] = corrections
+                if not keyword_chunks:
+                    raw_hits = await self._aexecute_knn_search(r, search_text or query, fetch_k, effective_filter)
 
                 if not raw_hits and effective_filter:
                     logger.info(
@@ -785,7 +942,9 @@ class RedisChunkRetriever:
         finally:
             await r.aclose()
 
-        if is_catalog_path:
+        if keyword_chunks:
+            final_chunks = keyword_chunks
+        elif is_catalog_path:
             final_chunks = raw_hits[:top_k] if (top_k and not use_dynamic) else raw_hits
         elif not use_dynamic:
             final_chunks = raw_hits[:top_k] if top_k else raw_hits

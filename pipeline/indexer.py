@@ -29,7 +29,10 @@ class RedisDocumentIndexer:
 
     async def create_index(self, r):
         try:
-            await r.execute_command("FT.INFO", self.index_name)
+            # FT._LIST, not FT.INFO: FT.INFO on a vector index can deadlock this RediSearch build (2026-11-14).
+            names = [n.decode() if isinstance(n, bytes) else str(n) for n in await r.execute_command("FT._LIST")]
+            if self.index_name not in names:
+                raise LookupError(self.index_name)
         except Exception:
             cmd = [
                 "FT.CREATE", self.index_name, "ON", "HASH", "PREFIX", "1", "doc:chunk:",
