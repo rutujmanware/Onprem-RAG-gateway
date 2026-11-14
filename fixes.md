@@ -1380,5 +1380,15 @@ tests/test_constant_time_and_cookie_security.py::test_secrets_compare_digest_tim
 
 ---
 
+## DEFECT-22: Questions About Rare Technical Terms Returned "No Theses Found"
+
+- **Symptom:** "What is known about GMRES?" (and similar short questions about acronyms or specialised terms) got the refusal although a thesis titled "GMRES acceleration of …" exists. "known" and "theses" were also treated as topic words, so the topic path required them in a thesis title and matched nothing.
+- **Root cause:** the word match only selected candidate chunks; acceptance used the semantic score alone. MiniLM does not know rare terms, so the question scored 0.37–0.44 against the right chunks, below the 0.52 floor (0.45 for title matches).
+- **Fix** ([`pipeline/retriever.py`](pipeline/retriever.py)):
+  - Framing words ("known", "thesis/theses", "research", "IISc", …) are no longer topic terms.
+  - Rare query words: content words of any question that are not everyday English are counted in the index (cached in memory); words in ≤ 2,000 of the 2.26 M chunks count as rare. Chunks containing the (up to two) rarest words are fetched with a filtered vector search, accepted from similarity 0.30 when corroborated (≥ 2 chunks of that thesis contain the word, or it is in the title; a lone mention is usually a citation or an aside), and ranked among the normal results with a +0.15 bonus (+0.05 for a title match). At most 3 are added. The global 0.52 floor and all other paths are unchanged; `RETRIEVAL_RARE_TERMS=false` restores the old behaviour.
+- **Evidence:** a new frozen rare-term set (`scripts/eval_retrieval.py generate-rare`: 120 questions about rare words sampled from the corpus, filtered by rules and an LLM term judge before any retrieval run, plus 15 off-corpus questions built around rare non-academic words): hit@3 0.467 → 0.758, empty answers 34% → 12%, 35 questions better and 0 worse (sign test p ≈ 6·10⁻¹¹). Main 244-question set unchanged (hit@3 0.691 → 0.691; 3 better, 3 worse). Off-corpus questions that now retrieve something: 6/40 → 9/40 and 1/15 → 2/15 (rare words used in another sense, e.g. "yolk", "lifespan", a name in acknowledgements); end to end all of them are still refused, because the answer prompt allows the refusal when no document is on topic. A variant without the corroboration rule was rejected (6/15 rare off-corpus questions retrieved something).
+- **Tests:** [`tests/test_rare_terms.py`](tests/test_rare_terms.py), stoplist case in [`tests/test_topic_speller.py`](tests/test_topic_speller.py).
+
 ## Remediation Complete
 All security vulnerabilities, cache qualification defects, frontend/backend break vectors, and redundant code have been fully resolved, hardened, and verified with passing regression tests. All changes are cleanly staged. Per instructions, `git commit` has not been run.

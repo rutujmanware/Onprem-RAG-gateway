@@ -104,3 +104,4 @@ tests/test_retrieval_warmup.py
 tests/test_slm_slots.py
 tests/test_topic_retrieval.py
 tests/test_topic_speller.py
+tests/test_rare_terms.py

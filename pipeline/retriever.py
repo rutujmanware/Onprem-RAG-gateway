@@ -25,6 +25,7 @@ import asyncio
 import logging
 import math
 import re
+import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
@@ -295,6 +296,145 @@ class RedisChunkRetriever:
         count = await r.execute_command("FT.SEARCH", self.index_name, self._title_all_terms_query(terms), "VERBATIM",
                                         "LIMIT", "0", "0", "DIALECT", "2")
         return self._merge_hits(*hit_lists), self._is_specific(self._total(count)), terms, corrections
+
+    # ------------------------------------------------------------------------------------------------
+    # Rare query words ("What is known about GMRES?", "How does GMRES compare with MINRES?")
+    #   The embedding model does not know rare technical terms, so a question built around one scores
+    #   only ~0.35-0.45 against the very chunks that discuss it, below the 0.52 floor. A rare word the
+    #   user typed is strong evidence by itself: chunks containing it (title or text, VERBATIM + lemmas)
+    #   are fetched with a filtered vector search, accepted from a lower floor (RARE_MIN_SIMILARITY) and
+    #   ranked with a bonus. Only words in <= RARE_MAX_CHUNKS of the 2.26 M chunks count as rare; common
+    #   English words are skipped without a query. The global floor and all other paths are unchanged.
+    # ------------------------------------------------------------------------------------------------
+    RARE_TERMS_ENABLED: bool = os.getenv("RETRIEVAL_RARE_TERMS", "true").lower() in ("true", "1", "yes")
+    RARE_MAX_CHUNKS: int = int(os.getenv("RETRIEVAL_RARE_MAX_CHUNKS", "2000"))
+    RARE_MIN_SIMILARITY: float = float(os.getenv("RETRIEVAL_RARE_MIN_SIMILARITY", "0.30"))
+    RARE_SCORE_BONUS: float = float(os.getenv("RETRIEVAL_RARE_SCORE_BONUS", "0.15"))
+    RARE_TITLE_BONUS: float = 0.05
+    RARE_MAX_ADDED: int = int(os.getenv("RETRIEVAL_RARE_MAX_ADDED", "3"))
+    RARE_MIN_DOC_CHUNKS: int = int(os.getenv("RETRIEVAL_RARE_MIN_DOC_CHUNKS", "2"))  # corroboration, unless title match
+    RARE_MAX_TERMS: int = 2          # the rarest words of the question
+    RARE_MAX_CANDIDATES: int = 6     # words per question checked against the index
+    RARE_COMMON_ENGLISH_FREQ: int = 1_000_000  # symspell count; above it a word is everyday English
+    _RARE_WORD = re.compile(r"[a-z][a-z0-9]{2,}")
+    _RARE_DF_CACHE: Dict[str, int] = {}
+    _ENGLISH_FREQ: Optional[Dict[str, int]] = None
+    _ENGLISH_FREQ_LOCK = threading.Lock()
+
+    @classmethod
+    def _english_freq(cls, word: str) -> int:
+        if cls._ENGLISH_FREQ is None:
+            with cls._ENGLISH_FREQ_LOCK:
+                if cls._ENGLISH_FREQ is None:
+                    freq: Dict[str, int] = {}
+                    try:
+                        from importlib.resources import files
+                        with open(str(files("symspellpy") / "frequency_dictionary_en_82_765.txt")) as fh:
+                            for line in fh:
+                                parts = line.split()
+                                if len(parts) == 2:
+                                    freq[parts[0]] = int(parts[1])
+                    except Exception as e:  # no dictionary: rely on the index counts alone
+                        logger.warning("English frequency dictionary unavailable: %s", e)
+                    cls._ENGLISH_FREQ = freq
+        return cls._ENGLISH_FREQ.get(word, 0)
+
+    @classmethod
+    def rare_candidates(cls, query: str) -> List[str]:
+        """Content words of the question that could be rare (not stopwords, not everyday English)."""
+        out: List[str] = []
+        for w in cls._RARE_WORD.findall((query or "").lower()):
+            if w in out or w in cls._TOPIC_STOP or cls._english_freq(w) >= cls.RARE_COMMON_ENGLISH_FREQ:
+                continue
+            out.append(w)
+        return out[:cls.RARE_MAX_CANDIDATES]
+
+    def _rare_df_query(self, word: str) -> Tuple[str, ...]:
+        return ("FT.SEARCH", self.index_name, self._keyword_filter([word]), "VERBATIM", "LIMIT", "0", "0", "DIALECT", "2")
+
+    def _remember_df(self, word: str, n: int) -> int:
+        if len(self._RARE_DF_CACHE) > 50_000:
+            self._RARE_DF_CACHE.clear()
+        self._RARE_DF_CACHE[word] = n
+        return n
+
+    def _pick_rare(self, dfs: List[Tuple[str, int]]) -> List[str]:
+        rare = sorted((d, w) for w, d in dfs if 0 < d <= self.RARE_MAX_CHUNKS)
+        return [w for _, w in rare[:self.RARE_MAX_TERMS]]
+
+    def _rare_knn_query(self, word: str) -> str:
+        return f"({self._keyword_filter([word])})=>[KNN 10 @vector $vec EF_RUNTIME {self.ef_runtime} AS score]"
+
+    def _select_rare_hits(self, hits: List[Tuple[str, List[Dict[str, Any]]]]) -> List[Dict[str, Any]]:
+        kept, seen = [], set()
+        for word, chunks in hits:
+            variants = self._term_variants(word)
+            ok = [c for c in chunks if float(c.get("similarity", 0.0)) >= self.RARE_MIN_SIMILARITY]
+            per_doc: Dict[Any, int] = {}
+            for c in ok:
+                per_doc[c.get("doc_id")] = per_doc.get(c.get("doc_id"), 0) + 1
+            for c in ok:
+                key = (c.get("doc_id"), c.get("chunk_index"), str(c.get("content", ""))[:80])
+                if key in seen:
+                    continue
+                title = str(c.get("title") or "").lower()
+                title_match = any(re.search(rf"\b{re.escape(v)}\b", title) for v in variants)
+                # Corroboration (as the dense path's coherence guard): a thesis that discusses the word
+                # mentions it in several chunks; a lone mention is usually a citation or an aside
+                # ("Messi" as a cited author in a chemistry thesis).
+                if not title_match and per_doc[c.get("doc_id")] < self.RARE_MIN_DOC_CHUNKS:
+                    continue
+                seen.add(key)
+                c["keyword_title_match"] = title_match
+                c["rare_term"] = word
+                c["retrieval_mode"] = "rare_term"
+                kept.append(c)
+        kept.sort(key=self._rare_rank_score, reverse=True)
+        return kept[:self.RARE_MAX_ADDED]
+
+    def _rare_rank_score(self, c: Dict[str, Any]) -> float:
+        return float(c.get("similarity", 0.0)) + self.RARE_SCORE_BONUS + (self.RARE_TITLE_BONUS if c.get("keyword_title_match") else 0.0)
+
+    def _merge_rare(self, rare: List[Dict[str, Any]], dense: List[Dict[str, Any]],
+                    top_k: Optional[int]) -> List[Dict[str, Any]]:
+        """Rare-word chunks ranked with their bonus among the normal results (duplicates dropped)."""
+        if not rare:
+            return dense
+        key = lambda c: (c.get("doc_id"), c.get("chunk_index"), str(c.get("content", ""))[:80])
+        rare_keys = {key(c) for c in rare}
+        scored = [(self._rare_rank_score(c), c) for c in rare]
+        scored += [(float(c.get("similarity", 0.0)), c) for c in dense if key(c) not in rare_keys]
+        scored.sort(key=lambda x: x[0], reverse=True)
+        merged = [c for _, c in scored]
+        return merged[:top_k] if top_k else merged
+
+    def _rare_term_search(self, r: Any, query: str, vec_bytes: bytes) -> List[Dict[str, Any]]:
+        dfs = []
+        for w in self.rare_candidates(query):
+            n = self._RARE_DF_CACHE.get(w)
+            if n is None:
+                n = self._remember_df(w, self._total(r.execute_command(*self._rare_df_query(w))))
+            dfs.append((w, n))
+        hits = []
+        for w in self._pick_rare(dfs):
+            res = r.execute_command("FT.SEARCH", self.index_name, self._rare_knn_query(w), "VERBATIM",
+                                    "PARAMS", "2", "vec", vec_bytes, "SORTBY", "score", "ASC", "DIALECT", "2")
+            hits.append((w, self._parse_results(res)))
+        return self._select_rare_hits(hits)
+
+    async def _arare_term_search(self, r: Any, query: str, vec_bytes: bytes) -> List[Dict[str, Any]]:
+        dfs = []
+        for w in self.rare_candidates(query):
+            n = self._RARE_DF_CACHE.get(w)
+            if n is None:
+                n = self._remember_df(w, self._total(await r.execute_command(*self._rare_df_query(w))))
+            dfs.append((w, n))
+        hits = []
+        for w in self._pick_rare(dfs):
+            res = await r.execute_command("FT.SEARCH", self.index_name, self._rare_knn_query(w), "VERBATIM",
+                                          "PARAMS", "2", "vec", vec_bytes, "SORTBY", "score", "ASC", "DIALECT", "2")
+            hits.append((w, self._parse_results(res)))
+        return self._select_rare_hits(hits)
 
     def _build_filter_expression(self, filter_dict: Optional[Dict[str, Any]] = None) -> str:
         """Format optional metadata filter dictionary into RediSearch query clauses.
@@ -705,12 +845,13 @@ class RedisChunkRetriever:
         text: str,
         k: int,
         filter_dict: Optional[Dict[str, Any]] = None,
+        vec_bytes: Optional[bytes] = None,
     ) -> List[Dict[str, Any]]:
         """Run single KNN RediSearch vector query with optional metadata filter."""
         # VULN-06: Defensive bound clamp on vector search k
         k = min(max(1, int(k)), 50)
-        query_vec = self.embedder.embed_query(text)
-        vec_bytes = np.array(query_vec, dtype=np.float32).tobytes()
+        if vec_bytes is None:
+            vec_bytes = np.array(self.embedder.embed_query(text), dtype=np.float32).tobytes()
         base_filter = self._build_filter_expression(filter_dict)
         search_query = f"({base_filter})=>[KNN {k} @vector $vec EF_RUNTIME {self.ef_runtime} AS score]"
         results = r.execute_command(
@@ -729,13 +870,15 @@ class RedisChunkRetriever:
         text: str,
         k: int,
         filter_dict: Optional[Dict[str, Any]] = None,
+        vec_bytes: Optional[bytes] = None,
     ) -> List[Dict[str, Any]]:
         """Asynchronous single KNN RediSearch vector query with optional metadata filter."""
         # VULN-06: Defensive bound clamp on vector search k
         k = min(max(1, int(k)), 50)
-        loop = asyncio.get_running_loop()
-        query_vec = await loop.run_in_executor(None, self.embedder.embed_query, text)
-        vec_bytes = np.array(query_vec, dtype=np.float32).tobytes()
+        if vec_bytes is None:
+            loop = asyncio.get_running_loop()
+            query_vec = await loop.run_in_executor(None, self.embedder.embed_query, text)
+            vec_bytes = np.array(query_vec, dtype=np.float32).tobytes()
         base_filter = self._build_filter_expression(filter_dict)
         search_query = f"({base_filter})=>[KNN {k} @vector $vec EF_RUNTIME {self.ef_runtime} AS score]"
         results = await r.execute_command(
@@ -789,6 +932,7 @@ class RedisChunkRetriever:
         fallback_triggered = False
         raw_hits = []
         keyword_chunks: List[Dict[str, Any]] = []
+        rare_chunks: List[Dict[str, Any]] = []
         is_catalog_path = bool(
             extracted_meta and (
                 extracted_meta.is_catalog_query
@@ -818,7 +962,12 @@ class RedisChunkRetriever:
                         if corrections:
                             c["keyword_corrections"] = corrections
                 if not keyword_chunks:
-                    raw_hits = self._execute_knn_search(r, search_text or query, fetch_k, effective_filter)
+                    use_rare = self.RARE_TERMS_ENABLED and not effective_filter
+                    dense_vec = (np.array(self.embedder.embed_query(search_text or query), dtype=np.float32).tobytes()
+                                 if use_rare else None)
+                    raw_hits = self._execute_knn_search(r, search_text or query, fetch_k, effective_filter, vec_bytes=dense_vec)
+                    if use_rare:
+                        rare_chunks = self._rare_term_search(r, query, dense_vec)
 
                 # 3. Stage 2: Hybrid Fallback Check
                 # If filtered search produced 0 matches, fall back to unconstrained search on raw query!
@@ -849,6 +998,8 @@ class RedisChunkRetriever:
                 max_knee_drop=eff_knee,
                 max_k=top_k,
             )
+        if rare_chunks:
+            final_chunks = self._merge_rare(rare_chunks, final_chunks, top_k)
 
         # Annotate chunks with metadata tracking
         for c in final_chunks:
@@ -901,6 +1052,7 @@ class RedisChunkRetriever:
         fallback_triggered = False
         raw_hits = []
         keyword_chunks: List[Dict[str, Any]] = []
+        rare_chunks: List[Dict[str, Any]] = []
         is_catalog_path = bool(
             extracted_meta and (
                 extracted_meta.is_catalog_query
@@ -930,7 +1082,15 @@ class RedisChunkRetriever:
                         if corrections:
                             c["keyword_corrections"] = corrections
                 if not keyword_chunks:
-                    raw_hits = await self._aexecute_knn_search(r, search_text or query, fetch_k, effective_filter)
+                    use_rare = self.RARE_TERMS_ENABLED and not effective_filter
+                    dense_vec = None
+                    if use_rare:
+                        loop = asyncio.get_running_loop()
+                        dense_vec = np.array(await loop.run_in_executor(None, self.embedder.embed_query, search_text or query),
+                                             dtype=np.float32).tobytes()
+                    raw_hits = await self._aexecute_knn_search(r, search_text or query, fetch_k, effective_filter, vec_bytes=dense_vec)
+                    if use_rare:
+                        rare_chunks = await self._arare_term_search(r, query, dense_vec)
 
                 if not raw_hits and effective_filter:
                     logger.info(
@@ -959,6 +1119,8 @@ class RedisChunkRetriever:
                 max_knee_drop=eff_knee,
                 max_k=top_k,
             )
+        if rare_chunks:
+            final_chunks = self._merge_rare(rare_chunks, final_chunks, top_k)
 
         for c in final_chunks:
             if extracted_meta and extracted_meta.has_filters:
