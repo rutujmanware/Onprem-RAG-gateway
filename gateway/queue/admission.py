@@ -100,6 +100,22 @@ class AdmissionController:
         self._total_timeouts = 0
         self._lock = asyncio.Lock()
 
+    async def _acquire_global_slot(self) -> None:
+        acquire_task = asyncio.create_task(self.global_sem.acquire())
+        try:
+            done, _ = await asyncio.wait((acquire_task,), timeout=self.queue_timeout)
+            if not done:
+                raise asyncio.TimeoutError
+            await acquire_task
+        except BaseException:
+            # A cancelled waiter may already have won the permit; settle it before returning.
+            if not acquire_task.done():
+                acquire_task.cancel()
+            result = (await asyncio.gather(acquire_task, return_exceptions=True))[0]
+            if not isinstance(result, BaseException):
+                self.global_sem.release()
+            raise
+
     async def acquire(self, user_id: str = "anonymous", cost: float = 1.0) -> None:
         """Acquire an active inference slot or queue if at capacity.
         
@@ -137,7 +153,7 @@ class AdmissionController:
         # 3. Wait in queue for available inference slot with timeout
         try:
             try:
-                await asyncio.wait_for(self.global_sem.acquire(), timeout=self.queue_timeout)
+                await self._acquire_global_slot()
             except asyncio.TimeoutError:
                 self._total_timeouts += 1
                 logger.warning(
@@ -150,13 +166,12 @@ class AdmissionController:
                     headers={"Retry-After": "3"}
                 )
         finally:
-            async with self._lock:
-                self._queued_count -= 1
+            # Keep permit ownership and queue accounting in one cancellation-free transition.
+            self._queued_count -= 1
 
         # 4. In-flight Execution
-        async with self._lock:
-            self._active_count += 1
-            self._total_admitted += 1
+        self._active_count += 1
+        self._total_admitted += 1
 
     def release(self) -> None:
         """Release the acquired inference slot."""
