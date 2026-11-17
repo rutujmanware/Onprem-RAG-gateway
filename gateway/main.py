@@ -432,6 +432,7 @@ async def chat_completions(
                 full_ans = []
                 collected_chunks = []
                 incomplete = False
+                model = "qwen2.5-3b-instruct-cpu" if decision.target_tier != ModelTier.GPU_LLM else "qwen2.5-7b-instruct-gpu"
                 for event in rag.answer_query_stream(
                     query,
                     max_new_tokens=req.max_tokens,
@@ -444,7 +445,7 @@ async def chat_completions(
                             "id": cmpl_id,
                             "object": "chat.completion.chunk",
                             "created": created_ts,
-                            "model": "qwen2.5-3b-instruct-cpu" if decision.target_tier != ModelTier.GPU_LLM else "qwen2.5-7b-instruct-gpu",
+                            "model": model,
                             "choices": [{
                                 "index": 0,
                                 "delta": {"content": delta_text},
@@ -454,13 +455,15 @@ async def chat_completions(
                         yield f"data: {json.dumps(chunk)}\n\n"
                     elif event.get("type") == "chunks":
                         collected_chunks = event.get("chunks", [])
+                    elif event.get("type") == "route":
+                        model = "qwen2.5-7b-instruct-gpu" if event.get("target_tier") == "gpu_vllm" else "qwen2.5-3b-instruct-cpu"
                     elif event.get("type") == "done":
                         incomplete = bool(event.get("incomplete"))
                         final_chunk = {
                             "id": cmpl_id,
                             "object": "chat.completion.chunk",
                             "created": created_ts,
-                            "model": "qwen2.5-3b-instruct-cpu" if decision.target_tier != ModelTier.GPU_LLM else "qwen2.5-7b-instruct-gpu",
+                            "model": model,
                             "choices": [{
                                 "index": 0,
                                 "delta": {},
@@ -494,6 +497,7 @@ async def chat_completions(
 
     # Cold non-streaming generation: guarded by admission slot
     async with admission.slot(client_id):
+        gpu_failed = False
         # Step 2: Route Enforcement for Hard Queries -> GPU LLM Tier (Qwen 2.5 7B)
         if decision.target_tier == ModelTier.GPU_LLM:
             gpu_max_tokens = req.max_tokens if (req.max_tokens is not None and req.max_tokens > 0) else 2048
@@ -519,41 +523,7 @@ async def chat_completions(
                 except Exception:
                     pass
 
-            # In-process GPU LLM fallback
-            try:
-                from pipeline.gpu_llm_runner import GPULLMEngine
-                engine = GPULLMEngine.get_instance()
-                gpu_res = engine.generate_chat(
-                    [{"role": m.role, "content": m.content} for m in req.messages],
-                    max_new_tokens=gpu_max_tokens,
-                    temperature=req.temperature or 0.2,
-                )
-                ans_text = gpu_res["text"]  # no retrieval: never cached (DEFECT-23)
-                return {
-                    "id": f"chatcmpl-hard-{uuid.uuid4().hex[:8]}",
-                    "object": "chat.completion",
-                    "model": "Qwen/Qwen2.5-7B-Instruct",
-                    "choices": [{
-                        "index": 0,
-                        "message": {"role": "assistant", "content": ans_text},
-                        "finish_reason": "stop",
-                    }],
-                    "usage": {
-                        "prompt_tokens": -1,
-                        "completion_tokens": gpu_res["num_tokens"],
-                        "total_tokens": gpu_res["num_tokens"],
-                    },
-                    "router_meta": {
-                        "score": round(score, 4),
-                        "tier": decision.target_tier.value,
-                        "route": "hard",
-                        "reason": decision.reason,
-                        "routing_time_seconds": round(time.time() - t0, 4),
-                    },
-                    "user": user.email,
-                }
-            except Exception as e:
-                raise HTTPException(status_code=500, detail=f"GPU LLM generation failed: {str(e)}")
+            gpu_failed = True
 
         # Step 3: Easy Queries -> CPU SLM Tier (Qwen 2.5 3B)
         slm_max_tokens = req.max_tokens if (req.max_tokens is not None and req.max_tokens > 0) else 160
@@ -567,7 +537,7 @@ async def chat_completions(
                 )
                 resp["router_meta"] = {
                     "score": round(score, 4),
-                    "tier": decision.target_tier.value,
+                    "tier": ModelTier.CPU_SLM.value,
                     "route": "easy",
                     "reason": decision.reason,
                     "routing_time_seconds": round(time.time() - t0, 4),
@@ -584,6 +554,8 @@ async def chat_completions(
             query,
             max_new_tokens=slm_max_tokens,
             temperature=req.temperature or 0.2,
+            **({"route_decision": {"route": "easy", "target_tier": "cpu_slm",
+                                   "probability_hard": score, "gpu_failed": True}} if gpu_failed else {}),
         )
         ans_text = rag_res.get("answer", "")
         retrieved_chunks = rag_res.get("chunks", [])
@@ -603,7 +575,7 @@ async def chat_completions(
             }],
             "router_meta": {
                 "score": round(score, 4),
-                "tier": decision.target_tier.value,
+                "tier": ModelTier.CPU_SLM.value,
                 "route": "easy",
                 "reason": decision.reason,
                 "chunks_retrieved": len(rag_res.get("chunks", [])),
@@ -894,12 +866,14 @@ async def query_endpoint(
                     pass
 
             rag = RAGQAPipeline(top_k=req.top_k)
-            res = rag.answer_query(
+            res = await run_in_threadpool(
+                rag.answer_query,
                 query,
                 top_k=req.top_k,
-                max_new_tokens=gpu_max_tokens,
+                max_new_tokens=req.max_tokens,
                 temperature=req.temperature or 0.2,
-                route_decision={"route": "hard", "target_tier": "gpu_vllm", "probability_hard": score},
+                route_decision={"route": "hard", "target_tier": "gpu_vllm", "probability_hard": score,
+                                "gpu_failed": True},
                 chunks=chunks,
             )
             if "chunks" in res:

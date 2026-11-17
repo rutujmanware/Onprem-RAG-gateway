@@ -163,6 +163,89 @@ def test_non_streaming_chat_completions_never_cache_ungrounded_answers(fakes, ti
     assert len(model.calls) == 2, "the second identical request must reach the model again (nothing cached)"
 
 
+@pytest.mark.parametrize("healthy", [False, True])
+def test_hard_chat_falls_back_to_cpu_when_gpu_fails(fakes, healthy):
+    cache, slm, vllm, route = fakes
+    route(ModelTier.GPU_LLM)
+
+    async def health():
+        return healthy
+
+    async def fail(*args, **kwargs):
+        raise RuntimeError("GPU unavailable")
+
+    vllm.check_health = health
+    vllm.generate_chat = fail
+    response = TestClient(gm.app).post(
+        "/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": "How is graphene synthesised?"}]},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["choices"][0]["message"]["content"] == ANS
+    assert response.json()["router_meta"]["tier"] == ModelTier.CPU_SLM.value
+    assert len(slm.calls) == 1
+    assert cache.stores == []
+
+
+def test_query_passes_failed_gpu_to_cpu_pipeline(fakes, monkeypatch):
+    import pipeline.retriever as retriever
+
+    cache, slm, vllm, route = fakes
+    route(ModelTier.GPU_LLM)
+
+    async def unavailable():
+        return False
+
+    class FakeRetriever:
+        async def asearch(self, *args, **kwargs):
+            return [{"title": "T", "text": "context"}]
+
+    calls = []
+
+    class FakePipeline:
+        def __init__(self, **kwargs):
+            pass
+
+        def answer_query(self, query, **kwargs):
+            calls.append(kwargs)
+            return {"answer": ANS, "route": "easy", "target_tier": "cpu_slm", "chunks": []}
+
+    vllm.check_health = unavailable
+    monkeypatch.setattr(retriever, "RedisChunkRetriever", FakeRetriever)
+    monkeypatch.setattr(gm, "RAGQAPipeline", FakePipeline)
+    response = TestClient(gm.app).post(
+        "/query", json={"query": "How is graphene synthesised?", "max_tokens": 120}
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["target_tier"] == "cpu_slm"
+    assert calls[0]["route_decision"]["gpu_failed"] is True
+    assert calls[0]["max_new_tokens"] == 120
+    assert cache.stores == []
+
+
+def test_streaming_chat_reports_actual_fallback_model(fakes, monkeypatch):
+    _, _, _, route = fakes
+    route(ModelTier.GPU_LLM)
+
+    class FakePipeline:
+        def answer_query_stream(self, *args, **kwargs):
+            yield {"type": "route", "route": "hard", "target_tier": "gpu_vllm"}
+            yield {"type": "route", "route": "easy", "target_tier": "cpu_slm"}
+            yield {"type": "token", "delta": ANS}
+            yield {"type": "done"}
+
+    monkeypatch.setattr(gm, "RAGQAPipeline", FakePipeline)
+    response = TestClient(gm.app).post(
+        "/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": "How is graphene synthesised?"}], "stream": True},
+    )
+    chunks = [json.loads(line[6:]) for line in response.text.splitlines()
+              if line.startswith("data: {")]
+    assert response.status_code == 200
+    assert len(chunks) == 2
+    assert all(chunk["model"] == "qwen2.5-3b-instruct-cpu" for chunk in chunks)
+
+
 def test_caller_supplied_system_message_cannot_poison_the_cache(fakes):
     cache, slm, vllm, route = fakes
     route(ModelTier.CPU_SLM)

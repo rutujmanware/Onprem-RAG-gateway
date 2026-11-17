@@ -335,7 +335,8 @@ class RAGQAPipeline:
 
         retrieval_duration = pre_duration
 
-        if is_hard:
+        gpu_failed = bool(route_decision.get("gpu_failed", False))
+        if is_hard and not gpu_failed:
 
             if not chunks:
                 refusal = "No specific institutional repository theses were found on this topic."
@@ -409,35 +410,7 @@ class RAGQAPipeline:
             except Exception:
                 pass
 
-            # Option B: Fallback to in-process GPU engine
-            t0_gen = time.time()
-            gen_result = self.gpu_engine.answer_rag(
-                question=query,
-                context_chunks=chunks,
-                max_new_tokens=tokens_to_gen,
-                temperature=temperature,
-            )
-            gen_duration = time.time() - t0_gen
-            total_duration = time.time() - t_start
-            ans_text = strip_mixed_refusal_text(gen_result["text"])
-            served_chunks = [] if is_no_relevant_docs_answer(ans_text) else sanitize_chunks(chunks)
-
-            return {
-                "query": query,
-                "answer": ans_text,
-                "route": "hard",
-                "target_tier": "gpu_vllm",
-                "probability_hard": prob,
-                "chunks": served_chunks,
-                "stats": {
-                    "retrieval_seconds": round(retrieval_duration, 3),
-                    "generation_seconds": round(gen_duration, 3),
-                    "total_seconds": round(total_duration, 3),
-                    "num_tokens": gen_result.get("num_tokens", 0),
-                    "tokens_per_second": gen_result.get("tokens_per_second", 0),
-                    "model": gen_result.get("model", "Qwen/Qwen2.5-7B-Instruct"),
-                },
-            }
+            gpu_failed = True
 
         easy_prob = prob
 
@@ -489,7 +462,7 @@ class RAGQAPipeline:
         backends.append(("gpu-daemon-port-8000 (cpu-slm-overflow)", "Qwen/Qwen2.5-7B-Instruct", gpu_overflow))
         slm_refusal = None
         for server, default_model, call in backends:
-            if server.startswith("gpu") and not self._gpu_daemon_healthy():
+            if server.startswith("gpu") and (gpu_failed or not self._gpu_daemon_healthy()):
                 continue
             try:
                 t0_gen = time.time()
@@ -499,7 +472,8 @@ class RAGQAPipeline:
                 logger.warning("%s could not answer (%s)", server, exc)
                 continue
             if (server.startswith("cpu") and is_no_relevant_docs_answer(ans_text)
-                    and should_escalate_refusal(query, chunks) and self._gpu_daemon_healthy()):
+                    and should_escalate_refusal(query, chunks) and not gpu_failed
+                    and self._gpu_daemon_healthy()):
                 # 3B refused although documents were retrieved: re-ask the 7B tier (see SLMRefused)
                 slm_refusal = (ans_text, tok_count, model, time.time() - t0_gen)
                 continue
@@ -687,6 +661,7 @@ class RAGQAPipeline:
                 done["incomplete"] = True
             yield done
 
+        gpu_failed = False
         if is_hard:
             yield {
                 "type": "route",
@@ -742,61 +717,22 @@ class RAGQAPipeline:
                 stream_via_http = False
 
             if stream_via_http:
-                yield from relay(
-                    _stream_chat_http(
-                        f"{gpu_server_url}/chat/completions",
-                        {"model": "Qwen/Qwen2.5-7B-Instruct", "messages": messages,
-                         "max_tokens": tokens_to_gen, "temperature": temperature},
-                        headers=_vllm_auth_headers(),
-                        timeout=90.0,
-                    ),
-                    model="Qwen/Qwen2.5-7B-Instruct",
-                    server="gpu-daemon-port-8000",
-                )
-                return
-
-            # Option B: Fallback to in-process streaming
-            t0_gen = time.time()
-            token_count = 0
-            full_response = []
-            ttft = None
-
-            for delta in strip_mixed_refusal(self.gpu_engine.generate_chat_stream(
-                messages,
-                max_new_tokens=tokens_to_gen,
-                temperature=temperature,
-            )):
-                if ttft is None:
-                    ttft = round(time.time() - t0_gen, 3)
-                token_count += 1
-                full_response.append(delta)
-                yield {
-                    "type": "token",
-                    "delta": delta,
-                }
-
-            gen_duration = time.time() - t0_gen
-            total_duration = time.time() - t_start
-            tok_per_sec = round(token_count / max(gen_duration, 0.001), 2)
-            full_ans = "".join(full_response)
-            if is_no_relevant_docs_answer(full_ans):
-                yield {"type": "chunks", "chunks": []}
-
-            yield {
-                "type": "done",
-                "full_answer": full_ans,
-                "chunks": [] if is_no_relevant_docs_answer(full_ans) else sanitize_chunks(chunks),
-                "stats": {
-                    "retrieval_seconds": round(retrieval_duration, 3),
-                    "generation_seconds": round(gen_duration, 3),
-                    "total_seconds": round(total_duration, 3),
-                    "ttft_seconds": ttft or 0.0,
-                    "num_tokens": token_count,
-                    "tokens_per_second": tok_per_sec,
-                    "model": "Qwen/Qwen2.5-7B-Instruct",
-                },
-            }
-            return
+                try:
+                    yield from relay(
+                        _stream_chat_http(
+                            f"{gpu_server_url}/chat/completions",
+                            {"model": "Qwen/Qwen2.5-7B-Instruct", "messages": messages,
+                             "max_tokens": tokens_to_gen, "temperature": temperature},
+                            headers=_vllm_auth_headers(),
+                            timeout=90.0,
+                        ),
+                        model="Qwen/Qwen2.5-7B-Instruct",
+                        server="gpu-daemon-port-8000",
+                    )
+                    return
+                except Exception as exc:
+                    logger.warning("GPU tier could not answer (%s); trying CPU", exc)
+            gpu_failed = True
 
         yield {
             "type": "route",
@@ -858,7 +794,7 @@ class RAGQAPipeline:
                     ),
                     model="qwen2.5-3b-instruct-q4_k_m.gguf",
                     server="cpu-daemon-port-8082",
-                    escalate_refusal=should_escalate_refusal(query, candidate_chunks or chunks),
+                    escalate_refusal=not gpu_failed and should_escalate_refusal(query, candidate_chunks or chunks),
                 )
                 return
             except SLMRefused as ref:
@@ -868,7 +804,7 @@ class RAGQAPipeline:
                 logger.warning("CPU SLM daemon could not answer (%s); trying GPU overflow", exc)
 
         # Option A2: GPU daemon when the CPU tier refused with documents, is busy, or is down.
-        if self._gpu_daemon_healthy():
+        if not gpu_failed and self._gpu_daemon_healthy():
             reason = "cpu_slm_refusal" if slm_refusal is not None else "cpu_slm_overflow"
             yield {"type": "route", "route": "hard", "target_tier": "gpu_vllm",
                    "probability_hard": route_decision.get("probability_hard", 0.0), "escalation": reason}
