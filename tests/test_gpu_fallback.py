@@ -190,10 +190,12 @@ def test_streaming_gpu_down_and_cpu_daemon_down_uses_inprocess_3b(net):
 
 
 # ------------------------------------------------------------------- route level: /v1/chat/completions
-def test_chat_completions_hard_route_with_gpu_down_returns_200_from_cpu(monkeypatch):
+def test_chat_completions_hard_route_with_gpu_down_returns_200_from_cpu(net, monkeypatch):
+    """The non-streaming route answers through the pipeline (DEFECT-41): with the GPU down a hard question is
+    answered by the CPU tier and the response reports the fallback."""
     import gateway.main as gm
     from gateway.dependencies import (get_admission_controller, get_complexity_scorer, get_dispatcher,
-                                      get_semantic_cache, get_slm_client, get_vllm_client)
+                                      get_semantic_cache)
     from gateway.router.dispatcher import ModelTier, RouteDecision
 
     class Cache:
@@ -202,20 +204,6 @@ def test_chat_completions_hard_route_with_gpu_down_returns_200_from_cpu(monkeypa
 
         async def astore(self, *a, **k):
             return False
-
-    class Down:
-        async def check_health(self):
-            return False
-
-    class SLM:
-        calls = 0
-
-        async def check_health(self):
-            return True
-
-        async def generate_chat(self, messages, **k):
-            SLM.calls += 1
-            return {"choices": [{"index": 0, "message": {"role": "assistant", "content": "CPU answer"}}]}
 
     class Scorer:
         async def score(self, q):
@@ -230,16 +218,17 @@ def test_chat_completions_hard_route_with_gpu_down_returns_200_from_cpu(monkeypa
         async def slot(self, *a, **k):
             yield
 
-    def boom():
-        raise AssertionError("the in-process 7B engine must not be loaded")
+    class Retr:
+        def search(self, *a, **k):
+            return list(CHUNKS)
 
-    monkeypatch.delenv("GPU_INPROCESS_FALLBACK", raising=False)
-    import pipeline.gpu_llm_runner as glr
-    monkeypatch.setattr(glr.GPULLMEngine, "get_instance", staticmethod(boom))
+    net["slm_up"] = True
+    monkeypatch.setattr(gm, "RAGQAPipeline", lambda *a, **k: RAGQAPipeline(retriever=Retr(), router=object(),
+                                                                          slm_engine=FakeSLM(), gpu_engine=FailIfUsedGPU()))
     over = gm.app.dependency_overrides
     saved = dict(over)
-    over.update({get_semantic_cache: Cache, get_vllm_client: Down, get_slm_client: SLM,
-                 get_complexity_scorer: Scorer, get_dispatcher: Disp, get_admission_controller: Adm})
+    over.update({get_semantic_cache: Cache, get_complexity_scorer: Scorer, get_dispatcher: Disp,
+                 get_admission_controller: Adm})
     try:
         r = TestClient(gm.app).post("/v1/chat/completions", json={"messages": [{"role": "user", "content": Q}]})
     finally:
@@ -248,8 +237,7 @@ def test_chat_completions_hard_route_with_gpu_down_returns_200_from_cpu(monkeypa
     assert r.status_code == 200, r.text
     meta = r.json()["router_meta"]
     assert meta["route"] == "hard" and meta["tier"] == "cpu_slm" and meta["fallback"] == "gpu_unavailable"
-    assert SLM.calls == 1
-
+    assert net["slm_calls"] >= 1
 
 # ------------------------------------------- 3B refuses on-topic documents while the 7B is unavailable
 RETRY_ANSWER = "From the next passages: attention aggregation lowers the error."

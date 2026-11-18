@@ -95,8 +95,23 @@ def test_harmless_multi_turn_conversation_still_works(client):
     msgs = [{"role": "system", "content": "You are a helpful assistant for IISc theses."},
             {"role": "user", "content": "What is graphene?"}, {"role": "assistant", "content": "A carbon allotrope."},
             {"role": "user", "content": INNOCUOUS}]
-    r = post(client, msgs)
-    assert r.status_code == 200 and len(Model.calls) == 1
+    import gateway.main as gm2
+    seen = []
+
+    class Pipe:
+        def __init__(self, *a, **k):
+            pass
+
+        def answer_query(self, query, **k):
+            seen.append(query)
+            return {"answer": "answer", "chunks": [], "stats": {}}
+    gm2_orig = gm2.RAGQAPipeline
+    gm2.RAGQAPipeline = Pipe
+    try:
+        r = post(client, msgs)
+    finally:
+        gm2.RAGQAPipeline = gm2_orig
+    assert r.status_code == 200 and seen == [INNOCUOUS], "answered through the grounded pipeline (DEFECT-41)"
 
 
 def test_injection_in_a_system_message_is_still_caught_by_the_patterns(client):

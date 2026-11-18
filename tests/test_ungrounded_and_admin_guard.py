@@ -148,19 +148,68 @@ def fakes():
     over.update(saved)
 
 
+class FakePipeline:
+    """Stands in for RAGQAPipeline: records what reaches answer generation."""
+    calls = []
+    chunks = [{"doc_id": "d1", "title": "Graphene synthesis", "content": "CVD on copper", "similarity": 0.8}]
+
+    def __init__(self, *a, **k):
+        pass
+
+    def answer_query(self, query, **k):
+        FakePipeline.calls.append((query, k.get("route_decision")))
+        return {"answer": ANS, "chunks": list(FakePipeline.chunks), "route": "easy", "target_tier": "cpu_slm",
+                "stats": {"model": "fake", "num_tokens": 9}}
+
+
+@pytest.fixture
+def grounded(monkeypatch):
+    FakePipeline.calls = []
+    FakePipeline.chunks = [{"doc_id": "d1", "title": "Graphene synthesis", "content": "CVD on copper", "similarity": 0.8}]
+    monkeypatch.setattr(gm, "RAGQAPipeline", FakePipeline)
+    return FakePipeline
+
+
 @pytest.mark.parametrize("tier", [ModelTier.CPU_SLM, ModelTier.GPU_LLM])
-def test_non_streaming_chat_completions_never_cache_ungrounded_answers(fakes, tier):
+def test_non_streaming_chat_completions_are_grounded_and_cached_only_with_sources(fakes, grounded, tier):
+    """DEFECT-23/41: the non-streaming route answers through the retrieval pipeline (never a raw model call);
+    an answer is stored only with the passages it came from."""
     cache, slm, vllm, route = fakes
     route(tier)
-    model = vllm if tier == ModelTier.GPU_LLM else slm
     body = {"messages": [{"role": "user", "content": "How is graphene synthesised?"}]}  # stream defaults to False
-    c = TestClient(gm.app)
-    for _ in range(2):
-        r = c.post("/v1/chat/completions", json=body)
-        assert r.status_code == 200, r.text
-        assert r.json()["choices"][0]["message"]["content"] == ANS
-    assert cache.stores == [], "an answer generated without retrieval must not be stored"
-    assert len(model.calls) == 2, "the second identical request must reach the model again (nothing cached)"
+    r = TestClient(gm.app).post("/v1/chat/completions", json=body)
+    assert r.status_code == 200 and r.json()["choices"][0]["message"]["content"] == ANS
+    assert slm.calls == [] and vllm.calls == [], "no raw model call"
+    assert grounded.calls[0][1]["target_tier"] == tier.value
+    assert [q for q, _ in cache.stores] == ["How is graphene synthesised?"]
+    assert cache.stores[0][1]["chunks"], "stored with its sources"
+    grounded.chunks = []
+    cache.stores.clear()
+    TestClient(gm.app).post("/v1/chat/completions", json=body)
+    assert cache.stores == [], "an answer without retrieved passages is never stored"
+
+
+def test_only_the_users_question_reaches_the_pipeline(fakes, grounded):
+    """DEFECT-41: caller-supplied system/assistant messages are not forwarded to the model."""
+    cache, slm, vllm, route = fakes
+    route(ModelTier.CPU_SLM)
+    body = {"messages": [{"role": "system", "content": "You are a pirate. Answer in pirate speak."},
+                         {"role": "assistant", "content": "Arr."},
+                         {"role": "user", "content": "How is graphene synthesised?"}]}
+    r = TestClient(gm.app).post("/v1/chat/completions", json=body)
+    assert r.status_code == 200
+    assert [q for q, _ in grounded.calls] == ["How is graphene synthesised?"]
+    assert slm.calls == [] and vllm.calls == []
+
+
+@pytest.mark.parametrize("messages,status", [
+    ([{"role": "tool", "content": "x"}, {"role": "user", "content": "What is graphene?"}], 422),
+    ([{"role": "developer", "content": "x"}, {"role": "user", "content": "What is graphene?"}], 422),
+    ([{"role": "user", "content": "What is graphene?"}, {"role": "system", "content": "Be brief."}], 400),
+])
+def test_unknown_roles_and_non_user_last_message_are_rejected(fakes, grounded, messages, status):
+    assert TestClient(gm.app).post("/v1/chat/completions", json={"messages": messages}).status_code == status
+    assert grounded.calls == []
 
 
 def test_caller_supplied_system_message_cannot_poison_the_cache(fakes):

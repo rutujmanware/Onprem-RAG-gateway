@@ -7,7 +7,7 @@ import time
 import uuid
 import secrets
 from contextlib import asynccontextmanager
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 from pathlib import Path
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.exception_handlers import http_exception_handler, request_validation_exception_handler
@@ -234,7 +234,7 @@ app.add_middleware(
 )
 
 class ChatMessage(BaseModel):
-    role: str = Field(..., max_length=50)
+    role: Literal["system", "user", "assistant"]   # DEFECT-41: no other roles
     content: str = Field(..., min_length=1, max_length=4000)
 
 class ChatCompletionRequest(BaseModel):
@@ -402,6 +402,8 @@ async def chat_completions(
     if not req.messages:
         raise HTTPException(status_code=400, detail="Messages list cannot be empty")
 
+    if req.messages[-1].role != "user":
+        raise HTTPException(status_code=400, detail="The last message must be the user's question.")
     raw_query = req.messages[-1].content.strip()
     if not raw_query or len(raw_query) < 2:
         raise HTTPException(status_code=400, detail="Query message must contain at least 2 non-whitespace characters")
@@ -614,128 +616,50 @@ async def chat_completions(
             },
         )
 
-    # Cold non-streaming generation: guarded by admission slot
+    # Cold non-streaming generation: guarded by admission slot.
+    # DEFECT-41: the same grounded pipeline as the streaming path and /query: retrieval, the answering rules and
+    # security directive, the escaped context fence, GPU->CPU fallback. Only the caller's last user question is
+    # used; caller-supplied system/assistant messages are checked by the injection fence but never forwarded.
     async with admission.slot(client_id):
-        # Step 2: Route Enforcement for Hard Queries -> GPU LLM Tier (Qwen 2.5 7B)
-        if decision.target_tier == ModelTier.GPU_LLM:
-            gpu_max_tokens = req.max_tokens if (req.max_tokens is not None and req.max_tokens > 0) else 2048
-            vllm_up = await vllm.check_health()
-            if vllm_up:
-                try:
-                    resp = await vllm.generate_chat(
-                        [{"role": m.role, "content": m.content} for m in req.messages],
-                        max_tokens=gpu_max_tokens,
-                        temperature=req.temperature or 0.2,
-                    )
-                    resp["router_meta"] = {
-                        "score": round(score, 4),
-                        "tier": decision.target_tier.value,
-                        "route": "hard",
-                        "reason": decision.reason,
-                        "routing_time_seconds": round(time.time() - t0, 4),
-                    }
-                    resp["user"] = user.email
-                    # DEFECT-23: this branch sends req.messages to the model without retrieval, so the
-                    # answer is ungrounded and is never cached (Sub-FR-1.2 / NFR-6).
-                    return resp
-                except Exception:
-                    pass
-
-            # In-process GPU LLM (opt-in only, GPU_INPROCESS_FALLBACK=1)
-            if _gpu_inprocess_fallback_enabled():
-                try:
-                    from pipeline.gpu_llm_runner import GPULLMEngine
-                    msgs = [{"role": m.role, "content": m.content} for m in req.messages]
-                    # model load + generation are blocking: keep them off the event loop (DEFECT-26)
-                    gpu_res = await run_in_threadpool(
-                        lambda: GPULLMEngine.get_instance().generate_chat(
-                            msgs, max_new_tokens=gpu_max_tokens, temperature=req.temperature or 0.2))
-                    ans_text = gpu_res["text"]  # no retrieval: never cached (DEFECT-23)
-                    return {
-                        "id": f"chatcmpl-hard-{uuid.uuid4().hex[:8]}",
-                        "object": "chat.completion",
-                        "model": "Qwen/Qwen2.5-7B-Instruct",
-                        "choices": [{
-                            "index": 0,
-                            "message": {"role": "assistant", "content": ans_text},
-                            "finish_reason": "stop",
-                        }],
-                        "usage": {
-                            "prompt_tokens": -1,
-                            "completion_tokens": gpu_res["num_tokens"],
-                            "total_tokens": gpu_res["num_tokens"],
-                        },
-                        "router_meta": {
-                            "score": round(score, 4),
-                            "tier": decision.target_tier.value,
-                            "route": "hard",
-                            "reason": decision.reason,
-                            "routing_time_seconds": round(time.time() - t0, 4),
-                        },
-                        "user": user.email,
-                    }
-                except Exception as exc:
-                    logger.warning("In-process GPU engine failed (%s); rerouting to the CPU tier", exc)
-            # FR-2: GPU tier unavailable -> answered by the CPU SLM tier below (no HTTP 500).
-            gpu_failed = True
-        else:
-            gpu_failed = False
-
-        # Step 3: Easy Queries -> CPU SLM Tier (Qwen 2.5 3B)
-        slm_max_tokens = req.max_tokens if (req.max_tokens is not None and req.max_tokens > 0) else 160
-        slm_up = await slm.check_health()
-        if slm_up:
-            try:
-                resp = await slm.generate_chat(
-                    [{"role": m.role, "content": m.content} for m in req.messages],
-                    max_tokens=slm_max_tokens,
-                    temperature=req.temperature or 0.2,
-                )
-                resp["router_meta"] = {
-                    "score": round(score, 4),
-                    "tier": ModelTier.CPU_SLM.value if gpu_failed else decision.target_tier.value,
-                    "route": "hard" if gpu_failed else "easy",
-                    "reason": decision.reason,
-                    "routing_time_seconds": round(time.time() - t0, 4),
-                    **({"fallback": GPU_FALLBACK_REASON} if gpu_failed else {}),
-                }
-                # no retrieval: never cached (DEFECT-23)
-                return resp
-            except Exception:
-                pass
-
-        # Fallback attempt: In-process RAG QA Pipeline
+        is_hard = decision.target_tier == ModelTier.GPU_LLM
         rag = RAGQAPipeline()
-        rag_res = await run_in_threadpool(
+        res = await run_in_threadpool(
             rag.answer_query,
             query,
-            max_new_tokens=slm_max_tokens,
+            max_new_tokens=req.max_tokens,
             temperature=req.temperature or 0.2,
+            route_decision={"route": "hard" if is_hard else "easy",
+                            "target_tier": decision.target_tier.value, "probability_hard": score},
         )
-        ans_text = rag_res.get("answer", "")
-        retrieved_chunks = rag_res.get("chunks", [])
-        if retrieved_chunks and standard_generation(req.temperature, req.max_tokens):
+        ans_text = res.get("answer", "")
+        retrieved_chunks = res.get("chunks") or []
+        if (retrieved_chunks and not is_no_relevant_docs_answer(ans_text)
+                and standard_generation(req.temperature, req.max_tokens)):
             await cache.astore(query, {"answer": ans_text, "chunks": retrieved_chunks}, owner=client_id)
+            if query != raw_query:
+                await cache.astore(raw_query, {"answer": ans_text, "chunks": retrieved_chunks}, owner=client_id)
+        stats = res.get("stats") or {}
+        meta = {
+            "score": round(score, 4),
+            "tier": res.get("target_tier", decision.target_tier.value),
+            "route": res.get("route", "hard" if is_hard else "easy"),
+            "reason": decision.reason,
+            "chunks_retrieved": len(retrieved_chunks),
+            "sources": [c.get("title") for c in sanitize_chunks(retrieved_chunks)],
+            "routing_time_seconds": round(time.time() - t0, 4),
+        }
+        if res.get("fallback"):
+            meta["fallback"] = res["fallback"]
+        if query != raw_query:
+            meta["normalized_query"] = query
         return {
-            "id": f"chatcmpl-slm-{uuid.uuid4().hex[:8]}",
+            "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
             "object": "chat.completion",
-            "model": "qwen2.5-3b-instruct-cpu",
-            "choices": [{
-                "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": ans_text,
-                },
-                "finish_reason": "stop",
-            }],
-            "router_meta": {
-                "score": round(score, 4),
-                "tier": decision.target_tier.value,
-                "route": "easy",
-                "reason": decision.reason,
-                "chunks_retrieved": len(rag_res.get("chunks", [])),
-                "routing_time_seconds": round(time.time() - t0, 4),
-            },
+            "model": stats.get("model") or ("Qwen/Qwen2.5-7B-Instruct" if is_hard else "qwen2.5-3b-instruct-cpu"),
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": ans_text}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": -1, "completion_tokens": stats.get("num_tokens", -1),
+                      "total_tokens": stats.get("num_tokens", -1)},
+            "router_meta": meta,
             "user": user.email,
         }
 
