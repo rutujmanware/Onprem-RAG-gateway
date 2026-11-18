@@ -1408,6 +1408,7 @@ tests/test_constant_time_and_cookie_security.py::test_secrets_compare_digest_tim
   - No admin role for sessions: nothing in the web UI needs these routes, and administrators run them on the server (`make cache-stats`, `make cache-clear`, `make queue-stats`) or with the admin key. The unused `ADMIN_ROLES` setting, which suggested a role check that never existed, was removed from `.env.example` (also reported by the red team as an unused role check).
   - A validation-error handler runs the route's guard first: a caller the guard would reject gets the same 404 whether the body is valid or not.
   - The same for a wrong HTTP method (e.g. `POST /cache/stats` answered 405, revealing the route): an unauthorised caller gets 404; loopback still gets the real 405.
+  - Red-team re-report (FR-4, 405/422 on `/query`, `/v1/chat/completions`, `/cache/purge`): verified live 2026-11-18 from an external unauthenticated client: wrong methods, malformed bodies and valid bodies on every hidden route all return 404, the same as a non-existent path; regression test covers `/query` and `/v1/chat/completions` wrong methods too.
 - **Tests:** [`tests/test_ungrounded_and_admin_guard.py`](tests/test_ungrounded_and_admin_guard.py): a session gets 404 on every admin route and nothing is cleared or purged; loopback and the admin key still work; malformed or empty bodies get 404 from an unauthorised caller and 422 from loopback. Live probe on the running gateway confirms the same.
 
 ## DEFECT-25: GPU Tier Unavailable → HTTP 500 Instead of Rerouting to the CPU Tier (FR-2)
@@ -1550,6 +1551,13 @@ tests/test_constant_time_and_cookie_security.py::test_secrets_compare_digest_tim
 - **Fix** ([`pipeline/sanitizer.py`](pipeline/sanitizer.py), used by both model prompts): `escape_context_text` HTML-escapes `&`, `<`, `>` in document text and titles (covers every tag and chat-template token in any spelling; the model reads `&lt;`/`&gt;` as `<`/`>`), turns `[INST]`/`[/INST]`/`[SYS]` markers into `(INST)` etc., and removes the heading marker from lines starting with `##`. The fence tags themselves are added after escaping, so each appears exactly once.
 - **Tests:** [`tests/test_context_escaping.py`](tests/test_context_escaping.py): no marker survives escaping; with a hostile document both prompts (3B and 7B) contain exactly one context fence, one document and one question heading, and the text stays readable; ordinary scientific text (`x < 5`, `R&D`, `[1]`) only gets standard entities. `tests/test_injection_fence.py` updated for the new escaping.
 - **Live (2026-11-18, production):** answers to frozen evaluation questions whose passages contain `<`, `>` or `&` show no escape artifacts; the two of them that are refused are refused identically with the old escaping (weak best matches 0.48 and 0.35).
+
+## DEFECT-38: Mail-Server Errors Were Shown to Unauthenticated Callers
+
+- **Symptom:** with the SMTP relay unreachable, `POST /auth/otp/request` answered HTTP 503 with the raw exception, e.g. "Could not send email: ConnectionRefusedError: [Errno 111] Connection refused".
+- **Fix** ([`gateway/main.py`](gateway/main.py), [`askiisc_chat/askiisc/app.py`](askiisc_chat/askiisc/app.py)): the response says "We could not send the sign-in code right now. Please try again in a few minutes."; the exception is logged server-side only (`otp mail failed: …`). The other client-facing errors in both apps were checked: they return fixed messages (rate limits, injection alert), not exception text.
+- **Tests:** [`tests/test_mail_error_disclosure.py`](tests/test_mail_error_disclosure.py): generic body, no exception class or errno, details still in the log; the standalone app no longer echoes the exception.
+- **Live (2026-11-18):** temporary gateway with SMTP pointed at a closed port → 503 with the generic message; details in the server log.
 
 ## Remediation Complete
 All security vulnerabilities, cache qualification defects, frontend/backend break vectors, and redundant code have been fully resolved, hardened, and verified with passing regression tests. All changes are cleanly staged. Per instructions, `git commit` has not been run.

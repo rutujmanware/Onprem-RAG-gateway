@@ -1211,7 +1211,8 @@ if STATIC_DIR.exists():
         except auth.MailError as e:
             auth.otp_store.revoke(email, code.challenge)
             logger.error("otp mail failed: %s", e)
-            return JSONResponse({"error": f"Could not send email: {e}"}, status_code=503)
+            # DEFECT-38: details (exception, errno) stay in the server log
+            return JSONResponse({"error": "We could not send the sign-in code right now. Please try again in a few minutes."}, status_code=503)
 
         # DEFECT-35: the code is bound to this browser (signed session); guesses from elsewhere cannot burn it
         request.session["otp_challenge"] = {"email": email, "c": code.challenge}

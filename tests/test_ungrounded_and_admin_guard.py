@@ -259,3 +259,11 @@ def test_unknown_path_still_404_and_normal_http_errors_unchanged(fakes):
     c = TestClient(gm.app)
     assert c.get("/no-such-route", headers=EXTERNAL).status_code == 404
     assert c.post("/healthz", headers=EXTERNAL).status_code == 405   # public route: wrong method stays 405
+
+
+@pytest.mark.parametrize("method,path", [("GET", "/query"), ("PUT", "/query"), ("DELETE", "/v1/chat/completions"),
+                                         ("GET", "/v1/chat/completions")])
+def test_wrong_method_on_question_routes_does_not_reveal_them(fakes, method, path):
+    """FR-4 (red-team report): a wrong method answered 405 to unauthenticated outsiders, revealing the route."""
+    assert TestClient(gm.app).request(method, path, headers=EXTERNAL).status_code == 404
+    assert TestClient(gm.app).request(method, path).status_code == 405        # loopback: the real answer

@@ -69,7 +69,7 @@ async def otp_request(body: OtpReq, request: Request):
     try: await asyncio.to_thread(auth.send_mail, email, "Your AskIISc sign-in code", auth.otp_mail_body(code))
     except auth.MailError as e:
         auth.otp_store.revoke(email, code.challenge); log.error("otp mail failed: %s", e)
-        return JSONResponse({"error": f"Could not send email: {e}"}, status_code=503)
+        return JSONResponse({"error": "We could not send the sign-in code right now. Please try again in a few minutes."}, status_code=503)   # details only in the log (DEFECT-38)
     request.session["otp_challenge"] = {"email": email, "c": code.challenge}   # DEFECT-35: bound to this browser
     is_resend = request.url.path.endswith("/resend")
     prefix = "A new 6-digit verification code" if is_resend else "A 6-digit verification code"
