@@ -79,6 +79,31 @@ def sanitize_chunk(chunk: Dict[str, Any]) -> Dict[str, Any]:
     return res
 
 
+# DEFECT-28: a retrieval outage (Redis down, timing out or still loading its snapshot, or the thesis index
+# missing) is reported to the client as HTTP 503 with this message; the details stay in the server log.
+RETRIEVAL_UNAVAILABLE_MESSAGE = ("The thesis search service is temporarily unavailable. "
+                                 "Please try again in a minute.")
+RETRIEVAL_RETRY_AFTER_SECONDS = 30
+
+
+class RetrievalUnavailable(RuntimeError):
+    """Retrieval could not run because of an infrastructure outage (see is_retrieval_outage)."""
+
+
+def is_retrieval_outage(exc: BaseException) -> bool:
+    try:
+        import redis.exceptions as rx
+    except ImportError:  # pragma: no cover
+        rx = None
+    if rx is not None:
+        if isinstance(exc, (rx.ConnectionError, rx.TimeoutError)):  # includes BusyLoadingError (LOADING)
+            return True
+        if isinstance(exc, rx.ResponseError):
+            msg = str(exc).lower()
+            return "no such index" in msg or "unknown index" in msg or "loading" in msg
+    return isinstance(exc, (ConnectionError, TimeoutError))
+
+
 def sanitize_chunks(chunks: List[Any]) -> List[Dict[str, Any]]:
     """Sanitize a list of chunks for response by keeping only unique document titles."""
     if not isinstance(chunks, list):

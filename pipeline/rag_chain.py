@@ -26,7 +26,8 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from pipeline.retriever import RedisChunkRetriever, retrieve_chunks, sanitize_chunks
+from pipeline.retriever import (RETRIEVAL_UNAVAILABLE_MESSAGE, RedisChunkRetriever, RetrievalUnavailable,
+                                is_retrieval_outage, retrieve_chunks, sanitize_chunks)
 from pipeline.sanitizer import (is_no_relevant_docs_answer, starts_with_refusal, strip_mixed_refusal,
                                 strip_mixed_refusal_text)
 from pipeline.slm_runner import CPUSLMEngine
@@ -335,10 +336,12 @@ class RAGQAPipeline:
             prob = route_decision.get("probability_hard", 1.0 if is_hard else 0.0)
 
             if retrieval_error:
-                hint = " Please ensure Redis is running." if ("connection" in str(retrieval_error).lower() or "loading" in str(retrieval_error).lower()) else ""
+                logger.warning("Retrieval failed: %r", retrieval_error, exc_info=retrieval_error)
+                if is_retrieval_outage(retrieval_error):
+                    raise RetrievalUnavailable(RETRIEVAL_UNAVAILABLE_MESSAGE) from retrieval_error
                 return {
                     "query": query,
-                    "answer": f"Retrieval failed: {type(retrieval_error).__name__} ({str(retrieval_error)}).{hint}",
+                    "answer": "Retrieval failed. Please try again.",
                     "route": "hard" if is_hard else "easy",
                     "target_tier": "gpu_vllm" if is_hard else "cpu_slm",
                     "probability_hard": prob,
@@ -680,6 +683,14 @@ class RAGQAPipeline:
             pre_duration = time.time() - t0_pre
             is_hard = route_decision.get("route") == "hard"
             prob = route_decision.get("probability_hard", 1.0 if is_hard else 0.0)
+
+            if retrieval_error is not None:
+                # DEFECT-28: report the outage instead of a misleading "no theses found"
+                logger.warning("Retrieval failed: %r", retrieval_error, exc_info=retrieval_error)
+                outage = is_retrieval_outage(retrieval_error)
+                yield {"type": "error", "status": 503 if outage else 500,
+                       "error": RETRIEVAL_UNAVAILABLE_MESSAGE if outage else "Retrieval failed. Please try again."}
+                return
 
             # In-memory dynamic document slicing
             if chunks is None:

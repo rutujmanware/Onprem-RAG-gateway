@@ -40,7 +40,8 @@ from gateway.router.dispatcher import ModelTier, RequestDispatcher
 from gateway.clients.cpu_slm_client import CPUSLMClient
 from gateway.clients.vllm_client import VLLMClient
 from pipeline.rag_chain import GPU_FALLBACK_REASON, RAGQAPipeline, _gpu_inprocess_fallback_enabled
-from pipeline.retriever import sanitize_chunks
+from pipeline.retriever import (RETRIEVAL_RETRY_AFTER_SECONDS, RETRIEVAL_UNAVAILABLE_MESSAGE, RetrievalUnavailable,
+                                is_retrieval_outage, sanitize_chunks)
 from pipeline.sanitizer import sanitize_and_fence_prompt, PromptInjectionAlert, is_no_relevant_docs_answer
 
 logger = logging.getLogger("gateway.main")
@@ -243,6 +244,30 @@ async def hide_guarded_routes_on_bad_body(request: Request, exc: RequestValidati
         except HTTPException as e:
             return JSONResponse({"detail": e.detail}, status_code=e.status_code)
     return await request_validation_exception_handler(request, exc)
+
+
+def _retrieval_unavailable_response() -> JSONResponse:
+    return JSONResponse({"detail": RETRIEVAL_UNAVAILABLE_MESSAGE}, status_code=503,
+                        headers={"Retry-After": str(RETRIEVAL_RETRY_AFTER_SECONDS)})
+
+
+@app.exception_handler(RetrievalUnavailable)
+async def retrieval_unavailable_handler(request: Request, exc: RetrievalUnavailable):
+    """DEFECT-28: Redis down / loading or the thesis index missing -> HTTP 503 (details in the log)."""
+    return _retrieval_unavailable_response()
+
+
+try:
+    import redis.exceptions as _redis_exc
+
+    @app.exception_handler(_redis_exc.ConnectionError)
+    @app.exception_handler(_redis_exc.TimeoutError)
+    async def redis_unavailable_handler(request: Request, exc: Exception):
+        """Safety net for any other Redis call on a request path (includes BusyLoadingError)."""
+        logger.warning("Redis unavailable on %s: %r", request.url.path, exc, exc_info=exc)
+        return _retrieval_unavailable_response()
+except ImportError:  # pragma: no cover
+    pass
 
 
 @app.get("/healthz", include_in_schema=False)
@@ -452,6 +477,12 @@ async def chat_completions(
                             }],
                         }
                         yield f"data: {json.dumps(chunk)}\n\n"
+                    elif event.get("type") == "error":  # e.g. retrieval outage (DEFECT-28)
+                        err = {"error": {"message": event.get("error"), "type": "service_unavailable",
+                                         "code": event.get("status", 503)}}
+                        yield f"data: {json.dumps(err)}\n\n"
+                        incomplete = True
+                        break
                     elif event.get("type") == "chunks":
                         collected_chunks = event.get("chunks", [])
                     elif event.get("type") == "done":
@@ -823,7 +854,14 @@ async def query_endpoint(
         score_task = asyncio.create_task(scorer.score(query))
         retrieval_task = asyncio.create_task(retriever.asearch(query, top_k=req.top_k))
 
-        score, candidate_chunks = await asyncio.gather(score_task, retrieval_task)
+        try:
+            score, candidate_chunks = await asyncio.gather(score_task, retrieval_task)
+        except Exception as exc:
+            if not is_retrieval_outage(exc):
+                raise
+            score_task.cancel()
+            logger.warning("Retrieval unavailable: %r", exc, exc_info=exc)
+            raise RetrievalUnavailable(RETRIEVAL_UNAVAILABLE_MESSAGE) from exc
         pre_duration = round(time.time() - t0_pre, 3)
 
         decision = dispatcher.decide(score, query=query)

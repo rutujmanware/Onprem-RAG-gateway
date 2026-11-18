@@ -1441,5 +1441,16 @@ tests/test_constant_time_and_cookie_security.py::test_secrets_compare_digest_tim
 - **Live (2026-11-18, production, 6 workers):** 8 simultaneous fresh requests from one user → 6 × HTTP 200, 2 × HTTP 429 after 0.1 s; another user's request → HTTP 200.
 - **Not changed:** the fair-queue scheduler (`gateway/queue/fair_queue.py`) is still not used by the admission path; with the per-user cap a single user can hold at most 6 of the 30 slots.
 
+## DEFECT-28: Retrieval Outage Returned an Unexplained HTTP 500
+
+- **Symptom:** with Redis unreachable or the thesis index missing, `/query` returned "Internal Server Error" (HTTP 500) with no message, also for questions that had been cached (the cache lives in the same Redis). In streaming mode the same outage produced a misleading "No specific institutional repository theses were found" answer, and the pipeline's non-streaming path returned the raw Redis error text (host and port) as the answer.
+- **Root cause:** the `FT.SEARCH` errors from the retrieval step were not handled in the `/query` handler; the streaming pipeline recorded the retrieval error but then continued with zero chunks.
+- **Fix:**
+  - [`pipeline/retriever.py`](pipeline/retriever.py): `is_retrieval_outage()` recognises Redis connection errors, timeouts, `LOADING` and a missing index; `RetrievalUnavailable` carries one user-facing message.
+  - [`gateway/main.py`](gateway/main.py): such errors become **HTTP 503** with `Retry-After: 30` and "The thesis search service is temporarily unavailable. Please try again in a minute."; the stack trace is logged. A safety-net handler does the same for a Redis connection error on any other request path. Other (unexpected) errors are not disguised as outages.
+  - [`pipeline/rag_chain.py`](pipeline/rag_chain.py): the streaming path sends an `error` event (shown in the chat UI) instead of the refusal; the non-streaming path raises `RetrievalUnavailable` instead of returning internal error text. `/v1/chat/completions` streaming relays it as an OpenAI-style error chunk.
+- **Tests:** [`tests/test_retrieval_outage.py`](tests/test_retrieval_outage.py) (19, no services needed): classification of outage vs. other errors; `/query` returns 503 + `Retry-After` with no internals for connection refused, `LOADING`, timeout and missing index; an unexpected bug still returns 500; streaming yields the error event and no refusal text.
+- **Live (2026-11-18, one-worker gateway):** Redis unreachable → HTTP 503 in 0.07 s, `Retry-After: 30`, streaming error event, `/health` 200; Redis up without the thesis index (empty throwaway instance) → the same, 0.08 s. The gateway reconnects on its own when Redis is back.
+
 ## Remediation Complete
 All security vulnerabilities, cache qualification defects, frontend/backend break vectors, and redundant code have been fully resolved, hardened, and verified with passing regression tests. All changes are cleanly staged. Per instructions, `git commit` has not been run.
