@@ -76,6 +76,7 @@ Individually rate-limiting, retrying, or caching at the application layer is ad 
   * *Measured 2026-11-18 (production, 6 workers):* 8 simultaneous fresh requests from one user → 6 × HTTP 200, 2 × HTTP 429 within 0.1 s; another user's request right after → HTTP 200.
 * **FR-6 (Must): Adversarial Defense & Prompt Injection Fencing**
   * The gateway shall inspect incoming queries against known adversarial jailbreak patterns (DAN, system role overrides, delimiter breakout attempts) and escape XML tags in retrieved context before feeding generation prompts, rejecting malicious queries with HTTP 400.
+  * *Scope (DEFECT-31):* every message of a request is inspected, whatever its role and position (system, assistant and earlier user turns of `/v1/chat/completions` too), not only the last one; one match rejects the whole request with HTTP 400 before any model call.
 
 ---
 

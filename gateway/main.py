@@ -368,9 +368,11 @@ async def chat_completions(
     raw_query = req.messages[-1].content.strip()
     if not raw_query or len(raw_query) < 2:
         raise HTTPException(status_code=400, detail="Query message must contain at least 2 non-whitespace characters")
-    # VULN-04: Validate prompt against adversarial injection & jailbreak patterns
+    # VULN-04 / DEFECT-31: validate EVERY message (any role) against the injection patterns, not only the
+    # last one: the non-streaming branches send the whole message list to the model.
     try:
-        sanitize_and_fence_prompt(raw_query)
+        for m in req.messages:
+            sanitize_and_fence_prompt(m.content or "")
     except PromptInjectionAlert as e:
         raise HTTPException(status_code=400, detail=str(e))
 

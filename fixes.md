@@ -1474,5 +1474,13 @@ tests/test_constant_time_and_cookie_security.py::test_secrets_compare_digest_tim
 - **Tests:** [`tests/test_internal_identity.py`](tests/test_internal_identity.py) (11, no services needed): round trip, signature bound to the user, forged / empty / expired / other-secret signatures fail, the bridge signs exactly like the gateway, both routes refuse unsigned, forged and replayed-for-another-user identities with 403 (the refused identity never reaches the cache), a signed identity becomes the cache owner, external callers stay hidden.
 - **Live (2026-11-18, production):** a signed-in session through `/chat` (the bridge) → HTTP 200 with tokens, sources and done; loopback `/query` with an unsigned or forged `X-Internal-User` → 403; `make cache-check` (cross-user isolation and regenerate, signed identities) → 0 failures.
 
+## DEFECT-31: Injection Fence Checked Only the Last Message (FR-6)
+
+- **Symptom:** on `/v1/chat/completions` an injection placed in an earlier message passed, and the model obeyed it (it replied with the injected marker string and ignored the actual question), while the same text as the last message was blocked with HTTP 400.
+- **Root cause:** `sanitize_and_fence_prompt()` was applied to `req.messages[-1]` only, but the non-streaming branches send the whole message list to the model.
+- **Fix** ([`gateway/main.py`](gateway/main.py)): every message is checked, any role (system, assistant, user) and any position; one match rejects the request with HTTP 400 before routing, caching or any model call. `/query` and `/chat` take a single question (the `history` field of `/chat` is not forwarded to the model) and were already checked.
+- **Tests:** [`tests/test_injection_all_messages.py`](tests/test_injection_all_messages.py) (9, no services needed): the reported request; the payload as the only message; an injection in every role and position; a harmless multi-turn conversation with a system message still answered. 7 of 9 fail on the previous code.
+- **Live (2026-11-18, production):** the reported request (payload first, harmless question last) → HTTP 400 "NFR-7 Alert: Adversarial prompt injection detected." (was HTTP 200 with `TOKEN_LEAK_7731`); the payload alone → HTTP 400.
+
 ## Remediation Complete
 All security vulnerabilities, cache qualification defects, frontend/backend break vectors, and redundant code have been fully resolved, hardened, and verified with passing regression tests. All changes are cleanly staged. Per instructions, `git commit` has not been run.
