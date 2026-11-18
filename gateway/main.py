@@ -1209,10 +1209,12 @@ if STATIC_DIR.exists():
             import asyncio
             await asyncio.to_thread(auth.send_mail, email, "Your AskIISc sign-in code", auth.otp_mail_body(code))
         except auth.MailError as e:
-            auth.otp_store.revoke(email)
+            auth.otp_store.revoke(email, code.challenge)
             logger.error("otp mail failed: %s", e)
             return JSONResponse({"error": f"Could not send email: {e}"}, status_code=503)
 
+        # DEFECT-35: the code is bound to this browser (signed session); guesses from elsewhere cannot burn it
+        request.session["otp_challenge"] = {"email": email, "c": code.challenge}
         is_resend = request.url.path.endswith("/resend")
         code_desc = "A new 6-digit verification code" if is_resend else "A 6-digit verification code"
         return {
@@ -1233,7 +1235,9 @@ if STATIC_DIR.exists():
         except auth.RateLimited as e:
             return JSONResponse({"error": str(e)}, status_code=429)
 
-        if not auth.otp_store.verify(email, body.code.strip()):
+        pending = request.session.get("otp_challenge") or {}
+        challenge = pending.get("c", "") if pending.get("email") == email else ""
+        if not auth.otp_store.verify(email, body.code.strip(), challenge):
             return JSONResponse({"error": "Invalid or expired code."}, status_code=401)
         request.session.clear()
         import hashlib

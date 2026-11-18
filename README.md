@@ -168,7 +168,9 @@ RATE_LIMIT_RPS=20.0
 SESSION_SECRET=<YOUR_RANDOM_64_CHAR_HEX_SECRET>
 COOKIE_SECURE=0
 ALLOWED_EMAIL_DOMAINS=iisc.ac.in
-OTP_MAX_PER_HOUR=10
+OTP_MAX_PER_HOUR=10      # codes per address per hour from one IP
+OTP_MAX_PER_EMAIL_HOUR=30          # codes per address per hour in total (mail-bombing ceiling)
+OTP_MAX_FAILS_PER_EMAIL_HOUR=20    # wrong guesses per address per hour (a fresh code's first try always counts)
 OTP_MAX_PER_IP_HOUR=1000
 
 # Retrieval Thresholds

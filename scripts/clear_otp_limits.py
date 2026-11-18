@@ -38,18 +38,18 @@ def main():
     if arg in ("--all", "-a"):
         # Scan and delete all auth:rate:* and auth:otp:* keys
         deleted = 0
-        for pattern in ["auth:rate:*", "auth:otp:*"]:
+        for pattern in ["auth:rate:*", "auth:otp:*", "auth:fail:*"]:
             keys = list(r.scan_iter(pattern))
             if keys:
                 deleted += r.delete(*keys)
         print(f"✅ Cleared {deleted} OTP rate limit and authentication keys from Redis.")
     else:
         email = arg.lower()
-        keys_to_delete = [
-            f"auth:rate:email:{email}",
-            f"auth:rate:verify:email:{email}",
-            f"auth:otp:{email}",
-        ]
+        keys_to_delete = [f"auth:rate:email:{email}", f"auth:rate:verify:email:{email}", f"auth:otp:{email}",
+                          f"auth:fail:{email}"]
+        # per-browser codes and per-(address, IP) limits (DEFECT-35)
+        for pattern in (f"auth:otp:{email}:*", f"auth:rate:pair:{email}|*"):
+            keys_to_delete += [k.decode() if isinstance(k, bytes) else k for k in r.scan_iter(pattern)]
         deleted = r.delete(*keys_to_delete)
         print(f"✅ Cleared OTP rate limits and active codes for '{email}' (keys removed: {deleted}).")
 

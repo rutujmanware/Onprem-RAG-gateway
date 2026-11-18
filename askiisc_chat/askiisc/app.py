@@ -68,8 +68,9 @@ async def otp_request(body: OtpReq, request: Request):
         return JSONResponse({"error": str(e), "resend_in": getattr(e, "resend_in", int(C.OTP_RESEND_SECS))}, status_code=429)
     try: await asyncio.to_thread(auth.send_mail, email, "Your AskIISc sign-in code", auth.otp_mail_body(code))
     except auth.MailError as e:
-        auth.otp_store.revoke(email); log.error("otp mail failed: %s", e)
+        auth.otp_store.revoke(email, code.challenge); log.error("otp mail failed: %s", e)
         return JSONResponse({"error": f"Could not send email: {e}"}, status_code=503)
+    request.session["otp_challenge"] = {"email": email, "c": code.challenge}   # DEFECT-35: bound to this browser
     is_resend = request.url.path.endswith("/resend")
     prefix = "A new 6-digit verification code" if is_resend else "A 6-digit verification code"
     return {"ok": True, "message": f"{prefix} has been sent to your email address.", "resend_in": int(C.OTP_RESEND_SECS)}
@@ -79,7 +80,9 @@ async def otp_verify(body: OtpVerify, request: Request):
     if C.AUTH_MODE != "otp": return JSONResponse({"error": "not enabled"}, status_code=404)
     try: email = auth.normalize_email(body.email)
     except auth.AuthError: return JSONResponse({"error": "Invalid or expired code."}, status_code=401)
-    if not auth.otp_store.verify(email, body.code.strip()):
+    pending = request.session.get("otp_challenge") or {}
+    challenge = pending.get("c", "") if pending.get("email") == email else ""
+    if not auth.otp_store.verify(email, body.code.strip(), challenge):
         return JSONResponse({"error": "Invalid or expired code."}, status_code=401)   # same message for wrong/expired/locked
     request.session.clear()
     request.session["user"] = {"sub": hashlib.sha256(email.encode()).hexdigest(), "name": email, "email": email,
