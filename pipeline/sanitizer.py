@@ -395,16 +395,31 @@ PREMISE_RULES = (
 )
 
 
+_INST_TOKEN_RE = re.compile(r"\[\s*(/?)\s*(INST|SYS|SYSTEM)\s*\]", re.IGNORECASE)
+_PROMPT_HEADING_RE = re.compile(r"(?m)^(\s*)#{2,}")
+
+
+def escape_context_text(text: str) -> str:
+    """Neutralise structure in retrieved document text (FR-6, DEFECT-37): no tag, chat-template token or prompt
+    heading inside a document can close the context fence or look like part of the prompt.
+      * & < > are HTML-escaped, which covers every XML/HTML tag in any spelling (</context_data>, </CONTEXT_DATA >,
+        </document>, <<SYS>>, <|im_start|>, ...); the model reads &lt; / &gt; as ordinary < / >.
+      * [INST] / [/INST] / [SYS] style markers become (INST), (/INST), (SYS).
+      * Lines starting with ## (like the prompt's "### User Question:") lose their heading marker.
+    """
+    t = str(text or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    t = _INST_TOKEN_RE.sub(lambda m: f"({m.group(1)}{m.group(2)})", t)
+    return _PROMPT_HEADING_RE.sub(lambda m: m.group(1) + "\u2022", t)
+
+
 def fence_context_chunks(chunks: List[Dict[str, Any]]) -> str:
     """Format and fence retrieved knowledge base chunks inside strict XML boundary tags.
-    Escapes any closing boundary tags within corpus text to prevent delimiter breakout.
+    Document text and titles are escaped (escape_context_text) so they cannot break out of the fence.
     """
     blocks = []
     for i, c in enumerate(chunks, 1):
-        title = str(c.get("title") or "Untitled Document").replace("<", "&lt;").replace(">", "&gt;")
-        raw_content = str(c.get("content") or "").strip()
-        # Escape any delimiter tag attempts inside document content
-        safe_content = raw_content.replace("</context_data>", "[escaped_tag]")
+        title = escape_context_text(c.get("title") or "Untitled Document").replace('"', "&quot;")
+        safe_content = escape_context_text(str(c.get("content") or "").strip())
         blocks.append(f"<document id=\"{i}\" title=\"{title}\">\n{safe_content}\n</document>")
 
     inner = "\n\n".join(blocks)

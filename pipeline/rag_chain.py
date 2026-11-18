@@ -49,6 +49,8 @@ def _vllm_auth_headers() -> Dict[str, str]:
 # has already started streaming is never restarted: it is finished with PARTIAL_ANSWER_NOTE and
 # flagged "incomplete" so the gateway does not cache it.
 PARTIAL_ANSWER_NOTE = "\n\n[Generation was interrupted. This answer is incomplete.]"
+# Nothing could be generated at all (every model tier down): say so instead of "incomplete" (DEFECT-36).
+GENERATION_UNAVAILABLE_NOTE = "[The answering service is temporarily unavailable. Please try again in a minute.]"
 
 
 class UpstreamBusy(RuntimeError):
@@ -1024,8 +1026,9 @@ class RAGQAPipeline:
         except Exception as opt_b_err:
             logger.warning("In-process SLM failed: %s", opt_b_err)
             incomplete = True
-            full_text.append(PARTIAL_ANSWER_NOTE)
-            yield {"type": "token", "delta": PARTIAL_ANSWER_NOTE}
+            note = PARTIAL_ANSWER_NOTE if full_text else GENERATION_UNAVAILABLE_NOTE
+            full_text.append(note)
+            yield {"type": "token", "delta": note}
 
         gen_duration = time.time() - t0_gen
         total_duration = time.time() - t_start

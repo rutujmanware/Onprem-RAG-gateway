@@ -276,6 +276,12 @@ class RedisSemanticCache:
             logger.warning("Async index init warning: %s", e)
             return False
 
+    GENERATION_FAILURE_MARKERS = (
+        "[generation was interrupted",
+        "answering service is temporarily unavailable",
+        "partial response recorded",
+        "[inference complete",
+    )
     INSUFFICIENT_DATA_PHRASES = (
         "insufficient information",
         "insufficient data",
@@ -347,6 +353,10 @@ class RedisSemanticCache:
             return False, f"Answer is too short ({len(ans)} chars) to be cacheable"
 
         ans_lower = ans.lower()
+        # DEFECT-36: generation-failure placeholders are never answers (current and earlier wordings)
+        for marker in cls.GENERATION_FAILURE_MARKERS:
+            if marker in ans_lower:
+                return False, f"Response is a generation-failure placeholder: '{marker}'"
         for phrase in cls.INSUFFICIENT_DATA_PHRASES:
             if phrase in ans_lower:
                 return False, f"Response indicates insufficient data / unretrieved documents: '{phrase}'"

@@ -77,6 +77,7 @@ Individually rate-limiting, retrying, or caching at the application layer is ad 
 * **FR-6 (Must): Adversarial Defense & Prompt Injection Fencing**
   * The gateway shall inspect incoming queries against known adversarial jailbreak patterns (DAN, system role overrides, delimiter breakout attempts) and escape XML tags in retrieved context before feeding generation prompts, rejecting malicious queries with HTTP 400.
   * *Scope (DEFECT-31):* every message of a request is inspected, whatever its role and position (system, assistant and earlier user turns of `/v1/chat/completions` too), not only the last one; one match rejects the whole request with HTTP 400 before any model call.
+  * *Context escaping (DEFECT-37):* retrieved document text and titles are escaped before they enter either model's prompt: `&`, `<`, `>` are HTML-escaped (every tag in any spelling, e.g. `</context_data>`, `</document>`, `<<SYS>>`, `<|im_start|>`), `[INST]`/`[SYS]`-style markers are neutralised and heading lines that mimic the prompt (`### User Question:`) lose their marker, so a document cannot close the context fence or pose as instructions. Verified: answers contain no escape artifacts.
 
 ---
 
