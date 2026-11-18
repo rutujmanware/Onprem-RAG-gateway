@@ -90,6 +90,7 @@ class AdmissionTicket:
     member: str
     in_redis: bool
     has_global: bool = True
+    released: bool = False   # release() is idempotent per ticket (DEFECT-34)
 
 
 class AdmissionController:
@@ -241,44 +242,64 @@ class AdmissionController:
         return ticket
 
     async def _acquire_global(self, user_id: str) -> None:
+        """Wait for a global inference permit (DEFECT-34: cancellation-safe).
+
+        Counters are plain ints updated without any await (one event loop, so these updates are atomic); the
+        permit is taken by a separate task, and if this coroutine is cancelled or times out at any point, a
+        permit that was (or still gets) granted is handed back. Also avoids asyncio.wait_for, which on
+        Python < 3.11 can drop an already-granted permit on timeout."""
         # 3. Queue Depth Check (Prevent unbounded memory backlog)
-        async with self._lock:
-            if self._queued_count >= self.max_queue_depth:
-                self._total_shed += 1
-                logger.warning(
-                    "Gateway admission queue full (%d queued, %d active). Shedding load for %s.",
-                    self._queued_count, self._active_count, user_id
-                )
-                raise HTTPException(
-                    status_code=503,
-                    detail="Campus Gateway is currently experiencing heavy load. Queue is full, please retry shortly.",
-                    headers={"Retry-After": "5"}
-                )
-            self._queued_count += 1
+        if self._queued_count >= self.max_queue_depth:
+            self._total_shed += 1
+            logger.warning(
+                "Gateway admission queue full (%d queued, %d active). Shedding load for %s.",
+                self._queued_count, self._active_count, user_id
+            )
+            raise HTTPException(
+                status_code=503,
+                detail="Campus Gateway is currently experiencing heavy load. Queue is full, please retry shortly.",
+                headers={"Retry-After": "5"}
+            )
+        self._queued_count += 1
 
         # 4. Wait in queue for available inference slot with timeout
+        waiter = asyncio.ensure_future(self.global_sem.acquire())
+        granted = False
         try:
-            try:
-                await asyncio.wait_for(self.global_sem.acquire(), timeout=self.queue_timeout)
-            except asyncio.TimeoutError:
-                self._total_timeouts += 1
-                logger.warning(
-                    "Request from user %s timed out after %.1fs waiting in admission queue.",
-                    user_id, self.queue_timeout
-                )
-                raise HTTPException(
-                    status_code=503,
-                    detail="Inference queue wait timed out. Model servers are busy, please retry shortly.",
-                    headers={"Retry-After": "3"}
-                )
-        finally:
-            async with self._lock:
-                self._queued_count -= 1
+            done, _ = await asyncio.wait({waiter}, timeout=self.queue_timeout)
+            granted = waiter in done and not waiter.cancelled() and waiter.exception() is None
+        except BaseException:          # cancelled while waiting (client disconnect)
+            self._queued_count -= 1
+            self._give_back_when_granted(waiter)
+            raise
+        if not granted:
+            self._queued_count -= 1
+            self._give_back_when_granted(waiter)
+            self._total_timeouts += 1
+            logger.warning(
+                "Request from user %s timed out after %.1fs waiting in admission queue.",
+                user_id, self.queue_timeout
+            )
+            raise HTTPException(
+                status_code=503,
+                detail="Inference queue wait timed out. Model servers are busy, please retry shortly.",
+                headers={"Retry-After": "3"}
+            )
+        # 5. In-flight Execution: no await between the grant and the return, so no cancellation point
+        self._queued_count -= 1
+        self._active_count += 1
+        self._total_admitted += 1
 
-        # 5. In-flight Execution
-        async with self._lock:
-            self._active_count += 1
-            self._total_admitted += 1
+    def _give_back_when_granted(self, waiter: "asyncio.Future") -> None:
+        """Cancel a pending permit request; if it was (or is about to be) granted, return the permit."""
+        def _done(t):
+            if not t.cancelled() and t.exception() is None:
+                self.global_sem.release()
+        if waiter.done():
+            _done(waiter)
+        else:
+            waiter.cancel()
+            waiter.add_done_callback(_done)
 
     def release(self, ticket: Optional[AdmissionTicket] = None) -> None:
         """Release the acquired inference slot (and the user's slot when the ticket is given).
@@ -296,6 +317,10 @@ class AdmissionController:
             self._release_now(ticket)
 
     def _release_now(self, ticket: Optional[AdmissionTicket]) -> None:
+        if ticket is not None:
+            if ticket.released:      # already released (e.g. generator finally + response close)
+                return
+            ticket.released = True
         self.global_sem.release()
         self._active_count = max(0, self._active_count - 1)
         if ticket is not None:

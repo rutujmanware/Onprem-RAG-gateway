@@ -322,6 +322,10 @@ def _views(text: str) -> List[str]:
     return views
 
 
+_QUESTION_TO_ASSISTANT = re.compile(r"^\W*(?:are|do|did|have|were|can|could|will|would)\s+you\s+(?:sure|really|"
+                                    r"actually|able|aware|answering|using|citing|getting|working|running|still)\b", re.I)
+
+
 def detect_injection(prompt: str, use_classifier: bool = True) -> Optional[str]:
     """Category of the first injection signature found in any view of the message, else None.
     Patterns first; then the embedding classifier (pipeline/injection_classifier.py) when available."""
@@ -333,15 +337,20 @@ def detect_injection(prompt: str, use_classifier: bool = True) -> Optional[str]:
         for cat, pattern in _COMPILED_V2:
             if pattern.search(view):
                 return cat
-    if use_classifier:
+    # A plain question to the assistant about itself ("Are you sure you are answering from the repository?") is
+    # not blocked by the classifier alone: it scores like an instruction but asks for nothing (patterns still apply).
+    if use_classifier and not _QUESTION_TO_ASSISTANT.match(views[0]):
         from pipeline.injection_classifier import is_injection
         if is_injection(views):
             return "classifier"
     return None
 
 
-def sanitize_and_fence_prompt(prompt: str) -> str:
+def sanitize_and_fence_prompt(prompt: str, use_classifier: bool = True) -> str:
     """Validate prompt against adversarial injection signatures and encapsulate it.
+
+    use_classifier=False for caller-supplied system/assistant messages: they are instructions by nature, which
+    the embedding classifier (trained on user questions) flags; the patterns still apply to them.
 
     Raises:
         PromptInjectionAlert: If an injection attempt or delimiter escape is detected.
@@ -349,7 +358,7 @@ def sanitize_and_fence_prompt(prompt: str) -> str:
         Fenced prompt wrapped in a safe user block.
     """
     clean_prompt = prompt.strip()
-    if detect_injection(clean_prompt):
+    if detect_injection(clean_prompt, use_classifier=use_classifier):
         raise PromptInjectionAlert("NFR-7 Alert: Adversarial prompt injection detected.")
 
     return f"```user\n{clean_prompt}\n```"

@@ -54,6 +54,23 @@ logger = logging.getLogger("gateway.main")
 _STREAM_END = object()
 
 
+class ReleasingStreamingResponse(StreamingResponse):
+    """StreamingResponse that always runs `on_close` when the response ends, also when the client disconnects
+    before streaming starts (the generator's own finally then never runs). DEFECT-34: the admission slot taken
+    before the response is returned is released on every path; ticket release is idempotent."""
+
+    def __init__(self, *args, on_close=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._on_close = on_close
+
+    async def __call__(self, scope, receive, send):
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            if self._on_close is not None:
+                self._on_close()
+
+
 async def closing_stream(gen):
     """Serve a sync generator from a worker thread and ALWAYS close it, client disconnect included.
 
@@ -380,7 +397,7 @@ async def chat_completions(
     # last one: the non-streaming branches send the whole message list to the model.
     try:
         for m in req.messages:
-            sanitize_and_fence_prompt(m.content or "")
+            sanitize_and_fence_prompt(m.content or "", use_classifier=(m.role or "user").lower() == "user")
     except PromptInjectionAlert as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -504,7 +521,11 @@ async def chat_completions(
 
     if req.stream:
         admission_ticket = await admission.acquire(client_id)  # per-user slot too (FR-5)
-        rag = RAGQAPipeline()
+        try:
+            rag = RAGQAPipeline()
+        except BaseException:
+            admission.release(admission_ticket)
+            raise
         cmpl_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
         created_ts = int(time.time())
 
@@ -569,8 +590,9 @@ async def chat_completions(
             finally:
                 admission.release(admission_ticket)
 
-        return StreamingResponse(
+        return ReleasingStreamingResponse(
             closing_stream(sse_chat_generator()),
+            on_close=lambda: admission.release(admission_ticket),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
@@ -845,7 +867,11 @@ async def query_endpoint(
     # Cache Miss: Cold inference required. Guarded by Admission Queue Manager.
     if req.stream:
         admission_ticket = await admission.acquire(client_id)  # per-user slot too (FR-5)
-        rag = RAGQAPipeline(top_k=req.top_k)
+        try:
+            rag = RAGQAPipeline(top_k=req.top_k)
+        except BaseException:
+            admission.release(admission_ticket)
+            raise
 
         def event_stream():
             try:
@@ -897,8 +923,9 @@ async def query_endpoint(
             finally:
                 admission.release(admission_ticket)
 
-        return StreamingResponse(
+        return ReleasingStreamingResponse(
             closing_stream(event_stream()),
+            on_close=lambda: admission.release(admission_ticket),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
