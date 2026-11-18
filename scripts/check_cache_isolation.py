@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Live end-to-end check of the semantic cache's safety properties against the running gateway.
 
-Uses synthetic users (X-Internal-User, honoured only from loopback) and generic intent-flip question
+Uses synthetic users (signed X-Internal-User via gateway.auth.internal, honoured only from loopback) and generic intent-flip question
 pairs (not the red-team set). Every entry it creates is purged at the end.
 
 Checks, per pair (seed, flipped follow-up):
@@ -26,6 +26,7 @@ import uuid
 from pathlib import Path
 
 import httpx
+from gateway.auth.internal import internal_user_headers  # signed X-Internal-User (DEFECT-30)
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -57,7 +58,7 @@ def main() -> int:
     def ask(q, user, **extra):
         asked.append(q)
         for _ in range(8):
-            r = cl.post(f"{args.gateway}/query", json={"query": q, "max_tokens": 160, **extra}, headers={"X-Internal-User": user})
+            r = cl.post(f"{args.gateway}/query", json={"query": q, "max_tokens": 160, **extra}, headers=internal_user_headers(user))
             if r.status_code in (429, 503) and "regenerate_token" not in extra:
                 time.sleep(5)
                 continue

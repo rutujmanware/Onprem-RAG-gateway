@@ -1405,7 +1405,9 @@ tests/test_constant_time_and_cookie_security.py::test_secrets_compare_digest_tim
 - **Root cause:** the admin routes used the same guard as the question routes, which accepts loopback, an admin key or any live session. FastAPI validates the body before it runs route dependencies, so the 422 came before the guard.
 - **Fix** ([`gateway/main.py`](gateway/main.py)):
   - New guard `require_internal_or_admin` (loopback or `ADMIN_API_KEY` only) on all `/cache/*` routes and `/queue/stats`. Question routes still accept a session.
+  - No admin role for sessions: nothing in the web UI needs these routes, and administrators run them on the server (`make cache-stats`, `make cache-clear`, `make queue-stats`) or with the admin key. The unused `ADMIN_ROLES` setting, which suggested a role check that never existed, was removed from `.env.example` (also reported by the red team as an unused role check).
   - A validation-error handler runs the route's guard first: a caller the guard would reject gets the same 404 whether the body is valid or not.
+  - The same for a wrong HTTP method (e.g. `POST /cache/stats` answered 405, revealing the route): an unauthorised caller gets 404; loopback still gets the real 405.
 - **Tests:** [`tests/test_ungrounded_and_admin_guard.py`](tests/test_ungrounded_and_admin_guard.py): a session gets 404 on every admin route and nothing is cleared or purged; loopback and the admin key still work; malformed or empty bodies get 404 from an unauthorised caller and 422 from loopback. Live probe on the running gateway confirms the same.
 
 ## DEFECT-25: GPU Tier Unavailable → HTTP 500 Instead of Rerouting to the CPU Tier (FR-2)
@@ -1451,6 +1453,26 @@ tests/test_constant_time_and_cookie_security.py::test_secrets_compare_digest_tim
   - [`pipeline/rag_chain.py`](pipeline/rag_chain.py): the streaming path sends an `error` event (shown in the chat UI) instead of the refusal; the non-streaming path raises `RetrievalUnavailable` instead of returning internal error text. `/v1/chat/completions` streaming relays it as an OpenAI-style error chunk.
 - **Tests:** [`tests/test_retrieval_outage.py`](tests/test_retrieval_outage.py) (19, no services needed): classification of outage vs. other errors; `/query` returns 503 + `Retry-After` with no internals for connection refused, `LOADING`, timeout and missing index; an unexpected bug still returns 500; streaming yields the error event and no refusal text.
 - **Live (2026-11-18, one-worker gateway):** Redis unreachable → HTTP 503 in 0.07 s, `Retry-After: 30`, streaming error event, `/health` 200; Redis up without the thesis index (empty throwaway instance) → the same, 0.08 s. The gateway reconnects on its own when Redis is back.
+
+## DEFECT-29: Cache Administration Open to Every Local User of the Shared Host
+
+- **Symptom:** after DEFECT-24, `/cache/clear`, `/cache/purge`, `/cache/purge-invalid`, `/cache/stats` and `/queue/stats` still accepted any request from the server itself. The gateway runs on a shared host (about 27 logged-in users), so any of them could clear or purge the cache all users share, e.g. `curl -X POST 127.0.0.1:8080/cache/clear`. A red-team report on the missing admin role (`ADMIN_ROLES` was never read) led to this review.
+- **Decision:** no admin role for login sessions (the web UI never needs these routes); administration is reserved for holders of `ADMIN_API_KEY`.
+- **Fix:**
+  - [`gateway/main.py`](gateway/main.py): the guard `require_admin_key` accepts only a valid `ADMIN_API_KEY` (`X-Admin-Key` or `Authorization: Bearer`, constant-time comparison), also on loopback. With the key unset nobody can administer. Unauthorised callers get 404 (also for malformed bodies and wrong methods).
+  - Key generated into the production `.env` (owner-readable only). The make targets `cache-stats`, `cache-clear` and `queue-stats` send it, passed on stdin so it never appears in the host's process list; they now fail with a clear message instead of printing "cleared successfully" regardless of the result. `scripts/run_100_uncached_load_test.py` and `tests/benchmark_cache_extensive.py` send it from `.env`.
+- **Tests:** [`tests/test_ungrounded_and_admin_guard.py`](tests/test_ungrounded_and_admin_guard.py): loopback without the key, a wrong key and a login session get 404 and nothing is cleared; loopback and remote callers with the key get 200; with no key configured every request gets 404; wrong methods and malformed bodies reveal nothing without the key.
+- **Live (2026-11-18, production):** `make cache-stats` / `make queue-stats` → 200; the same routes from the server without the key or with a wrong key → 404; ordinary questions unaffected.
+
+## DEFECT-30: Any Local User Could Claim Another User's Identity (X-Internal-User)
+
+- **Symptom:** the gateway took the user named in `X-Internal-User` from any loopback caller. The header exists for the web chat bridge (`/chat` → `/query`), but the gateway runs on a shared host, so every local user could send `X-Internal-User: someone@iisc.ac.in` to `127.0.0.1:8080/query` and act as that person: receive their owner-scoped (near-duplicate) cache hits, consume their regenerate quota and their concurrency slots.
+- **Fix:**
+  - [`gateway/auth/internal.py`](gateway/auth/internal.py): `X-Internal-Auth: <unix-time>.<HMAC-SHA256(user, time)>`, keyed from `INTERNAL_AUTH_KEY` or `SESSION_SECRET` (owner-readable `.env`), valid 2 min, constant-time comparison.
+  - [`gateway/main.py`](gateway/main.py): `/query` and `/v1/chat/completions` honour `X-Internal-User` only from loopback **and** with a valid signature; an unsigned, forged or other-user signature gets HTTP 403. Without the header a loopback caller is just anonymous loopback.
+  - The bridge ([`askiisc_chat/askiisc/gateway_backend.py`](askiisc_chat/askiisc/gateway_backend.py)) signs (standard-library copy of the scheme, so the standalone app needs no gateway imports); the measurement scripts and live tests sign with the helper.
+- **Tests:** [`tests/test_internal_identity.py`](tests/test_internal_identity.py) (11, no services needed): round trip, signature bound to the user, forged / empty / expired / other-secret signatures fail, the bridge signs exactly like the gateway, both routes refuse unsigned, forged and replayed-for-another-user identities with 403 (the refused identity never reaches the cache), a signed identity becomes the cache owner, external callers stay hidden.
+- **Live (2026-11-18, production):** a signed-in session through `/chat` (the bridge) → HTTP 200 with tokens, sources and done; loopback `/query` with an unsigned or forged `X-Internal-User` → 403; `make cache-check` (cross-user isolation and regenerate, signed identities) → 0 failures.
 
 ## Remediation Complete
 All security vulnerabilities, cache qualification defects, frontend/backend break vectors, and redundant code have been fully resolved, hardened, and verified with passing regression tests. All changes are cleanly staged. Per instructions, `git commit` has not been run.

@@ -26,6 +26,7 @@ from pathlib import Path
 
 import httpx
 import numpy as np
+from gateway.auth.internal import internal_user_headers  # signed X-Internal-User (DEFECT-30)
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -62,11 +63,11 @@ async def main_async(a) -> int:
         print(f"warm-up: {len(QUESTIONS)} questions for {user}")
         for q in QUESTIONS:
             created.append(q)
-            await cl.post(url, json={"query": q, "max_tokens": 160}, headers={"X-Internal-User": user})
+            await cl.post(url, json={"query": q, "max_tokens": 160}, headers=internal_user_headers(user))
         work, ok = [], 0
         for q in QUESTIONS:
-            e = (await cl.post(url, json={"query": q}, headers={"X-Internal-User": user})).json()
-            s = (await cl.post(url, json={"query": q.rstrip("?")}, headers={"X-Internal-User": user})).json()
+            e = (await cl.post(url, json={"query": q}, headers=internal_user_headers(user))).json()
+            s = (await cl.post(url, json={"query": q.rstrip("?")}, headers=internal_user_headers(user))).json()
             if e.get("cached"):
                 work.append(("exact", q))
             if s.get("cached"):
@@ -84,7 +85,7 @@ async def main_async(a) -> int:
             nonlocal not_cached
             t0 = time.perf_counter()
             try:
-                r = await cl.post(url, json={"query": q}, headers={"X-Internal-User": user})
+                r = await cl.post(url, json={"query": q}, headers=internal_user_headers(user))
                 dt = (time.perf_counter() - t0) * 1e3
                 if r.status_code != 200:
                     errors.append(r.status_code)
@@ -103,7 +104,7 @@ async def main_async(a) -> int:
             created.append(q)
             t0 = time.perf_counter()
             try:
-                r = await cl.post(url, json={"query": q, "max_tokens": 120}, headers={"X-Internal-User": f"fresh-{run}-{i}@iisc.ac.in"},
+                r = await cl.post(url, json={"query": q, "max_tokens": 120}, headers=internal_user_headers(f"fresh-{run}-{i}@iisc.ac.in"),
                                   timeout=300)
                 if r.status_code == 200:
                     lat["fresh"].append((time.perf_counter() - t0) * 1e3)

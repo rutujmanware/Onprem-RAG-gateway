@@ -1,9 +1,22 @@
 """Backend adapter: forward the question to the team gateway (POST /query with stream=true) and translate what comes back into this app's
 SSE events (meta, sources, token, done, error). The gateway does the routing (two-tower MLP), the Redis retrieval and the CPU-SLM / 7B generation.
 Field names are read tolerantly because they were taken from the team's design document, not from a live capture; set GATEWAY_DEBUG=1 to log raw events."""
-import json, logging, time
+import hashlib, hmac, json, logging, os, time
 import httpx
 from . import config as C
+
+
+def internal_user_headers(user: str) -> dict:
+    """Signed identity for the gateway (DEFECT-30). Same scheme as gateway/auth/internal.py, which the
+    standalone app may not be able to import; tests/test_internal_identity.py checks both agree. The key comes
+    from INTERNAL_AUTH_KEY or SESSION_SECRET, which must match the gateway's."""
+    secret = (os.getenv("INTERNAL_AUTH_KEY") or os.getenv("SESSION_SECRET") or "").strip()
+    if not user or len(secret) < 32:
+        return {}
+    key = hmac.new(secret.encode(), b"askiisc-internal-user-v1", hashlib.sha256).digest()
+    ts = int(time.time())
+    sig = hmac.new(key, f"{ts}|{user}".encode(), hashlib.sha256).hexdigest()
+    return {"X-Internal-User": user, "X-Internal-Auth": f"{ts}.{sig}"}
 
 try:
     from pipeline.sanitizer import is_no_relevant_docs_answer, starts_with_refusal
@@ -134,7 +147,7 @@ async def stream_via_gateway(query: str, tier: str, user_email: str = "", regene
         return out
 
     try:
-        fwd_headers = {"X-Internal-User": user_email} if user_email else {}
+        fwd_headers = internal_user_headers(user_email)
         async with httpx.AsyncClient(timeout=httpx.Timeout(C.GATEWAY_TIMEOUT, connect=5)) as cl:
             payload = {"query": query, "stream": True, "max_tokens": C.MAX_TOKENS}
             if regenerate_token:

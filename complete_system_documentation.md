@@ -150,7 +150,7 @@ sequenceDiagram
 To prevent unauthorized intranet access, direct model bypass, or cache manipulation:
 - The internal daemon ports (`6379`, `8082`, `8000`) bind strictly to `127.0.0.1`.
 - Any external request directly targeting internal ports is dropped at the OS socket level.
-- External requests to `/query`, `/cache/*`, and `/queue/stats` must present an authenticated campus web session or a valid `ADMIN_API_KEY`, otherwise returning HTTP 404 to obscure internal endpoint existence.
+- External requests to `/query` must present an authenticated campus web session or a valid `ADMIN_API_KEY`. The administrative routes `/cache/*` and `/queue/stats` accept only a valid `ADMIN_API_KEY`, also from the server itself (DEFECT-29); a login session is never enough, whatever the account (DEFECT-24). Otherwise HTTP 404 hides the endpoint.
 - Automated security test suite: [`tests/test_single_port_security.py`](file:///data2/home/ritujmanware/onprem-rag-gateway/tests/test_single_port_security.py).
 
 ### 3.2 Passwordless Email OTP Authentication

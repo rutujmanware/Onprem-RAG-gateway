@@ -117,18 +117,23 @@ chat-code:
 test-smtp:
 	$(PYTHON) scripts/test_smtp.py $(TO)
 
+# Admin routes need ADMIN_API_KEY (from .env), even from this server (DEFECT-29). The key is passed on
+# stdin so it never shows up in the process list of this shared host.
+ADMIN_CURL = printf 'X-Admin-Key: %s\n' "$$ADMIN_API_KEY" | curl -sf -H @-
+ADMIN_FAIL = { echo "Admin request failed: is the gateway running on 8080 and ADMIN_API_KEY set in .env?"; exit 1; }
+
 cache-stats:
-	@curl -s http://127.0.0.1:8080/cache/stats || echo "Gateway is not running on 8080"
+	@$(ADMIN_CURL) http://127.0.0.1:8080/cache/stats || $(ADMIN_FAIL)
 
 cache-clear:
-	@curl -s -X POST http://127.0.0.1:8080/cache/clear
+	@$(ADMIN_CURL) -X POST http://127.0.0.1:8080/cache/clear || $(ADMIN_FAIL)
 	@echo " -> Semantic cache cleared successfully. Document vector index (2.26M chunks) is untouched."
 
 otp-clear:
 	@$(PYTHON) scripts/clear_otp_limits.py $(if $(EMAIL),$(EMAIL),--all)
 
 queue-stats:
-	@curl -s http://127.0.0.1:8080/queue/stats || echo "Gateway is not running on 8080"
+	@$(ADMIN_CURL) http://127.0.0.1:8080/queue/stats || $(ADMIN_FAIL)
 
 redis-up:
 	./redis-stack-server-7.2.0-v9/bin/redis-stack-server
@@ -212,7 +217,7 @@ test: export TRANSFORMERS_OFFLINE ?= $(HF_HUB_OFFLINE)
 test:
 	PYTHONPATH=. $(PYTHON) tests/test_admission_queue.py
 	PYTHONPATH=. $(PYTHON) -m pytest tests/test_single_port_security.py
-	PYTHONPATH=. $(PYTHON) -m pytest tests/test_vllm_launcher.py tests/test_dispatcher_threshold.py tests/test_cache_owner_scoping.py tests/test_cache_regenerate.py tests/test_premise_rules.py tests/test_premise_routing.py tests/test_topic_retrieval.py tests/test_topic_speller.py tests/test_rare_terms.py tests/test_ungrounded_and_admin_guard.py tests/test_standalone_app_identity.py tests/test_gpu_fallback.py tests/test_event_loop_not_blocked.py tests/test_per_user_cap.py tests/test_retrieval_outage.py tests/test_slm_slots.py tests/test_retrieval_warmup.py tests/test_embedder_onnx.py tests/test_cache_index_alter.py
+	PYTHONPATH=. $(PYTHON) -m pytest tests/test_vllm_launcher.py tests/test_dispatcher_threshold.py tests/test_cache_owner_scoping.py tests/test_cache_regenerate.py tests/test_premise_rules.py tests/test_premise_routing.py tests/test_topic_retrieval.py tests/test_topic_speller.py tests/test_rare_terms.py tests/test_ungrounded_and_admin_guard.py tests/test_standalone_app_identity.py tests/test_gpu_fallback.py tests/test_event_loop_not_blocked.py tests/test_per_user_cap.py tests/test_retrieval_outage.py tests/test_internal_identity.py tests/test_slm_slots.py tests/test_retrieval_warmup.py tests/test_embedder_onnx.py tests/test_cache_index_alter.py
 	PYTHONPATH=. $(PYTHON) -m pytest tests/test_break_hardening.py tests/test_cache_purge_and_ttl.py tests/test_constant_time_and_cookie_security.py tests/test_dos_boundary_validation.py tests/test_otp_concurrency.py tests/test_refusal_chunks.py tests/test_typo_normalizer.py
 	@present="$(wildcard $(PRIVATE_TESTS))"; \
 	if [ -n "$$present" ]; then PYTHONPATH=. $(PYTHON) -m pytest $$present; \

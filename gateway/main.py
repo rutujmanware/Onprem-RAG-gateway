@@ -10,7 +10,8 @@ from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional
 from pathlib import Path
 from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exception_handlers import http_exception_handler, request_validation_exception_handler
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.concurrency import run_in_threadpool
@@ -29,6 +30,7 @@ except ImportError:
     pass
 
 from gateway.auth.guard import UserIdentity, require_iisc_user
+from gateway.auth.internal import verify_internal_user
 from gateway.cache.redis_semantic_cache import RedisSemanticCache
 from gateway.queue.admission import AdmissionController
 from gateway.dependencies import (
@@ -134,15 +136,28 @@ def require_internal_or_auth(request: Request):
     raise HTTPException(status_code=404, detail="Not Found")
 
 
-def require_internal_or_admin(request: Request):
-    """Cache/queue administration (/cache/*, /queue/stats): loopback or ADMIN_API_KEY only.
+def require_admin_key(request: Request):
+    """Cache/queue administration (/cache/*, /queue/stats): ADMIN_API_KEY only (X-Admin-Key or Bearer).
 
-    A logged-in user session is NOT enough (DEFECT-24): these routes can clear or purge the cache that
-    every user shares, and /cache/clear needs no request body at all. Returns 404 to hide the routes.
+    DEFECT-24: a login session is never enough (these routes clear or purge the cache every user shares).
+    DEFECT-29: neither is a request from the server itself; this is a shared host, so "loopback" means any
+    local user. Only key holders administer; with ADMIN_API_KEY unset nobody can. Returns 404 to hide the routes.
     """
-    if _is_loopback(request) or _has_admin_key(request):
+    if _has_admin_key(request):
         return True
     raise HTTPException(status_code=404, detail="Not Found")
+
+
+def _internal_user(request: Request) -> Optional[str]:
+    """The user named by the web chat bridge (`X-Internal-User`), only from loopback and only with a valid
+    `X-Internal-Auth` signature (DEFECT-30: on this shared host any local user could otherwise claim any
+    identity). A header that is present but not validly signed is refused with 403."""
+    user = request.headers.get("x-internal-user", "").strip()
+    if not user or not _is_loopback(request):
+        return None
+    if not verify_internal_user(user, request.headers.get("x-internal-auth", "").strip()):
+        raise HTTPException(status_code=403, detail="Invalid internal user identity.")
+    return user
 
 
 def _is_loopback(request: Request) -> bool:
@@ -220,16 +235,31 @@ class DirectQueryRequest(BaseModel):
     regenerate_token: Optional[str] = Field(default=None, max_length=128)
 
 
-_ROUTE_GUARDS = (require_internal_or_auth, require_internal_or_admin)
+_ROUTE_GUARDS = (require_internal_or_auth, require_admin_key)
 
 
-def _route_guard(request: Request):
+def _route_guard(request: Request, any_method: bool = False):
     for route in app.router.routes:
-        if getattr(route, "path", None) == request.url.path and request.method in (getattr(route, "methods", None) or ()):
+        if getattr(route, "path", None) == request.url.path and (
+                any_method or request.method in (getattr(route, "methods", None) or ())):
             for dep in getattr(route, "dependencies", None) or ():
                 if dep.dependency in _ROUTE_GUARDS:
                     return dep.dependency
     return None
+
+
+@app.exception_handler(StarletteHTTPException)
+async def hide_guarded_routes_on_wrong_method(request: Request, exc: StarletteHTTPException):
+    """A wrong HTTP method on a hidden route (e.g. POST /cache/stats) answered 405, revealing the route.
+    A caller its guard would reject now gets the same 404 as for any unknown path."""
+    if exc.status_code == 405:
+        guard = _route_guard(request, any_method=True)
+        if guard is not None:
+            try:
+                guard(request)
+            except HTTPException as e:
+                return JSONResponse({"detail": e.detail}, status_code=e.status_code)
+    return await http_exception_handler(request, exc)
 
 
 @app.exception_handler(RequestValidationError)
@@ -275,7 +305,7 @@ except ImportError:  # pragma: no cover
 async def healthz():
     return {"status": "ok"}
 
-@app.get("/cache/stats", dependencies=[Depends(require_internal_or_admin)], include_in_schema=False)
+@app.get("/cache/stats", dependencies=[Depends(require_admin_key)], include_in_schema=False)
 async def cache_stats(cache: RedisSemanticCache = Depends(get_semantic_cache)):
     count = await cache.acount()
     return {
@@ -293,7 +323,7 @@ class CachePurgeRequest(BaseModel):
     query: str = Field(..., min_length=2, max_length=1500)
     threshold: Optional[float] = Field(default=0.85, ge=0.5, le=1.0)
 
-@app.post("/cache/purge", dependencies=[Depends(require_internal_or_admin)], include_in_schema=False)
+@app.post("/cache/purge", dependencies=[Depends(require_admin_key)], include_in_schema=False)
 async def cache_purge_query(
     req: CachePurgeRequest,
     cache: RedisSemanticCache = Depends(get_semantic_cache),
@@ -306,17 +336,17 @@ async def cache_purge_query(
         "threshold": req.threshold or 0.85,
     }
 
-@app.post("/cache/clear", dependencies=[Depends(require_internal_or_admin)], include_in_schema=False)
+@app.post("/cache/clear", dependencies=[Depends(require_admin_key)], include_in_schema=False)
 async def cache_clear(cache: RedisSemanticCache = Depends(get_semantic_cache)):
     success = await cache.aclear()
     return {"status": "cleared" if success else "failed"}
 
-@app.post("/cache/purge-invalid", dependencies=[Depends(require_internal_or_admin)], include_in_schema=False)
+@app.post("/cache/purge-invalid", dependencies=[Depends(require_admin_key)], include_in_schema=False)
 async def cache_purge_invalid(cache: RedisSemanticCache = Depends(get_semantic_cache)):
     purged = await cache.apurge_uncacheable_entries()
     return {"status": "ok", "purged_count": purged}
 
-@app.get("/queue/stats", dependencies=[Depends(require_internal_or_admin)], include_in_schema=False)
+@app.get("/queue/stats", dependencies=[Depends(require_admin_key)], include_in_schema=False)
 async def queue_stats(admission: AdmissionController = Depends(get_admission_controller)):
     return admission.get_stats()
 
@@ -354,8 +384,8 @@ async def chat_completions(
     xff = request.headers.get("x-forwarded-for")
     client_id = client_host or "anonymous"
 
-    internal_user = request.headers.get("x-internal-user", "").strip()
-    if internal_user and client_host in ("127.0.0.1", "::1", "localhost", "testclient") and not xff:
+    internal_user = _internal_user(request)  # DEFECT-30: signed by the web chat bridge, else 403
+    if internal_user:
         client_id = internal_user
     elif "session" in request.scope:
         u = request.session.get("user")
@@ -679,8 +709,8 @@ async def query_endpoint(
     client_id = client_host or "anonymous"
 
     # VULN-03: If forwarded by internal web chat proxy over direct loopback, attribute to the user
-    internal_user = request.headers.get("x-internal-user", "").strip()
-    if internal_user and client_host in ("127.0.0.1", "::1", "localhost", "testclient") and not xff:
+    internal_user = _internal_user(request)  # DEFECT-30: signed by the web chat bridge, else 403
+    if internal_user:
         client_id = internal_user
     elif "session" in request.scope:
         u = request.session.get("user")

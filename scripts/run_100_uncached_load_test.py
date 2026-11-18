@@ -19,6 +19,11 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+try:  # ADMIN_API_KEY for the admin routes (DEFECT-29)
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 import sys
 import time
 from pathlib import Path
@@ -114,7 +119,7 @@ async def run_100_cold_test(concurrency: int = 10, total_requests: int = 100):
     # Clear cache before starting
     try:
         async with aiohttp.ClientSession() as s:
-            async with s.post(f"{GATEWAY_URL}/cache/clear") as r:
+            async with s.post(f"{GATEWAY_URL}/cache/clear", headers={"X-Admin-Key": os.getenv("ADMIN_API_KEY", "")}) as r:
                 print(f"🧹 Pre-test cache purge: HTTP {r.status} (Cache emptied)")
     except Exception as e:
         print(f"⚠️ Cache clear warning: {e}")

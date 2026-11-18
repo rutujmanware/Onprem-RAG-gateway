@@ -198,13 +198,33 @@ def test_logged_in_user_cannot_use_cache_admin_routes(fakes, method, path, body)
     assert cache.cleared == 0 and cache.purged == 0
 
 
+KEY = "a-test-admin-key-of-reasonable-length"
+KEYED = {"X-Admin-Key": KEY}
+
+
+@pytest.fixture
+def admin_key(monkeypatch):
+    monkeypatch.setattr(gm, "ADMIN_KEY", KEY)
+
+
 @pytest.mark.parametrize("method,path,body", ADMIN_ROUTES)
-def test_loopback_and_admin_key_still_reach_admin_routes(fakes, method, path, body, monkeypatch):
-    monkeypatch.setattr(gm, "ADMIN_KEY", "a-test-admin-key-of-reasonable-length")
+def test_only_the_admin_key_reaches_admin_routes(fakes, admin_key, method, path, body):
+    """DEFECT-29: the server itself (loopback = any user of this shared host) needs the key too."""
+    cache = fakes[0]
     c = TestClient(gm.app)
-    assert c.request(method, path, json=body).status_code == 200                       # loopback
-    r = c.request(method, path, json=body, headers={**EXTERNAL, "X-Admin-Key": "a-test-admin-key-of-reasonable-length"})
-    assert r.status_code == 200
+    assert c.request(method, path, json=body).status_code == 404                        # loopback, no key
+    assert c.request(method, path, json=body, headers={"X-Admin-Key": "wrong-key"}).status_code == 404
+    assert cache.cleared == 0 and cache.purged == 0
+    assert c.request(method, path, json=body, headers=KEYED).status_code == 200         # loopback + key
+    r = c.request(method, path, json=body, headers={**EXTERNAL, "Authorization": f"Bearer {KEY}"})
+    assert r.status_code == 200                                                          # remote + key
+
+
+def test_admin_routes_are_closed_when_no_key_is_configured(fakes, monkeypatch):
+    monkeypatch.setattr(gm, "ADMIN_KEY", "")
+    c = TestClient(gm.app)
+    assert c.post("/cache/clear").status_code == 404
+    assert c.post("/cache/clear", headers={"X-Admin-Key": ""}).status_code == 404
 
 
 def test_session_still_reaches_the_question_routes(fakes):
@@ -216,8 +236,25 @@ def test_session_still_reaches_the_question_routes(fakes):
 
 @pytest.mark.parametrize("path", ["/v1/chat/completions", "/query", "/cache/purge"])
 @pytest.mark.parametrize("body", [b"not json{", b"{}", b""])
-def test_malformed_body_does_not_reveal_hidden_routes(fakes, path, body):
+def test_malformed_body_does_not_reveal_hidden_routes(fakes, admin_key, path, body):
     c = TestClient(gm.app)
     h = {"content-type": "application/json"}
+    allowed = {**h, **KEYED} if path.startswith("/cache") else h                       # loopback (+ key for admin)
     assert c.post(path, content=body, headers={**EXTERNAL, **h}).status_code == 404   # unauthorised: hidden
-    assert c.post(path, content=body, headers=h).status_code == 422                   # loopback: real error
+    assert c.post(path, content=body, headers=allowed).status_code == 422             # authorised: real error
+
+
+@pytest.mark.parametrize("method,path", [("POST", "/cache/stats"), ("GET", "/cache/clear"), ("PUT", "/cache/purge"),
+                                         ("DELETE", "/queue/stats")])
+def test_wrong_method_on_admin_route_does_not_reveal_it(fakes, admin_key, method, path):
+    c = TestClient(gm.app)
+    c.cookies.set("askiisc_session", _session_cookie())          # ordinary logged-in user, no role
+    assert c.request(method, path, headers=EXTERNAL).status_code == 404
+    assert TestClient(gm.app).request(method, path).status_code == 404                 # loopback without key
+    assert TestClient(gm.app).request(method, path, headers=KEYED).status_code == 405  # key holder: real answer
+
+
+def test_unknown_path_still_404_and_normal_http_errors_unchanged(fakes):
+    c = TestClient(gm.app)
+    assert c.get("/no-such-route", headers=EXTERNAL).status_code == 404
+    assert c.post("/healthz", headers=EXTERNAL).status_code == 405   # public route: wrong method stays 405

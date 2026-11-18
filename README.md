@@ -447,7 +447,7 @@ curl -s -X POST http://localhost:8080/query \
   -d '{"query": "What is vermiculite?", "max_tokens": 150}' | jq .
 
 # Administrative semantic cache statistics:
-curl -s http://localhost:8080/cache/stats | jq .
+make cache-stats   # admin routes need ADMIN_API_KEY from .env, even on this server (sent via X-Admin-Key)
 ```
 
 ---

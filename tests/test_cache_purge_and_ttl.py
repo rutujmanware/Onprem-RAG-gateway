@@ -20,6 +20,13 @@ ADMIN_KEY = "test-admin-key"
 AUTH_HEADERS = {"Authorization": f"Bearer {ADMIN_KEY}"}
 
 
+@pytest.fixture(autouse=True)
+def _admin_key(monkeypatch):
+    """Admin routes need the key, also from loopback (DEFECT-29)."""
+    import gateway.main as gm
+    monkeypatch.setattr(gm, "ADMIN_KEY", ADMIN_KEY)
+
+
 def test_default_cache_ttl_is_4_hours():
     """Verify that the default TTL is 4 hours (14,400s)."""
     cache = RedisSemanticCache.get_instance()

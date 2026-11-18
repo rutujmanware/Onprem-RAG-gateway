@@ -19,6 +19,7 @@ import pytest
 
 import gateway.cache.redis_semantic_cache as M
 from gateway.cache.redis_semantic_cache import RedisSemanticCache
+from gateway.auth.internal import internal_user_headers  # signed X-Internal-User (DEFECT-30)
 
 # Fresh identities per run: the live tests make several regenerate attempts and the real per-user quota
 # (20 per hour) would otherwise reject repeated runs of `make test` with HTTP 429.
@@ -204,7 +205,7 @@ def gw():
 
 def _first_event(client, query, user, **extra):
     with client.stream("POST", "http://127.0.0.1:8080/query", json={"query": query, "stream": True, **extra},
-                       headers={"X-Internal-User": user}, timeout=60) as r:
+                       headers=internal_user_headers(user), timeout=60) as r:
         if r.status_code != 200:
             return {"http": r.status_code, "detail": json.loads(r.read() or b"{}").get("detail")}
         for line in r.iter_lines():
