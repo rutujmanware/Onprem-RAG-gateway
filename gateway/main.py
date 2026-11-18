@@ -301,6 +301,18 @@ def _metadata_sse():
     yield "data: [DONE]\n\n"
 
 
+CACHE_MAX_TEMPERATURE = 0.3
+CACHE_MIN_MAX_TOKENS = 512
+
+
+def standard_generation(temperature: Optional[float], max_tokens: Optional[int]) -> bool:
+    """DEFECT-39: only answers generated with the standard settings may be cached. Shared exact entries are
+    write-once, so whoever asks first sets the answer everyone gets; with this rule a caller cannot make a
+    high-temperature or deliberately truncated answer the cached one. Such requests are answered, not stored."""
+    t = 0.2 if temperature is None else temperature
+    return t <= CACHE_MAX_TEMPERATURE and (max_tokens is None or max_tokens >= CACHE_MIN_MAX_TOKENS)
+
+
 def _retrieval_unavailable_response() -> JSONResponse:
     return JSONResponse({"detail": RETRIEVAL_UNAVAILABLE_MESSAGE}, status_code=503,
                         headers={"Retry-After": str(RETRIEVAL_RETRY_AFTER_SECONDS)})
@@ -579,7 +591,8 @@ async def chat_completions(
 
                 # Save generated completion to cache only when document chunks were retrieved
                 complete_text = "".join(full_ans)
-                if complete_text and collected_chunks and not incomplete:
+                if (complete_text and collected_chunks and not incomplete
+                        and standard_generation(req.temperature, req.max_tokens)):
                     try:
                         cache.store(query, {"answer": complete_text, "chunks": collected_chunks}, owner=client_id)
                         if query != raw_query:
@@ -701,7 +714,7 @@ async def chat_completions(
         )
         ans_text = rag_res.get("answer", "")
         retrieved_chunks = rag_res.get("chunks", [])
-        if retrieved_chunks:
+        if retrieved_chunks and standard_generation(req.temperature, req.max_tokens):
             await cache.astore(query, {"answer": ans_text, "chunks": retrieved_chunks}, owner=client_id)
         return {
             "id": f"chatcmpl-slm-{uuid.uuid4().hex[:8]}",
@@ -779,7 +792,7 @@ async def query_endpoint(
         await cache.alog_regen_event(regen, client_id, evicted)
     regen_kind = regen["kind"] if regen else None
     use_cache = (not req.bypass_cache) and regen is None
-    may_store = (not req.bypass_cache) or regen is not None
+    may_store = ((not req.bypass_cache) or regen is not None) and standard_generation(req.temperature, req.max_tokens)
 
     # DEFECT-33: counting/listing theses by metadata is not supported; say so (never cached, no model call)
     if is_metadata_query(raw_query):

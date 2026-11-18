@@ -1559,5 +1559,14 @@ tests/test_constant_time_and_cookie_security.py::test_secrets_compare_digest_tim
 - **Tests:** [`tests/test_mail_error_disclosure.py`](tests/test_mail_error_disclosure.py): generic body, no exception class or errno, details still in the log; the standalone app no longer echoes the exception.
 - **Live (2026-11-18):** temporary gateway with SMTP pointed at a closed port → 503 with the generic message; details in the server log.
 
+## DEFECT-39: A User Could Set or Replace the Shared Cached Answer (NFR-6)
+
+- **Report (against rt-baseline):** streaming `/query` ignored `bypass_cache` on store and the exact-cache write was an unconditional overwrite, so user B's request (`stream`, `bypass_cache`, `temperature: 2.0`, `max_tokens: 16`) replaced the answer every other user got for that question.
+- **Status on main:** that path was already closed: every store honours `bypass_cache` (`may_store`), and shared exact entries are write-once (`SET NX`; a regenerate only creates a private override). Re-verified live: A's second request returned A's own answer.
+- **Remaining gap (fixed here):** the cache key ignores generation parameters, so the *first* asker could make a high-temperature or truncated answer the shared one (live: B asked first with `temperature: 2.0`, `max_tokens: 16`; A then got B's 16-token answer from the cache).
+- **Fix** ([`gateway/main.py`](gateway/main.py)): `standard_generation()` — an answer is stored only if it was generated with standard settings (temperature ≤ 0.3, no `max_tokens` below 512); applied to every store path (`/query` both modes, streaming and fallback `/v1/chat/completions`). Other requests are answered but not cached.
+- **Tests:** [`tests/test_cache_overwrite.py`](tests/test_cache_overwrite.py): the settings rule, every store path guarded, write-once exact entries, and live: a later store cannot replace the shared answer.
+- **Live (2026-11-18, production):** reported attack → A keeps A's answer; B first with non-standard settings → A gets a fresh answer (`cached: false`), not B's; a standard request is then cached as usual.
+
 ## Remediation Complete
 All security vulnerabilities, cache qualification defects, frontend/backend break vectors, and redundant code have been fully resolved, hardened, and verified with passing regression tests. All changes are cleanly staged. Per instructions, `git commit` has not been run.
