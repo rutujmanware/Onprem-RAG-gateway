@@ -31,7 +31,7 @@ Individually rate-limiting, retrying, or caching at the application layer is ad 
 * External cloud SaaS dependencies (the architecture enforces 100% zero-egress bare-metal operation).
 * A commercial multi-tenant credit-billing system (tenants and users are authenticated campus identities).
 * General-purpose API gateway features unrelated to LLM/RAG workloads (e.g., GraphQL proxies, arbitrary REST routing).
-* Metadata-filtered retrieval (restricting results by author, advisor, department, degree or year) is not applicable to this project: retrieval is content-based, and questions that name a person or department are answered by semantic search over thesis text.
+* Metadata-filtered retrieval (restricting results by author, advisor, department, degree or year) is not applicable to this project: retrieval is content-based. Requests to count or list theses by such fields (*"how many theses in the materials department"*, *"list theses by Prof. X in 2015"*) get a short notice that this is not supported yet (no model call, not cached; DEFECT-33). Ordinary questions that mention a department or a year are answered by semantic search over thesis text; implicit metadata filtering of such questions is off because it lowered retrieval quality (frozen 244-question set: hit@3 0.711 without vs. 0.691 with; 4 questions better, 0 worse).
 
 ---
 

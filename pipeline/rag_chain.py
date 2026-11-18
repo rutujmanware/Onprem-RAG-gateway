@@ -28,6 +28,7 @@ if str(ROOT_DIR) not in sys.path:
 
 from pipeline.retriever import (RETRIEVAL_UNAVAILABLE_MESSAGE, RedisChunkRetriever, RetrievalUnavailable,
                                 is_retrieval_outage, retrieve_chunks, sanitize_chunks)
+from pipeline.metadata_queries import METADATA_QUERY_MESSAGE, is_metadata_query
 from pipeline.sanitizer import (is_no_relevant_docs_answer, starts_with_refusal, strip_mixed_refusal,
                                 strip_mixed_refusal_text)
 from pipeline.slm_runner import CPUSLMEngine
@@ -107,20 +108,33 @@ def _gpu_inprocess_fallback_enabled() -> bool:
     return os.getenv("GPU_INPROCESS_FALLBACK", "0").strip() == "1"
 
 
+def metadata_query_result(query: str) -> Dict[str, Any]:
+    """Reply to a count/list-by-metadata request (DEFECT-33). No sources, so it is never cached."""
+    return {"query": query, "answer": METADATA_QUERY_MESSAGE, "route": "unsupported", "target_tier": "none",
+            "metadata_query": True, "chunks": [],
+            "stats": {"retrieval_seconds": 0.0, "generation_seconds": 0.0, "total_seconds": 0.0, "model": "none",
+                      "server": "metadata-query-notice"}}
+
+
+def metadata_query_events():
+    stats = {"retrieval_seconds": 0.0, "generation_seconds": 0.0, "total_seconds": 0.0, "ttft_seconds": 0.0,
+             "num_tokens": len(METADATA_QUERY_MESSAGE.split()), "model": "none", "server": "metadata-query-notice"}
+    yield {"type": "route", "route": "unsupported", "target_tier": "none", "metadata_query": True}
+    yield {"type": "chunks", "chunks": []}
+    yield {"type": "token", "delta": METADATA_QUERY_MESSAGE}
+    yield {"type": "done", "full_answer": METADATA_QUERY_MESSAGE, "chunks": [], "stats": stats}
+
+
 def _cpu_retry_context(chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Second CPU-tier context, used once when the 3B model refused on-topic documents and the 7B tier
     cannot be asked (GPU down or failed): the next three retrieved chunks. Whether the 3B refuses depends
     on the exact passages it is shown (measured: a combustor question refused on chunks 1-3 at similarity
     0.74 and answered from chunks 4-6 of the same thesis)."""
-    if not chunks or chunks[0].get("doc_id") == "catalog_summary":
-        return []
-    return chunks[3:6]
+    return chunks[3:6] if chunks else []
 
 
 def _cpu_context(chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """The CPU tier's context size (3 documents; a catalog summary is kept whole)."""
-    if chunks and chunks[0].get("doc_id") == "catalog_summary":
-        return chunks
+    """The CPU tier's context size (3 documents)."""
     return chunks[:3]
 
 
@@ -296,6 +310,8 @@ class RAGQAPipeline:
         """Execute full RAG flow: Route -> Retrieve -> Ground -> Generate.
         Uses parallel fan-out (concurrent routing & candidate retrieval) when not precomputed.
         """
+        if is_metadata_query(query):  # DEFECT-33: counting/listing by metadata is not supported
+            return metadata_query_result(query)
         from pipeline.text_processing.typo_normalizer import TypoNormalizer
         query = TypoNormalizer.get_instance().normalize(query)
         k = top_k or self.top_k
@@ -352,10 +368,7 @@ class RAGQAPipeline:
 
             # In-memory dynamic document slicing
             if chunks is None:
-                is_catalog = bool(candidate_chunks and candidate_chunks[0].get("doc_id") == "catalog_summary")
-                if is_catalog:
-                    chunks = candidate_chunks
-                elif top_k is not None:
+                if top_k is not None:
                     chunks = candidate_chunks[:top_k]
                 elif is_hard:
                     chunks = candidate_chunks[:8]  # Up to 8 docs for GPU LLM 7B
@@ -366,6 +379,7 @@ class RAGQAPipeline:
             prob = route_decision.get("probability_hard", 1.0 if is_hard else 0.0)
 
         retrieval_duration = pre_duration
+
 
         if is_hard:
 
@@ -645,6 +659,9 @@ class RAGQAPipeline:
         chunks: Optional[List[Dict[str, Any]]] = None,
     ):
         """Streaming version of RAG flow. Yields events: metadata first, then token chunks, then summary."""
+        if is_metadata_query(query):  # DEFECT-33: counting/listing by metadata is not supported
+            yield from metadata_query_events()
+            return
         from pipeline.text_processing.typo_normalizer import TypoNormalizer
         query = TypoNormalizer.get_instance().normalize(query)
         k = top_k or self.top_k
@@ -694,10 +711,7 @@ class RAGQAPipeline:
 
             # In-memory dynamic document slicing
             if chunks is None:
-                is_catalog = bool(candidate_chunks and candidate_chunks[0].get("doc_id") == "catalog_summary")
-                if is_catalog:
-                    chunks = candidate_chunks
-                elif top_k is not None:
+                if top_k is not None:
                     chunks = candidate_chunks[:top_k]
                 elif is_hard:
                     chunks = candidate_chunks[:8]  # Up to 8 docs for GPU LLM 7B
@@ -708,6 +722,7 @@ class RAGQAPipeline:
             prob = route_decision.get("probability_hard", 1.0 if is_hard else 0.0)
 
         retrieval_duration = pre_duration
+
 
         def relay(deltas, model: str, server: str, escalate_refusal: bool = False):
             """Yield token events then the done event. Raises only if nothing was streamed yet
@@ -1087,7 +1102,7 @@ def main():
         chunks = result.get("chunks", [])
         print(f"   ✓ Retrieved {len(chunks)} chunks in {result.get('stats', {}).get('retrieval_seconds', 0)}s")
         for i, c in enumerate(chunks, 1):
-            sim = c.get("similarity", 0) * 100
+            sim = (c.get("similarity") or 0) * 100
             doc_label = c.get("title") or c.get("doc_id") or f"Document {i}"
             print(f"   [{i}] (Similarity: {sim:.1f}%) | Title: {doc_label[:60]}")
 
@@ -1116,7 +1131,7 @@ def main():
             chunks = ev.get("chunks", [])
             print(f"   ✓ Retrieved {len(chunks)} chunks in {ev.get('retrieval_seconds', 0)}s")
             for i, c in enumerate(chunks, 1):
-                sim = c.get("similarity", 0) * 100
+                sim = (c.get("similarity") or 0) * 100
                 doc_label = c.get("title") or c.get("doc_id") or f"Document {i}"
                 print(f"   [{i}] (Similarity: {sim:.1f}%) | Title: {doc_label[:60]}")
             print(f"\n💡 Step 2: Answer streaming from {model_label}:")

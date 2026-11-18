@@ -44,6 +44,8 @@ from gateway.clients.vllm_client import VLLMClient
 from pipeline.rag_chain import GPU_FALLBACK_REASON, RAGQAPipeline, _gpu_inprocess_fallback_enabled
 from pipeline.retriever import (RETRIEVAL_RETRY_AFTER_SECONDS, RETRIEVAL_UNAVAILABLE_MESSAGE, RetrievalUnavailable,
                                 is_retrieval_outage, sanitize_chunks)
+from pipeline.metadata_queries import METADATA_QUERY_MESSAGE, is_metadata_query
+from pipeline.rag_chain import metadata_query_events, metadata_query_result
 from pipeline.sanitizer import sanitize_and_fence_prompt, PromptInjectionAlert, is_no_relevant_docs_answer
 
 logger = logging.getLogger("gateway.main")
@@ -276,6 +278,12 @@ async def hide_guarded_routes_on_bad_body(request: Request, exc: RequestValidati
     return await request_validation_exception_handler(request, exc)
 
 
+def _metadata_sse():
+    for e in metadata_query_events():
+        yield f"data: {json.dumps(e)}\n\n"
+    yield "data: [DONE]\n\n"
+
+
 def _retrieval_unavailable_response() -> JSONResponse:
     return JSONResponse({"detail": RETRIEVAL_UNAVAILABLE_MESSAGE}, status_code=503,
                         headers={"Retry-After": str(RETRIEVAL_RETRY_AFTER_SECONDS)})
@@ -375,6 +383,22 @@ async def chat_completions(
             sanitize_and_fence_prompt(m.content or "")
     except PromptInjectionAlert as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+    # DEFECT-33: counting/listing theses by metadata is not supported; say so (never cached, no model call)
+    if is_metadata_query(raw_query):
+        cid = f"chatcmpl-meta-{uuid.uuid4().hex[:8]}"
+        meta = {"tier": "none", "route": "unsupported", "metadata_query": True}
+        if req.stream:
+            def _meta_chat_sse():
+                yield "data: " + json.dumps({"id": cid, "object": "chat.completion.chunk", "model": "none",
+                                             "choices": [{"index": 0, "delta": {"content": METADATA_QUERY_MESSAGE},
+                                                          "finish_reason": "stop"}], "router_meta": meta}) + "\n\n"
+                yield "data: [DONE]\n\n"
+            return StreamingResponse(_meta_chat_sse(), media_type="text/event-stream",
+                                     headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+        return {"id": cid, "object": "chat.completion", "model": "none",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": METADATA_QUERY_MESSAGE},
+                             "finish_reason": "stop"}], "router_meta": meta}
 
     from pipeline.text_processing.typo_normalizer import TypoNormalizer
     query = TypoNormalizer.get_instance().normalize(raw_query)
@@ -735,6 +759,15 @@ async def query_endpoint(
     use_cache = (not req.bypass_cache) and regen is None
     may_store = (not req.bypass_cache) or regen is not None
 
+    # DEFECT-33: counting/listing theses by metadata is not supported; say so (never cached, no model call)
+    if is_metadata_query(raw_query):
+        if req.stream:
+            return StreamingResponse(_metadata_sse(), media_type="text/event-stream",
+                                     headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+        res = metadata_query_result(raw_query)
+        res["cached"] = False
+        return res
+
     # Step 0: Check Semantic Vector Cache in Redis (Fast path < 5ms bypasses admission queue)
     hit = None
     if use_cache:
@@ -900,10 +933,7 @@ async def query_endpoint(
         is_hard = (decision.target_tier == ModelTier.GPU_LLM)
 
         # Step 2: Dynamic In-Memory Tier Document Slicing
-        is_catalog = bool(candidate_chunks and candidate_chunks[0].get("doc_id") == "catalog_summary")
-        if is_catalog:
-            chunks = candidate_chunks
-        elif req.top_k is not None:
+        if req.top_k is not None:
             chunks = candidate_chunks[:req.top_k]
         elif is_hard:
             chunks = candidate_chunks[:8]  # Up to 8 docs for GPU LLM 7B
