@@ -1238,8 +1238,74 @@ class RedisSemanticCache:
         if has_neg_a != has_neg_b:
             return True, f"Polarity / Negation mismatch: {has_neg_a} vs {has_neg_b}"
 
-        # 3. Intent equivalence (red-team finding: semantic cache intent collisions)
+        # 3. Near-spelling entity swap (DEFECT-40): graphane vs graphene, neutrons vs neurons embed almost
+        #    identically, but both are real terms; a typo of the earlier question (not a real word) still hits.
+        swap = _near_spelling_swap(words_a, words_b)
+        if swap:
+            return True, f"Different terms with similar spelling: {swap[0]!r} vs {swap[1]!r}"
+
+        # 4. Intent equivalence (red-team finding: semantic cache intent collisions)
         return check_intent_conflict(query_a, query_b)
+
+
+def _edit_distance_le2(a: str, b: str) -> bool:
+    if abs(len(a) - len(b)) > 2:
+        return False
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i] + [0] * len(b)
+        for j, cb in enumerate(b, 1):
+            cur[j] = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb))
+        if min(cur) > 2:
+            return False
+        prev = cur
+    return prev[-1] <= 2
+
+
+def _same_lemma(a: str, b: str) -> bool:
+    """Inflections of one word (corrode/corrodes/corroded, thesis/theses, engine/engines) are not different terms."""
+    try:
+        from lemminflect import getAllLemmas
+        la = {l for v in getAllLemmas(a).values() for l in v} | {a}
+        lb = {l for v in getAllLemmas(b).values() for l in v} | {b}
+        if la & lb:
+            return True
+    except Exception:
+        pass
+    strip = lambda w: w[:-2] if w.endswith("es") else (w[:-1] if w.endswith("s") else w)
+    return strip(a) == strip(b)
+
+
+# Pairs of everyday words (effect/affect, dependent/dependence) are left to the other rules; the swap rule is for
+# technical terms: the rarer word of the pair must be below this English frequency (neutrons 0.7 M, neurons 3.5 M).
+SWAP_MAX_COMMON_FREQ = 5_000_000
+
+
+def _english_freq(w: str) -> int:
+    from pipeline.retriever import RedisChunkRetriever
+    return RedisChunkRetriever._english_freq(w)
+
+
+def _real_word(w: str) -> bool:
+    from pipeline.text_processing import typo_normalizer as tn
+    if tn._is_english(w):
+        return True
+    try:
+        return tn._in_corpus(w)
+    except tn.CorpusUnavailable:
+        return True     # cannot tell: treat as real, so the hit is refused (a fresh answer is always safe)
+
+
+def _near_spelling_swap(words_a, words_b):
+    only_a = [w for w in words_a - words_b if len(w) >= 4 and w.isalpha()]
+    only_b = [w for w in words_b - words_a if len(w) >= 4 and w.isalpha()]
+    for a in only_a:
+        for b in only_b:
+            if (_edit_distance_le2(a, b) and not _same_lemma(a, b)
+                    and min(_english_freq(a), _english_freq(b)) < SWAP_MAX_COMMON_FREQ
+                    and _real_word(a) and _real_word(b)):
+                return a, b
+    return None
 
 
 # ---------------------------------------------------------------------------

@@ -944,6 +944,12 @@
               cacheInfo = d;
               showCacheNote(head, d);
             }
+            else if (ev === 'correction') {   // the question was spell-corrected before searching
+              const n = document.createElement('div');
+              n.className = 'note';
+              n.textContent = 'Showing results for: \u201c' + (d.q || '') + '\u201d';
+              head.after(n);
+            }
             else if (ev === 'sources' || ev === 'chunks') {
               if (d.citations) showSources(d.citations);
               else if (d.chunks) showSources(d.chunks);

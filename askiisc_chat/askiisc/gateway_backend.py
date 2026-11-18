@@ -130,6 +130,8 @@ async def stream_via_gateway(query: str, tier: str, user_email: str = "", regene
                 st["route"] = "cache"      # a HIT is followed by a route event whose tier is semantic_cache
                 out.append(sse("cache", {"kind": d.get("cache_kind"), "matched_prompt": str(d.get("matched_prompt") or "")[:1500],
                                          "similarity": d.get("similarity"), "regenerate_token": d.get("regenerate_token")}))
+        elif t == "correction":
+            out.append(sse("correction", {"q": str(d.get("normalized_query") or "")[:500]}))
         elif t == "error":
             out.append(sse("error", {"msg": str(d.get("message") or d.get("error") or "The answering service reported an error.")[:200]}))
         elif t == "done":

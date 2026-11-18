@@ -1308,6 +1308,7 @@ tests/test_constant_time_and_cookie_security.py::test_secrets_compare_digest_tim
 - **Tests:** [`tests/test_premise_routing.py`](tests/test_premise_routing.py) (detector, dispatcher escalation, saturation fallback, streaming path with healthy/unhealthy daemon, alpha wiring), [`tests/test_premise_rules.py`](tests/test_premise_rules.py).
 
 ---
+- **Red-team re-report (streaming routes at 0.5, against rt-baseline):** already fixed here. Re-verified live 2026-11-18 on production with the reported query (P(hard) = 0.609, inside 0.5–0.65): `cpu_slm` both non-streaming and streaming; eight other questions also routed identically in both modes. Both paths use the same router model with α = `ROUTING_ALPHA`.
 
 ## DEFECT-16: Short Topic Questions Answered or Refused Depending on Phrasing + Cache Lifetime 4 h
 
@@ -1379,6 +1380,7 @@ tests/test_constant_time_and_cookie_security.py::test_secrets_compare_digest_tim
 - **Open (ops decisions):** upgrade Redis Stack to a release with the RediSearch fix; enable persistence (`save` or AOF) so a restart does not roll back days of state; the ~1 h reload time is an availability risk.
 
 ---
+- **Red-team re-report (KEYS blocking Redis, against rt-baseline):** already fixed here; re-measured 2026-11-18 on production (2,261,708 keys): 50 × `/cache/stats` in 0.10 s with PING from another client at max 1.7 ms (idle max 0.9 ms); a full-keyspace `/cache/purge-invalid` (SCAN, batches of 2,000) in 0.86 s with PING max 1.4 ms (reported: 316 ms per KEYS call). `/cache/stats` also needs the admin key since DEFECT-29, so a normal user cannot call it.
 
 ## DEFECT-22: Questions About Rare Technical Terms Returned "No Theses Found"
 
@@ -1567,6 +1569,18 @@ tests/test_constant_time_and_cookie_security.py::test_secrets_compare_digest_tim
 - **Fix** ([`gateway/main.py`](gateway/main.py)): `standard_generation()` — an answer is stored only if it was generated with standard settings (temperature ≤ 0.3, no `max_tokens` below 512); applied to every store path (`/query` both modes, streaming and fallback `/v1/chat/completions`). Other requests are answered but not cached.
 - **Tests:** [`tests/test_cache_overwrite.py`](tests/test_cache_overwrite.py): the settings rule, every store path guarded, write-once exact entries, and live: a later store cannot replace the shared answer.
 - **Live (2026-11-18, production):** reported attack → A keeps A's answer; B first with non-standard settings → A gets a fresh answer (`cached: false`), not B's; a standard request is then cached as usual.
+
+## DEFECT-40: Typo Normaliser Turned Distinct Terms Into Others; Cache Served One Term's Answer for Another
+
+- **Symptom:** correctly spelled terms were rewritten before retrieval and the exact cache key: *graphane*, *graphyne* → *graphene*, *ferrielectric* → *ferroelectric*, and without a system word list *neutrons* → *neurons*; asking about graphane returned the cached graphene answer at similarity 1.0. Re-checked on `main`: the first three were still rewritten.
+- **Root cause:** a word was protected only if it was in a ~400-word vocabulary or in `/usr/share/dict/words` (107-word fallback when absent), so any other word within edit distance 1–2 of a vocabulary term was "corrected". Separately, after protection was added, the graphane question still hit the graphene answer through the semantic cache (same user, near-identical embedding), which the intent guard did not separate.
+- **Fix:**
+  - [`pipeline/text_processing/typo_normalizer.py`](pipeline/text_processing/typo_normalizer.py): a word is never rewritten if it is in the English dictionary bundled with `symspellpy` (82,765 words, no system word list needed) or appears in at least `TYPO_CORPUS_MIN_CHUNKS` (5) thesis chunks (measured: real terms 9–1,323, typos and PDF-extraction fragments 0–3). Decisions made while the index is unreachable are not cached.
+  - [`gateway/cache/redis_semantic_cache.py`](gateway/cache/redis_semantic_cache.py): the semantic-hit guard refuses a hit when the questions differ by a small spelling change (edit distance ≤ 2) between two real words that are not inflections of one lemma (`lemminflect`) and not both very common English words; typos of an earlier question still hit.
+  - When the normaliser changes a question, the stream sends a `correction` event and the chat shows "Showing results for: …" (non-streaming responses already carry `normalized_query`).
+- **Measured:** retrieval on the frozen 244-question set unchanged (hit@3 0.711); the normaliser changes none of those questions. All cache intent-guard suites pass (624); one documented hard case is now caught (*CNNs* vs *RNNs*).
+- **Tests:** [`tests/test_typo_protection.py`](tests/test_typo_protection.py): common words protected without a system word list, corpus terms protected, typos still corrected, distinct terms no longer share an exact key, decisions without the index not cached, semantic hits refused between distinct terms but kept for typos and plurals, and a live corpus check.
+- **Live (2026-11-19, production):** graphane after graphene → fresh answer; neurons after neutrons → fresh answer; the typo *grapheen* → graphene's cached answer with `normalized_query` shown.
 
 ## Remediation Complete
 All security vulnerabilities, cache qualification defects, frontend/backend break vectors, and redundant code have been fully resolved, hardened, and verified with passing regression tests. All changes are cleanly staged. Per instructions, `git commit` has not been run.

@@ -828,6 +828,8 @@ async def query_endpoint(
 
         if req.stream:
             def cached_stream():
+                if query != raw_query:   # DEFECT-40: tell the user what was searched for
+                    yield f"data: {json.dumps({'type': 'correction', 'normalized_query': query})}\n\n"
                 # Yield cache hit notification event
                 yield f"data: {json.dumps({'type': 'cache', 'status': 'HIT', 'similarity': sim, 'matched_prompt': matched_prompt, 'badge': 'Cached answer', 'cache_kind': cache_kind, 'regenerate_token': regen_token, 'cached_at': cached_resp.get('cached_at', time.time())})}\n\n"
                 # Yield route event
@@ -892,6 +894,8 @@ async def query_endpoint(
                 collected_chunks = []
                 route_info = {}
                 incomplete = False
+                if query != raw_query:   # DEFECT-40: tell the user what was searched for
+                    yield f"data: {json.dumps({'type': 'correction', 'normalized_query': query})}\n\n"
                 for event in rag.answer_query_stream(
                     query,
                     top_k=req.top_k,
