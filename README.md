@@ -510,6 +510,8 @@ skip with a reason instead of failing, and run once those services are available
 | Ingested thesis index | live retrieval (topic, rare-term, dynamic floor) | §5 ingestion |
 | Running gateway on :8080 | live `/query` and `/chat` checks | `make prod-up` |
 
+`make injection-eval` measures the prompt-injection fence (NFR-7) on the frozen suites in `tests/data/injection_eval/` (`ROUND=round3` is the final test set).
+
 `make test` never downloads models (`HF_HUB_OFFLINE=1`; override with `make test HF_HUB_OFFLINE=0`).
 Run it through `make`: several files in `tests/` are standalone scripts, so a bare `pytest tests/` is not supported.
 
