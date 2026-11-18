@@ -1597,5 +1597,13 @@ tests/test_constant_time_and_cookie_security.py::test_secrets_compare_digest_tim
 - **Tests:** [`tests/test_readiness.py`](tests/test_readiness.py): every combination of Redis / CPU / GPU availability, outsiders see the status only, `/health` unchanged.
 - **Live (2026-11-19):** production `/ready` → 200 with all checks true (status only from outside); a gateway with Redis unreachable → `/health` 200, `/ready` 503 naming `redis_thesis_index`, `/query` 503 with the outage message.
 
+## DEFECT-43: Clean Install Pulled the Wrong `jwt` Package (Gateway Could Not Start)
+
+- **Symptom:** following the documented install (`pip install -r requirements.txt`) on a clean host, importing the gateway failed with `ImportError: cannot import name 'PyJWKClient' from 'jwt'`.
+- **Root cause:** `requirements.txt` listed `jwt>=1.3.1`, which on PyPI is GehirnInc's `jwt`, not PyJWT; the code (`askiisc_chat/askiisc/auth.py`, imported by the gateway at start-up) uses PyJWT's `PyJWKClient`. Our own environment had both installed (they share the `jwt` import name), which hid the error.
+- **Fix:** `requirements.txt` now lists `PyJWT[crypto]>=2.4.0` (PyJWKClient since 2.4.0) instead of `jwt`, with a comment that the two must not be installed together.
+- **Tests:** [`tests/test_requirements.py`](tests/test_requirements.py): PyJWT is listed and the package `jwt` is not; `from jwt import PyJWKClient` works.
+- **Verified (2026-11-19):** clean Python 3.11 virtualenvs: `jwt>=1.3.1` → the reported ImportError; `PyJWT[crypto]>=2.4.0` → `PyJWKClient` imports (PyJWT 2.15.1).
+
 ## Remediation Complete
 All security vulnerabilities, cache qualification defects, frontend/backend break vectors, and redundant code have been fully resolved, hardened, and verified with passing regression tests. All changes are cleanly staged. Per instructions, `git commit` has not been run.
