@@ -422,7 +422,7 @@ async def chat_completions(
     decision = dispatcher.decide(score, query=query)
 
     if req.stream:
-        await admission.acquire(client_id)
+        admission_ticket = await admission.acquire(client_id)  # per-user slot too (FR-5)
         rag = RAGQAPipeline()
         cmpl_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
         created_ts = int(time.time())
@@ -480,7 +480,7 @@ async def chat_completions(
                         pass
                 yield "data: [DONE]\n\n"
             finally:
-                admission.release()
+                admission.release(admission_ticket)
 
         return StreamingResponse(
             closing_stream(sse_chat_generator()),
@@ -523,12 +523,11 @@ async def chat_completions(
             if _gpu_inprocess_fallback_enabled():
                 try:
                     from pipeline.gpu_llm_runner import GPULLMEngine
-                    engine = GPULLMEngine.get_instance()
-                    gpu_res = engine.generate_chat(
-                        [{"role": m.role, "content": m.content} for m in req.messages],
-                        max_new_tokens=gpu_max_tokens,
-                        temperature=req.temperature or 0.2,
-                    )
+                    msgs = [{"role": m.role, "content": m.content} for m in req.messages]
+                    # model load + generation are blocking: keep them off the event loop (DEFECT-26)
+                    gpu_res = await run_in_threadpool(
+                        lambda: GPULLMEngine.get_instance().generate_chat(
+                            msgs, max_new_tokens=gpu_max_tokens, temperature=req.temperature or 0.2))
                     ans_text = gpu_res["text"]  # no retrieval: never cached (DEFECT-23)
                     return {
                         "id": f"chatcmpl-hard-{uuid.uuid4().hex[:8]}",
@@ -749,7 +748,7 @@ async def query_endpoint(
 
     # Cache Miss: Cold inference required. Guarded by Admission Queue Manager.
     if req.stream:
-        await admission.acquire(client_id)
+        admission_ticket = await admission.acquire(client_id)  # per-user slot too (FR-5)
         rag = RAGQAPipeline(top_k=req.top_k)
 
         def event_stream():
@@ -800,7 +799,7 @@ async def query_endpoint(
                         pass
                 yield "data: [DONE]\n\n"
             finally:
-                admission.release()
+                admission.release(admission_ticket)
 
         return StreamingResponse(
             closing_stream(event_stream()),

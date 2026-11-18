@@ -71,6 +71,8 @@ Individually rate-limiting, retrying, or caching at the application layer is ad 
   * The gateway shall encapsulate all UI and API traffic behind a unified port (`:8080`), restricting internal management endpoints (`/query`, `/cache/*`, `/queue/stats`) to authenticated campus web sessions or valid administrative API keys, returning HTTP 404 to unauthorized external callers.
 * **FR-5 (Should): Fair Admission Control & Overload Protection**
   * The gateway shall enforce per-client token-bucket rate limiting (default capacity 60, refill 20 tokens/sec, HTTP 429 on breach) and concurrency slot allocation (global cap 30, per-user cap 6, queue depth 120, timeout 30s) shedding excess load with HTTP 503.
+  * *Implementation (DEFECT-27):* the per-user cap counts a user's in-flight inferences across all gateway workers (Redis sorted set per user; entries older than 10 min are dropped, so a crashed worker cannot lock a user out; per-worker counting if Redis is unreachable). A request over the cap gets HTTP 429 with `Retry-After` immediately instead of occupying a slot. Cache hits are not counted.
+  * *Measured 2026-11-18 (production, 6 workers):* 8 simultaneous fresh requests from one user → 6 × HTTP 200, 2 × HTTP 429 within 0.1 s; another user's request right after → HTTP 200.
 * **FR-6 (Must): Adversarial Defense & Prompt Injection Fencing**
   * The gateway shall inspect incoming queries against known adversarial jailbreak patterns (DAN, system role overrides, delimiter breakout attempts) and escape XML tags in retrieved context before feeding generation prompts, rejecting malicious queries with HTTP 400.
 

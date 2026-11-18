@@ -1420,5 +1420,26 @@ tests/test_constant_time_and_cookie_security.py::test_secrets_compare_digest_tim
 - **Tests:** [`tests/test_gpu_fallback.py`](tests/test_gpu_fallback.py) (17, no services needed): GPU down / timing out / failing before the first token, streaming and non-streaming, CPU daemon up or down, `skip_gpu`, the opt-in engine failing, the `/v1/chat/completions` route returning 200 from the CPU tier, and the refusal retry (answers, second refusal stands, no further passages, 7B still preferred when up). 9 of the first 10 fail on the previous code.
 - **Live (2026-11-18, gateway with vLLM unreachable, production Redis and CPU tier):** the reported request returns HTTP 200 from the CPU tier (`fallback: gpu_unavailable`, 4.6 s); 10 streamed questions: 10/10 HTTP 200, fallback activation for the GPU-routed ones (route event → reroute event) p50 18 ms, max 41 ms; the combustor question that was refused now gets a grounded answer in both modes.
 
+## DEFECT-26: One Slow Request Blocked the Whole Gateway Worker (Event Loop)
+
+- **Symptom:** while one hard-routed `/query` request was failing slowly (GPU tier down, DEFECT-25), `/health` and every other request on the same gateway worker waited for it (43 s on a one-worker deployment); concurrent such requests also ran into the admission-queue timeout (HTTP 503).
+- **Root cause:** the `/query` hard-route fallback called the synchronous `rag.answer_query(...)` (model calls with up to 60–90 s HTTP timeouts, or an in-process model load) directly inside the async handler, which blocks the worker's event loop. The opt-in in-process GPU path of `/v1/chat/completions` did the same.
+- **Fix** ([`gateway/main.py`](gateway/main.py)): both run in the thread pool (`run_in_threadpool`), like the other pipeline calls; the streaming routes already ran their generators in worker threads (`closing_stream`). A slow request now only delays itself.
+- **Tests:** [`tests/test_event_loop_not_blocked.py`](tests/test_event_loop_not_blocked.py) (no services needed): with a deliberately slow, blocking CPU fallback, `/health` answers in milliseconds on the same event loop and the loop is never stalled ≥ 0.5 s (before the fix: stalled 1.5 s, the full duration of the slow call); a source check that pipeline/model calls in the async handlers go through the thread pool.
+- **Live (2026-11-18, one worker, vLLM unreachable):** `/health` during a hard request: HTTP 200 in 2.7 ms (was 43 s); the hard request: HTTP 200 in 4.0 s from the CPU tier (was HTTP 500 after 46 s).
+
+## DEFECT-27: Per-User Concurrency Cap Never Enforced (FR-5)
+
+- **Symptom:** one user could occupy every inference slot; other users were queued or shed with HTTP 503. `PER_USER_CONCURRENCY_LIMIT` (6) had no effect.
+- **Root cause:** `AdmissionController` stored `per_user_cap` but never read it; `acquire()` applied only the token bucket, the queue depth and the global semaphore. Also, all limits are per gateway worker (global 30 / 6 workers = 5 slots each), so a per-worker per-user count of 6 could never have triggered.
+- **Fix** ([`gateway/queue/admission.py`](gateway/queue/admission.py)):
+  - The cap counts a user's in-flight inferences across all workers: a Redis sorted set per user (hashed user id; member = request id, score = start time), checked and updated atomically in one Lua call. Entries older than 10 min (`PER_USER_SLOT_MAX_AGE_SECONDS`) are dropped first, so a crashed worker cannot lock a user out. If Redis is unreachable, the cap is counted per worker.
+  - Over the cap: HTTP 429 with `Retry-After` immediately (no slot, no queue position). The user's slot is released with the request, also when its queue wait fails.
+  - `acquire()` returns a ticket that `release(ticket)` frees; the streaming routes ([`gateway/main.py`](gateway/main.py)) pass it.
+  - Related fix: the streaming routes release their slot inside generators that run in worker threads, and `asyncio.Semaphore.release()` is not thread-safe; `release()` now hands the work to the event loop when called from a thread.
+- **Tests:** [`tests/test_per_user_cap.py`](tests/test_per_user_cap.py): the reported scenario (the second request of a user with cap 1 gets 429, another user is admitted), exactly `cap` concurrent requests, no slot leak on a queue timeout, release from a worker thread, and live with Redis: two controllers (two workers) share the cap; stale entries do not block. [`tests/test_admission_queue.py`](tests/test_admission_queue.py) now uses the per-worker counter (it tests global slots only).
+- **Live (2026-11-18, production, 6 workers):** 8 simultaneous fresh requests from one user → 6 × HTTP 200, 2 × HTTP 429 after 0.1 s; another user's request → HTTP 200.
+- **Not changed:** the fair-queue scheduler (`gateway/queue/fair_queue.py`) is still not used by the admission path; with the per-user cap a single user can hold at most 6 of the 30 slots.
+
 ## Remediation Complete
 All security vulnerabilities, cache qualification defects, frontend/backend break vectors, and redundant code have been fully resolved, hardened, and verified with passing regression tests. All changes are cleanly staged. Per instructions, `git commit` has not been run.
