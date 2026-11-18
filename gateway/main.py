@@ -340,7 +340,41 @@ except ImportError:  # pragma: no cover
 @app.get("/healthz", include_in_schema=False)
 @app.get("/health", include_in_schema=False)
 async def healthz():
+    """Liveness: the gateway process is up. Readiness (can it answer?) is /ready."""
     return {"status": "ok"}
+
+
+async def _readiness_checks(cache, slm, vllm) -> Dict[str, bool]:
+    async def redis_index() -> bool:
+        try:
+            names = await asyncio.wait_for(cache.async_client.execute_command("FT._LIST"), timeout=2.0)
+            names = {n.decode() if isinstance(n, bytes) else str(n) for n in names}
+            return os.getenv("REDIS_INDEX_NAME", "rag_documents_idx") in names
+        except Exception:
+            return False
+
+    async def up(client) -> bool:
+        try:
+            return bool(await asyncio.wait_for(client.check_health(), timeout=4.0))
+        except Exception:
+            return False
+
+    r, c, g = await asyncio.gather(redis_index(), up(slm), up(vllm))
+    return {"redis_thesis_index": r, "cpu_model": c, "gpu_model": g}
+
+
+@app.get("/ready", include_in_schema=False)
+async def ready(request: Request, cache: RedisSemanticCache = Depends(get_semantic_cache),
+                slm: CPUSLMClient = Depends(get_slm_client), vllm: VLLMClient = Depends(get_vllm_client)):
+    """Readiness (DEFECT-42): 200 only if Redis with the thesis index is reachable and at least one model tier
+    answers health checks (the CPU tier alone suffices: hard questions fall back to it, FR-2); else 503.
+    Which dependency failed is shown only to the server itself or an admin-key holder."""
+    checks = await _readiness_checks(cache, slm, vllm)
+    ok = checks["redis_thesis_index"] and (checks["cpu_model"] or checks["gpu_model"])
+    body: Dict[str, Any] = {"status": "ready" if ok else "not_ready"}
+    if _is_loopback(request) or _has_admin_key(request):
+        body["checks"] = checks
+    return JSONResponse(body, status_code=200 if ok else 503, headers={"Cache-Control": "no-store"})
 
 @app.get("/cache/stats", dependencies=[Depends(require_admin_key)], include_in_schema=False)
 async def cache_stats(cache: RedisSemanticCache = Depends(get_semantic_cache)):
