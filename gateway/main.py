@@ -39,7 +39,7 @@ from gateway.router.complexity_scorer import ComplexityScorer
 from gateway.router.dispatcher import ModelTier, RequestDispatcher
 from gateway.clients.cpu_slm_client import CPUSLMClient
 from gateway.clients.vllm_client import VLLMClient
-from pipeline.rag_chain import RAGQAPipeline
+from pipeline.rag_chain import GPU_FALLBACK_REASON, RAGQAPipeline, _gpu_inprocess_fallback_enabled
 from pipeline.retriever import sanitize_chunks
 from pipeline.sanitizer import sanitize_and_fence_prompt, PromptInjectionAlert, is_no_relevant_docs_answer
 
@@ -519,41 +519,46 @@ async def chat_completions(
                 except Exception:
                     pass
 
-            # In-process GPU LLM fallback
-            try:
-                from pipeline.gpu_llm_runner import GPULLMEngine
-                engine = GPULLMEngine.get_instance()
-                gpu_res = engine.generate_chat(
-                    [{"role": m.role, "content": m.content} for m in req.messages],
-                    max_new_tokens=gpu_max_tokens,
-                    temperature=req.temperature or 0.2,
-                )
-                ans_text = gpu_res["text"]  # no retrieval: never cached (DEFECT-23)
-                return {
-                    "id": f"chatcmpl-hard-{uuid.uuid4().hex[:8]}",
-                    "object": "chat.completion",
-                    "model": "Qwen/Qwen2.5-7B-Instruct",
-                    "choices": [{
-                        "index": 0,
-                        "message": {"role": "assistant", "content": ans_text},
-                        "finish_reason": "stop",
-                    }],
-                    "usage": {
-                        "prompt_tokens": -1,
-                        "completion_tokens": gpu_res["num_tokens"],
-                        "total_tokens": gpu_res["num_tokens"],
-                    },
-                    "router_meta": {
-                        "score": round(score, 4),
-                        "tier": decision.target_tier.value,
-                        "route": "hard",
-                        "reason": decision.reason,
-                        "routing_time_seconds": round(time.time() - t0, 4),
-                    },
-                    "user": user.email,
-                }
-            except Exception as e:
-                raise HTTPException(status_code=500, detail=f"GPU LLM generation failed: {str(e)}")
+            # In-process GPU LLM (opt-in only, GPU_INPROCESS_FALLBACK=1)
+            if _gpu_inprocess_fallback_enabled():
+                try:
+                    from pipeline.gpu_llm_runner import GPULLMEngine
+                    engine = GPULLMEngine.get_instance()
+                    gpu_res = engine.generate_chat(
+                        [{"role": m.role, "content": m.content} for m in req.messages],
+                        max_new_tokens=gpu_max_tokens,
+                        temperature=req.temperature or 0.2,
+                    )
+                    ans_text = gpu_res["text"]  # no retrieval: never cached (DEFECT-23)
+                    return {
+                        "id": f"chatcmpl-hard-{uuid.uuid4().hex[:8]}",
+                        "object": "chat.completion",
+                        "model": "Qwen/Qwen2.5-7B-Instruct",
+                        "choices": [{
+                            "index": 0,
+                            "message": {"role": "assistant", "content": ans_text},
+                            "finish_reason": "stop",
+                        }],
+                        "usage": {
+                            "prompt_tokens": -1,
+                            "completion_tokens": gpu_res["num_tokens"],
+                            "total_tokens": gpu_res["num_tokens"],
+                        },
+                        "router_meta": {
+                            "score": round(score, 4),
+                            "tier": decision.target_tier.value,
+                            "route": "hard",
+                            "reason": decision.reason,
+                            "routing_time_seconds": round(time.time() - t0, 4),
+                        },
+                        "user": user.email,
+                    }
+                except Exception as exc:
+                    logger.warning("In-process GPU engine failed (%s); rerouting to the CPU tier", exc)
+            # FR-2: GPU tier unavailable -> answered by the CPU SLM tier below (no HTTP 500).
+            gpu_failed = True
+        else:
+            gpu_failed = False
 
         # Step 3: Easy Queries -> CPU SLM Tier (Qwen 2.5 3B)
         slm_max_tokens = req.max_tokens if (req.max_tokens is not None and req.max_tokens > 0) else 160
@@ -567,10 +572,11 @@ async def chat_completions(
                 )
                 resp["router_meta"] = {
                     "score": round(score, 4),
-                    "tier": decision.target_tier.value,
-                    "route": "easy",
+                    "tier": ModelTier.CPU_SLM.value if gpu_failed else decision.target_tier.value,
+                    "route": "hard" if gpu_failed else "easy",
                     "reason": decision.reason,
                     "routing_time_seconds": round(time.time() - t0, 4),
+                    **({"fallback": GPU_FALLBACK_REASON} if gpu_failed else {}),
                 }
                 # no retrieval: never cached (DEFECT-23)
                 return resp
@@ -890,16 +896,20 @@ async def query_endpoint(
                         if query != raw_query:
                             await cache.astore(raw_query, res, owner=client_id, regen_kind=regen_kind)
                     return res
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.warning("GPU tier could not answer (%s); rerouting to the CPU tier", exc)
 
+            # FR-2: the GPU tier is down or failed for this request -> the chain answers on the CPU tier
+            # (skip_gpu: no second GPU attempt, so a timing-out GPU is not waited for twice).
             rag = RAGQAPipeline(top_k=req.top_k)
-            res = rag.answer_query(
+            res = await run_in_threadpool(
+                rag.answer_query,
                 query,
                 top_k=req.top_k,
                 max_new_tokens=gpu_max_tokens,
                 temperature=req.temperature or 0.2,
-                route_decision={"route": "hard", "target_tier": "gpu_vllm", "probability_hard": score},
+                route_decision={"route": "hard", "target_tier": "gpu_vllm", "probability_hard": score,
+                                "skip_gpu": True},
                 chunks=chunks,
             )
             if "chunks" in res:

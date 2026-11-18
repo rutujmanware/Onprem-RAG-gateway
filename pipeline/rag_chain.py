@@ -95,6 +95,34 @@ def _gpu_timeout():
     return httpx.Timeout(connect=2.0, read=60.0, write=10.0, pool=2.0)
 
 
+# FR-2: when the GPU tier cannot answer (vLLM down, timing out or failing), hard questions are answered by
+# the CPU tier. Loading the 7B model inside the gateway process instead (the old "Option B") cannot work in
+# production (no weights / no internet / one copy per worker) and turned GPU outages into HTTP 500s; it is
+# kept only as an explicit opt-in for single-process development setups.
+GPU_FALLBACK_REASON = "gpu_unavailable"
+
+
+def _gpu_inprocess_fallback_enabled() -> bool:
+    return os.getenv("GPU_INPROCESS_FALLBACK", "0").strip() == "1"
+
+
+def _cpu_retry_context(chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Second CPU-tier context, used once when the 3B model refused on-topic documents and the 7B tier
+    cannot be asked (GPU down or failed): the next three retrieved chunks. Whether the 3B refuses depends
+    on the exact passages it is shown (measured: a combustor question refused on chunks 1-3 at similarity
+    0.74 and answered from chunks 4-6 of the same thesis)."""
+    if not chunks or chunks[0].get("doc_id") == "catalog_summary":
+        return []
+    return chunks[3:6]
+
+
+def _cpu_context(chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """The CPU tier's context size (3 documents; a catalog summary is kept whole)."""
+    if chunks and chunks[0].get("doc_id") == "catalog_summary":
+        return chunks
+    return chunks[:3]
+
+
 def _iter_sse_deltas(response):
     """Content deltas from an OpenAI-style chat completion SSE stream."""
     for line in response.iter_lines():
@@ -274,6 +302,7 @@ class RAGQAPipeline:
 
         # Step 0: Parallel Fan-Out (Routing + Database Retrieval concurrently)
         pre_duration = 0.001
+        candidate_chunks = chunks  # full retrieval list (the CPU tier uses the first 3)
         if route_decision is None or chunks is None:
             t0_pre = time.time()
             retrieval_error = None
@@ -355,10 +384,13 @@ class RAGQAPipeline:
             tokens_to_gen = max_new_tokens if (max_new_tokens and max_new_tokens > 160) else 1024
 
             # Option A: Fast HTTP path if GPU LLM server daemon is running on port 8000
+            # (skipped when the caller already found the GPU tier unable to answer).
             gpu_server_url = os.getenv("VLLM_BASE_URL", "http://localhost:8000/v1").rstrip("/")
             server_root = gpu_server_url.rsplit("/v1", 1)[0]
             try:
                 import httpx
+                if route_decision.get("skip_gpu"):
+                    raise RuntimeError("GPU tier already failed for this request")
                 h_check = None
                 for ep in ["/health", "/healthz"]:
                     try:
@@ -406,40 +438,53 @@ class RAGQAPipeline:
                             "server": "gpu-daemon-port-8000",
                         },
                     }
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("GPU tier could not answer (%s); rerouting to the CPU tier", exc)
 
-            # Option B: Fallback to in-process GPU engine
-            t0_gen = time.time()
-            gen_result = self.gpu_engine.answer_rag(
-                question=query,
-                context_chunks=chunks,
-                max_new_tokens=tokens_to_gen,
-                temperature=temperature,
-            )
-            gen_duration = time.time() - t0_gen
-            total_duration = time.time() - t_start
-            ans_text = strip_mixed_refusal_text(gen_result["text"])
-            served_chunks = [] if is_no_relevant_docs_answer(ans_text) else sanitize_chunks(chunks)
+            # Option B (opt-in only, GPU_INPROCESS_FALLBACK=1): in-process GPU engine
+            if _gpu_inprocess_fallback_enabled():
+                try:
+                    t0_gen = time.time()
+                    gen_result = self.gpu_engine.answer_rag(
+                        question=query,
+                        context_chunks=chunks,
+                        max_new_tokens=tokens_to_gen,
+                        temperature=temperature,
+                    )
+                    gen_duration = time.time() - t0_gen
+                    ans_text = strip_mixed_refusal_text(gen_result["text"])
+                    served_chunks = [] if is_no_relevant_docs_answer(ans_text) else sanitize_chunks(chunks)
+                    return {
+                        "query": query,
+                        "answer": ans_text,
+                        "route": "hard",
+                        "target_tier": "gpu_vllm",
+                        "probability_hard": prob,
+                        "chunks": served_chunks,
+                        "stats": {
+                            "retrieval_seconds": round(retrieval_duration, 3),
+                            "generation_seconds": round(gen_duration, 3),
+                            "total_seconds": round(time.time() - t_start, 3),
+                            "num_tokens": gen_result.get("num_tokens", 0),
+                            "tokens_per_second": gen_result.get("tokens_per_second", 0),
+                            "model": gen_result.get("model", "Qwen/Qwen2.5-7B-Instruct"),
+                        },
+                    }
+                except Exception as exc:
+                    logger.warning("In-process GPU engine failed (%s); rerouting to the CPU tier", exc)
 
-            return {
-                "query": query,
-                "answer": ans_text,
-                "route": "hard",
-                "target_tier": "gpu_vllm",
-                "probability_hard": prob,
-                "chunks": served_chunks,
-                "stats": {
-                    "retrieval_seconds": round(retrieval_duration, 3),
-                    "generation_seconds": round(gen_duration, 3),
-                    "total_seconds": round(total_duration, 3),
-                    "num_tokens": gen_result.get("num_tokens", 0),
-                    "tokens_per_second": gen_result.get("tokens_per_second", 0),
-                    "model": gen_result.get("model", "Qwen/Qwen2.5-7B-Instruct"),
-                },
-            }
+            # FR-2: reroute to the CPU tier below with its context size and token budget.
+            gpu_failed = True
+            retry_pool = list(chunks)
+            chunks = _cpu_context(chunks)
+            max_new_tokens = min(max_new_tokens or 1024, 1024)
+        else:
+            gpu_failed = False
+            retry_pool = list(candidate_chunks or chunks or [])
 
         easy_prob = prob
+        route_label = "hard" if gpu_failed else "easy"
+        fallback = {"fallback": GPU_FALLBACK_REASON} if gpu_failed else {}
 
         if not chunks:
             refusal = "No specific institutional repository theses were found on this topic."
@@ -489,7 +534,7 @@ class RAGQAPipeline:
         backends.append(("gpu-daemon-port-8000 (cpu-slm-overflow)", "Qwen/Qwen2.5-7B-Instruct", gpu_overflow))
         slm_refusal = None
         for server, default_model, call in backends:
-            if server.startswith("gpu") and not self._gpu_daemon_healthy():
+            if server.startswith("gpu") and (gpu_failed or not self._gpu_daemon_healthy()):
                 continue
             try:
                 t0_gen = time.time()
@@ -498,20 +543,39 @@ class RAGQAPipeline:
             except Exception as exc:
                 logger.warning("%s could not answer (%s)", server, exc)
                 continue
-            if (server.startswith("cpu") and is_no_relevant_docs_answer(ans_text)
+            if (server.startswith("cpu") and is_no_relevant_docs_answer(ans_text) and not gpu_failed
                     and should_escalate_refusal(query, chunks) and self._gpu_daemon_healthy()):
                 # 3B refused although documents were retrieved: re-ask the 7B tier (see SLMRefused)
                 slm_refusal = (ans_text, tok_count, model, time.time() - t0_gen)
                 continue
             if server.startswith("gpu") and slm_refusal is not None:
                 server = "gpu-daemon-port-8000 (cpu-slm-refusal)"
+            if (server.startswith("cpu") and is_no_relevant_docs_answer(ans_text)
+                    and should_escalate_refusal(query, chunks)):
+                # 7B tier unavailable: one retry on the CPU tier with the next retrieved passages
+                retry = _cpu_retry_context(retry_pool)
+                if retry:
+                    try:
+                        r_text, r_tok, r_model = _complete_chat_http(
+                            f"{slm_server_url}/chat/completions",
+                            {"messages": CPUSLMEngine.build_rag_messages(query, retry),
+                             "max_tokens": tokens_to_gen, "temperature": temperature},
+                            timeout=_slm_timeout(streaming=False),
+                        )
+                        r_text = strip_mixed_refusal_text(r_text)
+                        if not is_no_relevant_docs_answer(r_text):
+                            ans_text, tok_count, model, chunks = r_text, r_tok, r_model, retry
+                            server = f"{server} (retry-next-passages)"
+                    except Exception as exc:
+                        logger.warning("CPU tier retry could not answer (%s)", exc)
             gen_duration = time.time() - t0_gen
             served_chunks = [] if is_no_relevant_docs_answer(ans_text) else sanitize_chunks(chunks)
             return {
                 "query": query,
                 "answer": ans_text,
-                "route": "easy",
+                "route": route_label,
                 "target_tier": "cpu_slm",
+                **fallback,
                 "probability_hard": easy_prob,
                 "chunks": served_chunks,
                 "stats": {
@@ -528,7 +592,7 @@ class RAGQAPipeline:
         if slm_refusal is not None:
             ans_text, tok_count, model, gen_duration = slm_refusal
             return {
-                "query": query, "answer": ans_text, "route": "easy", "target_tier": "cpu_slm",
+                "query": query, "answer": ans_text, "route": route_label, "target_tier": "cpu_slm", **fallback,
                 "probability_hard": easy_prob, "chunks": [],
                 "stats": {"retrieval_seconds": round(retrieval_duration, 3), "generation_seconds": round(gen_duration, 3),
                           "total_seconds": round(time.time() - t_start, 3), "num_tokens": tok_count,
@@ -552,8 +616,9 @@ class RAGQAPipeline:
         return {
             "query": query,
             "answer": ans_text,
-            "route": "easy",
+            "route": route_label,
             "target_tier": "cpu_slm",
+            **fallback,
             "probability_hard": easy_prob,
             "chunks": served_chunks,
             "stats": {
@@ -730,6 +795,8 @@ class RAGQAPipeline:
             stream_via_http = False
             try:
                 import httpx
+                if route_decision.get("skip_gpu"):
+                    raise RuntimeError("GPU tier already failed for this request")
                 for ep in ["/health", "/healthz"]:
                     try:
                         h_check = httpx.get(f"{server_root}{ep}", timeout=1.0)
@@ -742,67 +809,51 @@ class RAGQAPipeline:
                 stream_via_http = False
 
             if stream_via_http:
-                yield from relay(
-                    _stream_chat_http(
-                        f"{gpu_server_url}/chat/completions",
-                        {"model": "Qwen/Qwen2.5-7B-Instruct", "messages": messages,
-                         "max_tokens": tokens_to_gen, "temperature": temperature},
-                        headers=_vllm_auth_headers(),
-                        timeout=90.0,
-                    ),
-                    model="Qwen/Qwen2.5-7B-Instruct",
-                    server="gpu-daemon-port-8000",
-                )
-                return
+                try:
+                    # relay raises only before the first token; a failure mid-answer ends with a note.
+                    yield from relay(
+                        _stream_chat_http(
+                            f"{gpu_server_url}/chat/completions",
+                            {"model": "Qwen/Qwen2.5-7B-Instruct", "messages": messages,
+                             "max_tokens": tokens_to_gen, "temperature": temperature},
+                            headers=_vllm_auth_headers(),
+                            timeout=90.0,
+                        ),
+                        model="Qwen/Qwen2.5-7B-Instruct",
+                        server="gpu-daemon-port-8000",
+                    )
+                    return
+                except Exception as exc:
+                    logger.warning("GPU tier could not answer (%s); rerouting to the CPU tier", exc)
 
-            # Option B: Fallback to in-process streaming
-            t0_gen = time.time()
-            token_count = 0
-            full_response = []
-            ttft = None
+            # Option B (opt-in only, GPU_INPROCESS_FALLBACK=1): in-process streaming
+            if _gpu_inprocess_fallback_enabled():
+                try:
+                    yield from relay(
+                        self.gpu_engine.generate_chat_stream(messages, max_new_tokens=tokens_to_gen,
+                                                             temperature=temperature),
+                        model="Qwen/Qwen2.5-7B-Instruct",
+                        server="in-process-gpu",
+                    )
+                    return
+                except Exception as exc:
+                    logger.warning("In-process GPU engine failed (%s); rerouting to the CPU tier", exc)
 
-            for delta in strip_mixed_refusal(self.gpu_engine.generate_chat_stream(
-                messages,
-                max_new_tokens=tokens_to_gen,
-                temperature=temperature,
-            )):
-                if ttft is None:
-                    ttft = round(time.time() - t0_gen, 3)
-                token_count += 1
-                full_response.append(delta)
-                yield {
-                    "type": "token",
-                    "delta": delta,
-                }
-
-            gen_duration = time.time() - t0_gen
-            total_duration = time.time() - t_start
-            tok_per_sec = round(token_count / max(gen_duration, 0.001), 2)
-            full_ans = "".join(full_response)
-            if is_no_relevant_docs_answer(full_ans):
-                yield {"type": "chunks", "chunks": []}
-
-            yield {
-                "type": "done",
-                "full_answer": full_ans,
-                "chunks": [] if is_no_relevant_docs_answer(full_ans) else sanitize_chunks(chunks),
-                "stats": {
-                    "retrieval_seconds": round(retrieval_duration, 3),
-                    "generation_seconds": round(gen_duration, 3),
-                    "total_seconds": round(total_duration, 3),
-                    "ttft_seconds": ttft or 0.0,
-                    "num_tokens": token_count,
-                    "tokens_per_second": tok_per_sec,
-                    "model": "Qwen/Qwen2.5-7B-Instruct",
-                },
-            }
-            return
+            # FR-2: reroute to the CPU tier below with its context size and token budget.
+            gpu_failed = True
+            retry_pool = list(chunks)
+            chunks = _cpu_context(chunks)
+            max_new_tokens = min(max_new_tokens or 1024, 1024)
+        else:
+            gpu_failed = False
+            retry_pool = list(candidate_chunks or chunks or [])
 
         yield {
             "type": "route",
-            "route": "easy",
+            "route": "hard" if gpu_failed else "easy",
             "target_tier": "cpu_slm",
             "probability_hard": route_decision.get("probability_hard", 0.0),
+            **({"fallback": GPU_FALLBACK_REASON} if gpu_failed else {}),
         }
 
         yield {
@@ -867,8 +918,9 @@ class RAGQAPipeline:
             except Exception as exc:
                 logger.warning("CPU SLM daemon could not answer (%s); trying GPU overflow", exc)
 
-        # Option A2: GPU daemon when the CPU tier refused with documents, is busy, or is down.
-        if self._gpu_daemon_healthy():
+        # Option A2: GPU daemon when the CPU tier refused with documents, is busy, or is down
+        # (never for a request the GPU tier already failed).
+        if not gpu_failed and self._gpu_daemon_healthy():
             reason = "cpu_slm_refusal" if slm_refusal is not None else "cpu_slm_overflow"
             yield {"type": "route", "route": "hard", "target_tier": "gpu_vllm",
                    "probability_hard": route_decision.get("probability_hard", 0.0), "escalation": reason}
@@ -896,6 +948,31 @@ class RAGQAPipeline:
                 return
             except Exception as exc:
                 logger.warning("GPU tier could not answer (%s)", exc)
+
+        if slm_refusal is not None and slm_up:
+            # 7B tier unavailable: one retry on the CPU tier with the next retrieved passages
+            retry = _cpu_retry_context(retry_pool)
+            if retry:
+                first_chunks, chunks = chunks, retry  # relay's done event reads `chunks`
+                yield {"type": "chunks", "chunks": sanitize_chunks(chunks), "retrieval_seconds": round(retrieval_duration, 3)}
+                try:
+                    yield from relay(
+                        _stream_chat_http(
+                            f"{slm_server_url}/chat/completions",
+                            {"messages": CPUSLMEngine.build_rag_messages(query, retry),
+                             "max_tokens": tokens_to_gen, "temperature": temperature},
+                            timeout=_slm_timeout(),
+                        ),
+                        model="qwen2.5-3b-instruct-q4_k_m.gguf",
+                        server="cpu-daemon-port-8082 (retry-next-passages)",
+                        escalate_refusal=True,  # a second refusal is not streamed; the first one stands
+                    )
+                    return
+                except SLMRefused:
+                    pass
+                except Exception as exc:
+                    logger.warning("CPU tier retry could not answer (%s)", exc)
+                chunks = first_chunks
 
         if slm_refusal is not None:  # the 3B answer stands (GPU tier unavailable)
             yield from relay(iter([slm_refusal]), model="qwen2.5-3b-instruct-q4_k_m.gguf", server="cpu-daemon-port-8082")

@@ -153,6 +153,7 @@ VLLM_BASE_URL=http://localhost:8000/v1
 VLLM_MODEL_NAME=Qwen/Qwen2.5-7B-Instruct
 VLLM_API_KEY=<GENERATE: python -c 'import secrets;print(secrets.token_hex(32))'>   # required by scripts/serve_vllm.py; sent as Bearer by all clients
 VLLM_GPU=0          # GPU index for vLLM (shared machine: pick a GPU with steady usage and ~19 GB free)
+GPU_INPROCESS_FALLBACK=0   # keep 0: with vLLM down, hard questions are answered by the CPU tier (FR-2)
 GPU_DEVICE=0
 
 # Router & Admission Control
@@ -272,8 +273,11 @@ Once loading completes (`loading:0`):
 redis-cli dbsize
 # -> (integer) 2261664
 
-# Verify RediSearch index schema:
-redis-cli FT.INFO rag_documents_idx | head -n 20
+# Verify the RediSearch index exists and count its documents
+# (never run FT.INFO on this index: it can deadlock Redis Stack 7.2.0-v9, see fixes.md DEFECT-21):
+redis-cli FT._LIST
+redis-cli FT.SEARCH rag_documents_idx "*" LIMIT 0 0
+# -> 2261664 (first line of the reply)
 
 # Test Redis connection:
 redis-cli ping
@@ -331,7 +335,7 @@ python -m pipeline.batch_ingest_pdfs \
 
 ## 7. CPU SLM Tier (Port 8082 - Qwen 2.5 3B)
 
-The CPU SLM serves routine factual questions ($P(\text{hard}) < 0.65$) and acts as the zero-downtime fallback engine.
+The CPU SLM serves routine factual questions ($P(\text{hard}) < 0.65$) and acts as the zero-downtime fallback engine: when the GPU tier is down, times out or fails before its first token, hard questions are answered here (responses carry `fallback: "gpu_unavailable"`). If the 3B model refuses on-topic documents while the 7B tier is unavailable, it is asked once more with the next three retrieved passages.
 
 ### Model Weights
 ```bash
@@ -554,7 +558,7 @@ make otp-clear
 | **`NOAUTH Authentication required`** | `REDIS_PASSWORD` not supplied to CLI or script. | Run `export REDISCLI_AUTH="<YOUR_REDIS_PASSWORD>"`. Ensure `REDIS_URL` in `.env` has format `redis://:<PW>@localhost:6379/0`. |
 | **`LOADING Redis is loading the dataset in memory`** | Redis is actively reading `dump_final.rdb` into RAM. | **Do not terminate Redis.** Run `make redis-watch` to view live progress bar and ETA. Wait for `loading:0`. |
 | **`unknown command 'FT.SEARCH'`** | Plain Redis is running instead of Redis Stack. | Stop standard redis (`sudo systemctl stop redis`). Start native binary (`redis-stack-server` or `make redis-up`). |
-| **Zero chunks retrieved / out-of-domain refusal** | Similarity below 0.52 floor or index empty. | Check that `FT.INFO rag_documents_idx` shows `num_docs: 2261664`. Ensure `all-MiniLM-L6-v2` is installed. |
+| **Zero chunks retrieved / out-of-domain refusal** | Similarity below 0.52 floor or index empty. | Check that `FT.SEARCH rag_documents_idx "*" LIMIT 0 0` returns 2261664 (never `FT.INFO`: it can deadlock Redis, DEFECT-21). Ensure `all-MiniLM-L6-v2` is installed. |
 | **Gateway returns 429 Too Many Requests** | Client token bucket capacity exhausted. | Wait 2 seconds for bucket refill (20 tokens/sec), or increase `RATE_LIMIT_BURST` and `RATE_LIMIT_RPS` in `.env`. |
 | **OTP Email not received** | SMTP credentials invalid or rate limit hit. | Run `python scripts/clear_otp_limits.py <your_email>`. Verify SMTP credentials with `python scripts/test_smtp.py <your_email>`. |
 | **vLLM CUDA Out-of-Memory** | GPU VRAM over-allocation. | Set `--gpu-memory-utilization 0.85` or decrease `--max-model-len 4096` in `Makefile` / `scripts/prod_stack.py`. |
