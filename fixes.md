@@ -1482,5 +1482,11 @@ tests/test_constant_time_and_cookie_security.py::test_secrets_compare_digest_tim
 - **Tests:** [`tests/test_injection_all_messages.py`](tests/test_injection_all_messages.py) (9, no services needed): the reported request; the payload as the only message; an injection in every role and position; a harmless multi-turn conversation with a system message still answered. 7 of 9 fail on the previous code.
 - **Live (2026-11-18, production):** the reported request (payload first, harmless question last) → HTTP 400 "NFR-7 Alert: Adversarial prompt injection detected." (was HTTP 200 with `TOKEN_LEAK_7731`); the payload alone → HTTP 400.
 
+## REVIEW-1 (not a defect): Identical Questions Share One Cached Answer Across Users
+
+- **Report:** an identical question from a second user is served the first user's cached answer; the reporter asked for per-user scoping or an explicit statement that cached answers are shared, non-personal content (NFR-4).
+- **Status on current code:** by design and now stated explicitly in PRD NFR-4 ("what counts as a leak"). Only **exact** (normalised) repeats are shared (Sub-FR-1.4); **near-duplicate** hits are per user since the owner-scoping change, and identities are signed (DEFECT-30). Answers come only from the public thesis corpus; the shared response contains no owner, email or session data. Sharing exact repeats is what makes the cache effective across users; the pollution risk the report mentions is addressed by DEFECT-23 (grounded answers only), DEFECT-31 (fence on every message), write-once shared entries and regenerate-based eviction.
+- **Live (2026-11-18, production, two signed identities):** user A's fresh answer → user B's identical question `cached: true`, same answer, no trace of A in the response; B's paraphrase → `cached: false`.
+
 ## Remediation Complete
 All security vulnerabilities, cache qualification defects, frontend/backend break vectors, and redundant code have been fully resolved, hardened, and verified with passing regression tests. All changes are cleanly staged. Per instructions, `git commit` has not been run.
