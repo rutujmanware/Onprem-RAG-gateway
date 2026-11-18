@@ -1560,6 +1560,7 @@ tests/test_constant_time_and_cookie_security.py::test_secrets_compare_digest_tim
 - **Fix** ([`gateway/main.py`](gateway/main.py), [`askiisc_chat/askiisc/app.py`](askiisc_chat/askiisc/app.py)): the response says "We could not send the sign-in code right now. Please try again in a few minutes."; the exception is logged server-side only (`otp mail failed: …`). The other client-facing errors in both apps were checked: they return fixed messages (rate limits, injection alert), not exception text.
 - **Tests:** [`tests/test_mail_error_disclosure.py`](tests/test_mail_error_disclosure.py): generic body, no exception class or errno, details still in the log; the standalone app no longer echoes the exception.
 - **Live (2026-11-18):** temporary gateway with SMTP pointed at a closed port → 503 with the generic message; details in the server log.
+- **Related red-team report (`/v1/chat/completions` → 500 "GPU LLM generation failed: <exception text>"):** that branch no longer exists (DEFECT-25 reroutes to the CPU tier; DEFECT-41 replaced the route). Re-verified 2026-11-19 with vLLM unreachable: the reported request → HTTP 200 from the CPU tier (`fallback: gpu_unavailable`), no exception text. A guard test fails if any handler builds a client message from an exception (only the injection alert, a fixed text, is allowed).
 
 ## DEFECT-39: A User Could Set or Replace the Shared Cached Answer (NFR-6)
 

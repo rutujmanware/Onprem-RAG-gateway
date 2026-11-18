@@ -34,3 +34,17 @@ def test_gateway_mail_failure_is_generic(monkeypatch, caplog):
 def test_standalone_app_does_not_echo_the_exception():
     src = open("askiisc_chat/askiisc/app.py").read()
     assert 'f"Could not send email: {e}"' not in src
+
+
+def test_no_handler_returns_raw_exception_text():
+    """Red-team report: '/v1/chat/completions' returned 500 'GPU LLM generation failed: <exception text>'. That path is
+    gone (DEFECT-25/41); no handler may build a client message from an exception again. The only allowed
+    str(e) is PromptInjectionAlert, whose message is a fixed text."""
+    import re
+    for path in ("gateway/main.py", "askiisc_chat/askiisc/app.py"):
+        src = open(path).read()
+        bad = re.findall(r"""(?:detail=|["']error["']:\s*)f["'][^"']*\{(?:e|exc|err|str\(e\)|str\(exc\))\}""", src)
+        assert not bad, (path, bad)
+        for m in re.finditer(r"detail=str\((\w+)\)", src):
+            before = src[max(0, m.start() - 160):m.start()]
+            assert "PromptInjectionAlert" in before, (path, before[-80:])
