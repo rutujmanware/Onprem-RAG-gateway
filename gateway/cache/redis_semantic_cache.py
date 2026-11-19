@@ -1310,7 +1310,7 @@ def _english_freq(w: str) -> int:
 
 def _real_word(w: str) -> bool:
     from pipeline.text_processing import typo_normalizer as tn
-    if tn._is_english(w):
+    if tn._is_english(w) or tn.looks_like_term(w):   # DEFECT-62: coinages built from known parts (graphane)
         return True
     try:
         return tn._in_corpus(w)

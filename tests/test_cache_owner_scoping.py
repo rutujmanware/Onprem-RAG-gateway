@@ -146,7 +146,13 @@ def test_gateway_passes_owner_on_every_lookup_and_store():
     lookups = re.findall(r"cache\.a?lookup\([^\n]*\)", src)
     stores = re.findall(r"cache\.a?store\([^\n]*\)", src)
     assert lookups and stores
-    assert all("owner=client_id" in c for c in lookups), lookups
+    # DEFECT-62: lookups go through _cache_lookup(cache, query, raw_query, owner); it passes its owner on, and every
+    # call of it passes client_id
+    assert all("owner=client_id" in c or "owner=owner" in c for c in lookups), lookups
+    helper = src[src.index("async def _cache_lookup("):src.index("def _fence_messages(")]
+    assert "owner=owner" in helper and "owner=client_id" not in helper
+    calls = re.findall(r"await _cache_lookup\([^\n]*\)", src)
+    assert calls and all(c.endswith("client_id)") for c in calls), calls
     assert all("owner=client_id" in c for c in stores), stores
 
 

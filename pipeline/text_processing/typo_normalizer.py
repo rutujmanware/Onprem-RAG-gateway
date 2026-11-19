@@ -42,6 +42,45 @@ def _is_english(word: str) -> bool:
     return word in _EN_WORDS
 
 
+# DEFECT-62: technical coinages that are in no dictionary and may be absent from the corpus (ferrielectric: 0 thesis
+# chunks; graphane / graphyne in a small or new corpus) look exactly like typos to the dictionary and corpus checks,
+# so they were rewritten into a neighbouring known term (ferroelectric, graphene) and served that term's answer.
+# Such words are built from known parts; typos are not. A word "looks like a term" if it is a scientific prefix plus
+# a known word (ferri+electric, nano+ribbons), or a known stem plus a chemical-nomenclature suffix (graph+ane,
+# graph+yne, german+ene). Measured on the 416 typos of the frozen evaluation questions (5 random seeds; dropped,
+# doubled, swapped and substituted letters) that the normaliser corrected: 414 are still corrected (Sub-FR-1.1); 2
+# are now kept as typed (graphine, itself a plausible material name, and aerospade).
+_TERM_PREFIXES = (
+    "antiferro", "ferri", "ferro", "anti", "hetero", "homo", "hydro", "thermo", "electro", "photo", "magneto",
+    "piezo", "pyro", "nano", "micro", "macro", "meso", "poly", "mono", "multi", "para", "meta", "ortho", "iso",
+    "neuro", "cyto", "geo", "bio", "super", "semi", "hyper", "hypo", "pseudo", "quasi", "inter", "intra", "trans",
+    "cryo", "opto", "aero", "astro", "chemo", "immuno", "radio", "spectro", "tera", "giga", "mega", "kilo", "milli",
+    "femto", "pico", "atto", "zepto",
+)
+_CHEM_SUFFIXES = ("ane", "ene", "yne", "ine", "ide", "ite", "ate", "ole", "one", "ium", "ose", "ase")
+_TERM_MIN_PART = 4          # the known word after a prefix (ferri+electric)
+_TERM_MIN_STEM = 5          # the known stem before a suffix (graph+ane); 4-letter stems matched typos (stud+ide)
+
+
+def _known_part(part: str, vocab=None) -> bool:
+    return len(part) >= _TERM_MIN_PART and (_is_english(part) or (vocab is not None and part in vocab))
+
+
+def looks_like_term(word: str, vocab=None) -> bool:
+    """True if `word` is built like a technical term from known parts (see _TERM_PREFIXES / _CHEM_SUFFIXES)."""
+    w = (word or "").lower()
+    if len(w) < 6 or not w.isalpha():
+        return False
+    for p in _TERM_PREFIXES:
+        if w.startswith(p) and _known_part(w[len(p):], vocab):
+            return True
+    for s in _CHEM_SUFFIXES:
+        stem = w[: -len(s)]
+        if w.endswith(s) and len(stem) >= _TERM_MIN_STEM and _known_part(stem, vocab):
+            return True
+    return False
+
+
 _CORPUS_CLIENT = None
 # A word counts as a real corpus term from this many chunks on. Measured: real terms 9-1323 chunks (stanene 9,
 # fluxonium 12, graphane 18, ...); typos/extraction fragments 0-3 (nanoscienc 2, machne 3, catalist 1).
@@ -249,8 +288,8 @@ class TypoNormalizer:
         # DEFECT-40: a word that is a real word is never rewritten into a different one. Real = in the English
         # dictionary bundled with symspellpy (82,765 words; no system word list needed) or present in at least
         # CORPUS_MIN_CHUNKS thesis chunks (graphane, graphyne, ...). Only words found in neither are treated as typos.
-        if _is_english(token_lower) or (check_corpus and _in_corpus(token_lower)):
-            return token_lower
+        if _is_english(token_lower) or looks_like_term(token_lower, self.vocab) or (check_corpus and _in_corpus(token_lower)):
+            return token_lower   # DEFECT-62: coinages built from known parts are kept too
 
         max_allowed = 1 if len(token_lower) <= 6 else 2
 
