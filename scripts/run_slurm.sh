@@ -11,16 +11,17 @@ echo "Starting job on 4 GPUs..."
 mkdir -p logs
 
 # Activate conda environment for Python 3.10
-source /data2/home/ritujmanware/miniconda3/etc/profile.d/conda.sh
+source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate llm_env
 set -a; source .env; set +a
 
 # Install vLLM and pandas if not already installed
 pip install vllm pandas > /dev/null 2>&1
 
-# Force HuggingFace to download the massive model into the RAM Disk!
-export HF_HOME="/dev/shm/huggingface_cache"
-mkdir -p $HF_HOME
+# Download the 150 GB model into a RAM disk (override with DATASET_HF_CACHE); deleted at the end of the job
+DATASET_HF_CACHE="${DATASET_HF_CACHE:-/dev/shm/huggingface_cache_$USER}"
+export HF_HOME="$DATASET_HF_CACHE"
+mkdir -p "$HF_HOME"
 
 # Prevent CUDA memory fragmentation which causes OOMs on 40GB GPUs
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
@@ -65,6 +66,6 @@ echo "Downloading model to RAM Disk and starting generation..."
 python3 scripts/dataset_generator.py
 
 echo "Job complete! Deleting the 150GB model from RAM Disk to clean up..."
-rm -rf /dev/shm/huggingface_cache
+rm -rf "$DATASET_HF_CACHE"
 echo "Done!"
 

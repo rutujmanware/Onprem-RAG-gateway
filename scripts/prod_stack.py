@@ -12,6 +12,9 @@ Usage:
     python scripts/prod_stack.py status
     python scripts/prod_stack.py stop
     python scripts/prod_stack.py restart
+    python scripts/prod_stack.py redis-start   # only Redis (make redis-up)
+
+All paths are relative to the repository root, so the stack runs from any checkout location.
 """
 
 from __future__ import annotations
@@ -41,7 +44,11 @@ PYTHON_BIN = sys.executable
 
 # Default configuration
 REDIS_SERVER_BIN = ROOT_DIR / "redis-stack-server-7.2.0-v9" / "bin" / "redis-stack-server"
-REDIS_PORT = 6379
+REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
+# The thesis snapshot: <REDIS_DATA_DIR>/<REDIS_DBFILENAME>, relative to the repository root unless absolute
+REDIS_DATA_DIR = ROOT_DIR / os.getenv("REDIS_DATA_DIR", "redis_server_data")
+REDIS_DBFILENAME = os.getenv("REDIS_DBFILENAME", "dump_final.rdb")
+RUN_DIR = ROOT_DIR / "run"
 VLLM_PORT = 8000
 SLM_PORT = 8082
 ROUTER_PORT = 8090
@@ -120,6 +127,50 @@ def check_port_health(port: int, path: str = "/healthz") -> Tuple[str, str]:
     return "DOWN", "Unreachable"
 
 
+def redis_start_cmd() -> list[str]:
+    """Redis Stack with this repository's settings. Nothing depends on the config file shipped inside the Redis
+    download: settings go into run/redis.conf (mode 600, so the password never shows in the process list), and the
+    data directory is passed last because the redis-stack-server wrapper sets its own --dir after the config file."""
+    password = os.getenv("REDIS_PASSWORD", "")
+    if not password:
+        sys.exit("REDIS_PASSWORD is empty: set it in .env before starting Redis (README, step 3).")
+    if not REDIS_SERVER_BIN.exists():
+        sys.exit(f"{REDIS_SERVER_BIN.relative_to(ROOT_DIR)} not found: download Redis Stack first (README, step 5).")
+    if " " in str(REDIS_DATA_DIR):
+        sys.exit("The Redis data directory path contains a space, which the redis-stack-server wrapper cannot handle.")
+    RUN_DIR.mkdir(parents=True, exist_ok=True)
+    REDIS_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    quoted = password.replace("\\", "\\\\").replace('"', '\\"')
+    conf = RUN_DIR / "redis.conf"
+    fd = os.open(conf, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        fh.write(
+            f'requirepass "{quoted}"\n'
+            "bind 127.0.0.1 -::1\n"          # loopback only
+            "protected-mode yes\n"
+            f"port {REDIS_PORT}\n"
+            f"dbfilename {REDIS_DBFILENAME}\n"
+            'save ""\n'                      # read-only snapshot use: never rewrite the 12.67 GB file
+            "daemonize no\n"                 # stays under this script's PID tracking; output -> logs/redis.log
+        )
+    os.chmod(conf, 0o600)
+    return [str(REDIS_SERVER_BIN), str(conf), "--dir", str(REDIS_DATA_DIR)]
+
+
+def start_redis(pids: Dict[str, int]) -> None:
+    redis_st, _ = check_port_health(REDIS_PORT)
+    if redis_st == "DOWN":
+        if not is_pid_running(pids.get("redis", 0), "redis"):
+            print(f"📦 Starting Redis Stack Server on port {REDIS_PORT} "
+                  f"(snapshot: {REDIS_DATA_DIR.relative_to(ROOT_DIR) if REDIS_DATA_DIR.is_relative_to(ROOT_DIR) else REDIS_DATA_DIR}/{REDIS_DBFILENAME})...")
+            pids["redis"] = start_service("redis", redis_start_cmd())
+            time.sleep(1.0)
+    elif redis_st == "LOADING":
+        print(f"🟡 Redis Stack is running and actively loading 12GB dataset into RAM...")
+    else:
+        print(f"✅ Redis Stack is already running on port {REDIS_PORT}.")
+
+
 def start_service(name: str, cmd: list[str], env: Optional[dict] = None) -> int:
     log_file = LOGS_DIR / f"{name}.log"
     out = open(log_file, "a")
@@ -146,17 +197,7 @@ def start_all():
     print("=" * 70)
 
     # 1. Start Redis Stack
-    redis_st, _ = check_port_health(REDIS_PORT)
-    if redis_st == "DOWN":
-        if not is_pid_running(pids.get("redis", 0), "redis"):
-            print(f"📦 Starting Redis Stack Server on port {REDIS_PORT}...")
-            pid = start_service("redis", [str(REDIS_SERVER_BIN)])
-            pids["redis"] = pid
-            time.sleep(1.0)
-    elif redis_st == "LOADING":
-        print(f"🟡 Redis Stack is running and actively loading 12GB dataset into RAM...")
-    else:
-        print(f"✅ Redis Stack is already running on port {REDIS_PORT}.")
+    start_redis(pids)
 
     # 2. Start vLLM GPU Server
     vllm_st, _ = check_port_health(VLLM_PORT, "/health")
@@ -414,13 +455,19 @@ def print_status():
 
 def main():
     parser = argparse.ArgumentParser(description="Production Stack Orchestrator")
-    parser.add_argument("action", choices=["start", "stop", "status", "restart"], help="Action to perform")
+    parser.add_argument("action", choices=["start", "stop", "status", "restart", "redis-start"], help="Action to perform")
     parser.add_argument("--with-vllm", action="store_true",
                         help="Also stop/restart the vLLM GPU engine (slow model reload; needed to apply vLLM launch changes)")
     args = parser.parse_args()
 
     if args.action == "start":
         start_all()
+    elif args.action == "redis-start":
+        ensure_dirs()
+        pids = load_pids()
+        start_redis(pids)
+        save_pids(pids)
+        print("Redis is starting. Loading the thesis snapshot takes 35-50 minutes: watch it with `make redis-watch`.")
     elif args.action == "stop":
         stop_all(stop_vllm=args.with_vllm)
     elif args.action == "status":

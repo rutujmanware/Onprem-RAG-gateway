@@ -137,12 +137,11 @@ The SLM generated a high-precision, factual answer directly citing the document:
 
 ### Step 1: Environment Activation
 ```bash
-# Navigate to the workspace
-cd /data2/home/ritujmanware/onprem-rag-gateway
+# Run every command from the repository root
+cd Onprem-RAG-gateway
 
-# Activate Conda environment and load environment variables
-source /data2/home/ritujmanware/miniconda3/etc/profile.d/conda.sh
-conda activate rag_env
+# Activate the Python environment (see README step 2) and load environment variables
+source .venv/bin/activate        # or: conda activate <your env>
 set -a && source .env && set +a
 ```
 

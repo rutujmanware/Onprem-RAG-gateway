@@ -33,7 +33,7 @@
 
 ## 2. End-to-End System Topology & Decoupled Architecture
 
-The system consists of **4 independent services** orchestrated bare-metal via [`scripts/prod_stack.py`](file:///data2/home/ritujmanware/onprem-rag-gateway/scripts/prod_stack.py):
+The system consists of **4 independent services** orchestrated bare-metal via [`scripts/prod_stack.py`](scripts/prod_stack.py):
 
 ```mermaid
 flowchart TD
@@ -151,10 +151,10 @@ To prevent unauthorized intranet access, direct model bypass, or cache manipulat
 - The internal daemon ports (`6379`, `8082`, `8000`) bind strictly to `127.0.0.1`.
 - Any external request directly targeting internal ports is dropped at the OS socket level.
 - External requests to `/query` must present an authenticated campus web session or a valid `ADMIN_API_KEY`. The administrative routes `/cache/*` and `/queue/stats` accept only a valid `ADMIN_API_KEY`, also from the server itself (DEFECT-29); a login session is never enough, whatever the account (DEFECT-24). Otherwise HTTP 404 hides the endpoint.
-- Automated security test suite: [`tests/test_single_port_security.py`](file:///data2/home/ritujmanware/onprem-rag-gateway/tests/test_single_port_security.py).
+- Automated security test suite: [`tests/test_single_port_security.py`](tests/test_single_port_security.py).
 
 ### 3.2 Passwordless Email OTP Authentication
-Implemented in [`askiisc_chat/askiisc/auth.py`](file:///data2/home/ritujmanware/onprem-rag-gateway/askiisc_chat/askiisc/auth.py):
+Implemented in [`askiisc_chat/askiisc/auth.py`](askiisc_chat/askiisc/auth.py):
 - **Campus Domain Lockdown:** Enforces strict domain validation (`@iisc.ac.in`).
 - **Cryptographic OTP Tokens:** 6-digit cryptographically secure numeric tokens.
 - **Lifecycle & Expiration:** 180-second token TTL with rate-limited resend cooldown (60s).
@@ -162,13 +162,13 @@ Implemented in [`askiisc_chat/askiisc/auth.py`](file:///data2/home/ritujmanware/
 - **Session Handling:** Encrypted session cookies (`askiisc_session`) with `HttpOnly`, `SameSite=Lax`, and `Secure` attributes, validated via constant-time digest comparison.
 
 ### 3.3 Prompt Injection & Jailbreak Defense Fence (NFR-7)
-Implemented in [`pipeline/sanitizer.py`](file:///data2/home/ritujmanware/onprem-rag-gateway/pipeline/sanitizer.py) and verified in [`tests/test_injection_fence.py`](file:///data2/home/ritujmanware/onprem-rag-gateway/tests/test_injection_fence.py):
+Implemented in [`pipeline/sanitizer.py`](pipeline/sanitizer.py) and verified in [`tests/test_injection_fence.py`](tests/test_injection_fence.py):
 - Inspects queries before vectorization for jailbreak signatures (e.g. *"ignore previous instructions"*, *"system prompt override"*, *"DAN mode"*, system delimiter tags).
 - Rejects adversarial prompts with HTTP 400 (`PromptInjectionAlert`) before tokens enter retrieval or inference pipelines.
 - Escapes XML context boundaries to prevent document content from executing prompt-breakout attacks.
 
 ### 3.4 Token-Bucket Fair Queue & Admission Controller
-Implemented in [`gateway/queue/admission.py`](file:///data2/home/ritujmanware/onprem-rag-gateway/gateway/queue/admission.py):
+Implemented in [`gateway/queue/admission.py`](gateway/queue/admission.py):
 - **Token Bucket Rate Limiting:** Per-client bucket with capacity 60.0 and refill rate 20.0 tokens/sec. Breaches trigger HTTP 429 with `Retry-After: 2`.
 - **Worker Concurrency Limit:** Bounded active inference slots (global cap 30, per-user cap 6) across 6 worker processes to prevent CPU thread thrashing and GPU out-of-memory errors.
 - **Fair Queuing & Load Shedding:** Excess requests wait in an async queue (max depth 120, wait timeout 30s). When the queue is saturated, requests are shed gracefully with HTTP 503.
@@ -177,11 +177,11 @@ Implemented in [`gateway/queue/admission.py`](file:///data2/home/ritujmanware/on
 
 ## 4. Fast-Path Semantic Vector Cache
 
-Implemented in [`gateway/cache/redis_semantic_cache.py`](file:///data2/home/ritujmanware/onprem-rag-gateway/gateway/cache/redis_semantic_cache.py).
+Implemented in [`gateway/cache/redis_semantic_cache.py`](gateway/cache/redis_semantic_cache.py).
 
 ### Mechanism & Cache Topology
-1. Incoming queries are normalized via [`TypoNormalizer`](file:///data2/home/ritujmanware/onprem-rag-gateway/pipeline/text_processing/typo_normalizer.py) (p99 ≤ 5 ms; microseconds once its words have been seen).
-2. Query text is embedded into a 384-dimensional dense vector using [`all-MiniLM-L6-v2`](file:///data2/home/ritujmanware/onprem-rag-gateway/models/embeddings/all-MiniLM-L6-v2) on CPU (< 4ms).
+1. Incoming queries are normalized via [`TypoNormalizer`](pipeline/text_processing/typo_normalizer.py) (p99 ≤ 5 ms; microseconds once its words have been seen).
+2. Query text is embedded into a 384-dimensional dense vector using [`all-MiniLM-L6-v2`](models/embeddings/all-MiniLM-L6-v2) on CPU (< 4ms).
 3. Performs HNSW cosine similarity search against index `semantic_cache_idx` (key prefix `semcache:`) using RediSearch `FT.SEARCH` with `EF_RUNTIME 64`.
 4. **Cache Hit Decision:**
    - Exact L0 hash match (shared across users), **or**, among the requesting user's **own** entries only (owner-scoped KNN pre-filter), cosine similarity $\ge 0.90$ (cosine distance $\le 0.10$) **and** the intent-equivalence guard (`RedisSemanticCache.check_entity_conflict`) confirms both queries ask the same question. The guard rejects differences in numbers/years, negation, question type (*why* vs. yes/no vs. *what/how*), opposite terms, quantifiers, and swapped roles of two terms. Known limits: PRD §9.1.
@@ -193,7 +193,7 @@ Implemented in [`gateway/cache/redis_semantic_cache.py`](file:///data2/home/ritu
 6. **Owner scoping:** Every stored entry carries a keyed HMAC owner tag (`owner`, RediSearch `TAG`). Semantic lookups are pre-filtered to the requester's tag, so near-duplicate answers are never shared between users (NFR-6 measured 0/255 cross-user poisonings). Exact-text matches remain shared. Requests or entries without an owner use the exact path only.
 
 ### Refusal & Anti-Pollution Shield (NFR-6)
-- [`RedisSemanticCache.is_cacheable_response`](file:///data2/home/ritujmanware/onprem-rag-gateway/gateway/cache/redis_semantic_cache.py):
+- [`RedisSemanticCache.is_cacheable_response`](gateway/cache/redis_semantic_cache.py):
   - Any response associated with zero retrieved document chunks is **strictly prohibited from cache entry**.
   - Standard institutional refusal phrases (*"No specific institutional repository theses were found on this topic."*, *"insufficient information"*, retrieval errors) are blocked from storage.
   - Startup routine `apurge_uncacheable_entries()` scans and evicts any legacy empty or ungrounded entries.
@@ -202,7 +202,7 @@ Implemented in [`gateway/cache/redis_semantic_cache.py`](file:///data2/home/ritu
 
 ## 5. Neural Complexity Router (Two-Tower MLP Engine)
 
-Implemented in [`gateway/router/complexity_scorer.py`](file:///data2/home/ritujmanware/onprem-rag-gateway/gateway/router/complexity_scorer.py) and [`gateway/router/mlp_router/inference.py`](file:///data2/home/ritujmanware/onprem-rag-gateway/gateway/router/mlp_router/inference.py).
+Implemented in [`gateway/router/complexity_scorer.py`](gateway/router/complexity_scorer.py) and [`gateway/router/mlp_router/inference.py`](gateway/router/mlp_router/inference.py).
 
 ### Architectural Rationale
 The Two-Tower MLP Router classifies semantic reasoning complexity using a 400-dimensional hybrid representation without performing any database lookups:
@@ -230,7 +230,7 @@ flowchart LR
 
 ## 6. Hybrid Knowledge Retrieval & Query Metadata Extraction
 
-Implemented in [`pipeline/retriever.py`](file:///data2/home/ritujmanware/onprem-rag-gateway/pipeline/retriever.py) and [`pipeline/query_metadata_extractor.py`](file:///data2/home/ritujmanware/onprem-rag-gateway/pipeline/query_metadata_extractor.py).
+Implemented in [`pipeline/retriever.py`](pipeline/retriever.py) and [`pipeline/query_metadata_extractor.py`](pipeline/query_metadata_extractor.py).
 
 ### 6.1 Corpus Scale & Indexing
 - **Total Chunks:** `2,261,664` chunks in Redis Stack RAM (`used_memory: 43.84 GB`).
@@ -238,7 +238,7 @@ Implemented in [`pipeline/retriever.py`](file:///data2/home/ritujmanware/onprem-
 - **Text & Tag Index:** RediSearch inverted indices on `department`, `author`, `advisor`, `title`, and `date`.
 
 ### 6.2 Query Metadata Extraction & Catalog Routing
-[`QueryMetadataExtractor`](file:///data2/home/ritujmanware/onprem-rag-gateway/pipeline/query_metadata_extractor.py) uses regex patterns and department dictionaries to detect structured constraints:
+[`QueryMetadataExtractor`](pipeline/query_metadata_extractor.py) uses regex patterns and department dictionaries to detect structured constraints:
 - Queries like *"how many thesis of CSA department exist"* extract `@department:(Computer Science and Automation)` with `is_count=True`.
 - Queries matching catalog patterns bypass dense KNN vector distortion and execute exact RediSearch boolean queries, grouping chunks by `doc_id` to prevent multi-chunk duplicate counts.
 
@@ -252,14 +252,14 @@ Unlike traditional fixed $k=3$ or $k=5$ retrievers:
 ### 6.4 Response Sanitization (Document Titles Only)
 To minimize network payload and avoid overwhelming the user with raw text walls:
 - The internal retriever passes full chunk content to the model for grounding.
-- In the final HTTP/SSE response sent to the client, [`sanitize_chunks()`](file:///data2/home/ritujmanware/onprem-rag-gateway/pipeline/retriever.py) strips all raw chunk text (`content`, `text`, `chunk_text`, `vector`, `chunk_key`), returning **only document titles**, authors, and similarity scores.
+- In the final HTTP/SSE response sent to the client, [`sanitize_chunks()`](pipeline/retriever.py) strips all raw chunk text (`content`, `text`, `chunk_text`, `vector`, `chunk_key`), returning **only document titles**, authors, and similarity scores.
 
 ---
 
 ## 7. Grounding, Context Auto-Budgeting & Zero-Document Rejection
 
 ### 7.1 Context Window Auto-Budgeting
-In [`pipeline/slm_runner.py`](file:///data2/home/ritujmanware/onprem-rag-gateway/pipeline/slm_runner.py):
+In [`pipeline/slm_runner.py`](pipeline/slm_runner.py):
 - **Context Size:** `SLM_CONTEXT_WINDOW = 8192` tokens.
 - **Character Budgeting:** `max_chars = 12000` (~3,000 tokens) in `build_rag_messages()`.
 - **Strict Block Clamping:** Even if the first chunk (e.g., catalog summary) is massive, it is strictly sliced to fit the budget.
@@ -273,7 +273,7 @@ When a query yields zero relevant theses from the institutional corpus (all cand
 - The anti-pollution shield guarantees this refusal string is never stored in the semantic cache.
 
 ### 7.3 Grounded System Prompting
-Refined prompt rules in [`pipeline/slm_runner.py`](file:///data2/home/ritujmanware/onprem-rag-gateway/pipeline/slm_runner.py):
+Refined prompt rules in [`pipeline/slm_runner.py`](pipeline/slm_runner.py):
 - **Repository Grounding:** Answers must be strictly derived from the retrieved thesis chunks with explicit citations (`[Document i]`).
 - **Delimiter Fencing:** Injected document content is wrapped in `<context>` blocks with XML escaping to neutralize prompt-breakout attacks.
 
@@ -282,7 +282,7 @@ Refined prompt rules in [`pipeline/slm_runner.py`](file:///data2/home/ritujmanwa
 ## 8. Dual-Tier Inference Serving Infrastructure
 
 ### 8.1 Tier 1: Host CPU SLM Server (Port 8082)
-Implemented in [`pipeline/serve_cpu_slm.py`](file:///data2/home/ritujmanware/onprem-rag-gateway/pipeline/serve_cpu_slm.py) and [`pipeline/slm_runner.py`](file:///data2/home/ritujmanware/onprem-rag-gateway/pipeline/slm_runner.py):
+Implemented in [`pipeline/serve_cpu_slm.py`](pipeline/serve_cpu_slm.py) and [`pipeline/slm_runner.py`](pipeline/slm_runner.py):
 - **Model:** `Qwen2.5-3B-Instruct` in 4-bit INT4 quantization (`qwen2.5-3b-instruct-q4_k_m.gguf`, 2.0 GB).
 - **Backend:** `llama-cpp-python` compiled with native AVX-512 acceleration.
 - **Concurrency:** 6 Uvicorn workers, each with 16 decode threads and 32 batch threads.
@@ -301,7 +301,7 @@ Implemented in [`pipeline/serve_cpu_slm.py`](file:///data2/home/ritujmanware/onp
 ## 9. Comprehensive Codebase Directory Map
 
 ```text
-/data2/home/ritujmanware/onprem-rag-gateway/
+onprem-rag-gateway/
 ├── askiisc_chat/                 # Unified Web Frontend & Chat UI
 │   ├── askiisc/                  # Chat backend adapter modules
 │   │   ├── app.py                # FastAPI chat endpoints & session auth

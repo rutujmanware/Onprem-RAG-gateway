@@ -195,7 +195,7 @@ Output ONLY valid JSON in this exact format, with no markdown formatting:
     llm = LLM(
         model="Qwen/Qwen2.5-72B-Instruct-GPTQ-Int8",
         tensor_parallel_size=4,
-        download_dir="/dev/shm/huggingface_cache",
+        download_dir=os.getenv("HF_HOME"),          # scripts/run_slurm.sh points it at a RAM disk; default: HF cache
         trust_remote_code=True,
         gpu_memory_utilization=0.8,
         max_model_len=3072,

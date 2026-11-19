@@ -30,7 +30,6 @@ except ImportError:
 import torch
 
 LOCAL_GGUF_MODEL = os.path.join(ROOT_DIR, "models", "slm_gguf", "qwen2.5-3b-instruct-q4_k_m.gguf")
-SHM_GGUF_MODEL = "/dev/shm/models/qwen2.5-3b-instruct-q4_k_m.gguf"
 LOCAL_3B_HF_MODEL = os.path.expanduser("~/.cache/huggingface/hub/models--Qwen--Qwen2.5-3B-Instruct")
 LOCAL_0_5B_MODEL = os.path.join(ROOT_DIR, "models", "slm_cpu", "qwen2.5-0.5b")
 
@@ -44,8 +43,6 @@ def resolve_default_model() -> str:
         return env_model
     if os.path.exists(LOCAL_GGUF_MODEL):
         return LOCAL_GGUF_MODEL
-    if os.path.exists(SHM_GGUF_MODEL):
-        return SHM_GGUF_MODEL
     if os.path.exists(LOCAL_3B_HF_MODEL):
         return "Qwen/Qwen2.5-3B-Instruct"
     if os.path.exists(LOCAL_0_5B_MODEL):
