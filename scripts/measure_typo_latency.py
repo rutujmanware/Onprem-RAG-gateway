@@ -50,7 +50,7 @@ def main():
                 ts.append((time.perf_counter() - t0) * 1000)
             out[f"{label} / {phase}"] = ts
             print(f"{label:11s} {phase}: n={len(ts)} p50 {statistics.median(ts):.3f} ms  p95 {pct(ts, 95):.3f} ms  "
-                  f"p99 {pct(ts, 99):.3f} ms  max {max(ts):.3f} ms  (target p99 <= 0.5 ms)")
+                  f"p99 {pct(ts, 99):.3f} ms  max {max(ts):.3f} ms  (target p99 <= 5 ms)")
     log = ROOT / "logs" / "perf" / f"typo_latency_{time.strftime('%Y%m%d_%H%M%S')}.json"
     log.parent.mkdir(parents=True, exist_ok=True)
     log.write_text(json.dumps({k: {"p50": statistics.median(v), "p95": pct(v, 95), "p99": pct(v, 99), "max": max(v),

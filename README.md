@@ -2,7 +2,7 @@
 
 A 100% bare-metal, zero-egress Retrieval-Augmented Generation (RAG) platform and API Gateway built for the Indian Institute of Science (IISc). The entire corpus of institutional theses and research papers (**2,261,664 chunks**) is indexed in **Redis Stack** RAM. A PyTorch Two-Tower **complexity router** dynamically dispatches queries to either an ultra-fast **CPU Small Language Model** (Qwen 2.5 3B across 6 workers $\times$ 16 threads) or a high-capacity **GPU Large Language Model** (Qwen 2.5 7B served via **vLLM** on an NVIDIA A100), with automatic fallback to CPU on GPU saturation.
 
-The platform runs behind a single-port secure perimeter (**Port 8080**) featuring email OTP authentication, CSRF protection, token-bucket admission control, microsecond-tier typo normalization, and a two-level semantic cache.
+The platform runs behind a single-port secure perimeter (**Port 8080**) featuring email OTP authentication, CSRF protection, token-bucket admission control, low-latency typo normalization (p99 ≤ 5 ms), and a two-level semantic cache.
 
 📖 **Engineering Manuals:** [complete_system_documentation.md](complete_system_documentation.md) (Complete Architecture) · [product_requirements_document.md](product_requirements_document.md) (PRD & Requirements) · [OPTIMIZATION_GUIDE.md](OPTIMIZATION_GUIDE.md) (CPU SLM Tuning)
 
@@ -41,7 +41,7 @@ The platform runs behind a single-port secure perimeter (**Port 8080**) featurin
                │                         │
                └────────────┬────────────┘
                             ▼
-               Typo Normalizer (3.95 µs)
+               Typo Normalizer (p99 ≤ 5 ms)
                             │
                ┌────────────┴────────────┐
                ▼                         ▼
