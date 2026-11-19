@@ -1871,7 +1871,7 @@ New scripts. Each runs on an isolated measurement gateway ([`scripts/eval_gatewa
 |---|---|---|
 | NFR-4 | [`measure_cross_account.py`](scripts/measure_cross_account.py) | **0 leaks / 500 probes** (95 % upper bound 0.76 %). 211 of the paraphrase probes reached the victim's entry when the victim asked, so owner scoping is what stopped them. |
 | NFR-3 / §7 C0–C2 | [`measure_configs.py`](scripts/measure_configs.py) | CPU tier **81 %** of generated answers; GPU time **−92 %** vs GPU-only (306.6 s → 23.9 s); new questions slower on the CPU tier (5.3 s vs 2.3 s median). C3 not run (no FP16 CPU deployment). |
-| Sub-FR-1.1 / NFR-1 | [`measure_typo_latency.py`](scripts/measure_typo_latency.py) | **Missed:** p99 1.0–4.2 ms vs ≤ 0.5 ms target, since the corpus check of DEFECT-40. |
+| Sub-FR-1.1 / NFR-1 | [`measure_typo_latency.py`](scripts/measure_typo_latency.py) | **Missed:** p99 1.0–4.2 ms vs ≤ 0.5 ms target, since the corpus check of DEFECT-40. Target later revised to p99 ≤ 5 ms (PRD NFR-1); **met** (re-measured after DEFECT-62: worst p99 4.5 ms). |
 | NFR-5 | [`measure_burst.py`](scripts/measure_burst.py) | **Met** (50× burst, 100 req/s for 60 s): no crash, no HTTP 500, recovery 120/120. Cached answers during the burst: probe p50 56 ms / p99 0.95 s. New questions: 59 % answered, 41 % shed with 503 by design. Found DEFECT-52. |
 | NFR-1 re-run | [`load_test_cache.py`](scripts/load_test_cache.py) | Failed after classifier v2 (semantic p99 48.7 ms); **met** again after DEFECT-51 (p99 15.1 ms). |
 

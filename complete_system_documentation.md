@@ -24,7 +24,7 @@
 ### Core Architectural Pillars
 - **100% On-Premise Air-Gapped Operation:** Absolute zero-egress guarantee. No document text, query vectors, or intermediate embeddings ever leave the institutional network.
 - **Zero-GPU-Starvation Dynamic Tiering:** Employs an intelligent Two-Tower Neural Router to absorb **70% to 80%** of everyday campus queries on highly optimized **CPU Small Language Models (3B GGUF with AVX-512)** consuming **0 MiB of GPU VRAM**. The enterprise **GPU LLM (7B on NVIDIA A100)** is reserved exclusively for complex, multi-document synthesis and mathematical proofs.
-- **Ultra-Low-Latency Typo Normalization:** Microsecond-tier ($3.95\ \mu\text{s}$) token regularizer that resolves domain typographical errors before cache lookup and retrieval without altering standard English.
+- **Low-Latency Typo Normalization:** Token regularizer (p99 ≤ 5 ms; microseconds for dictionary words, a cached Redis corpus lookup for unknown words) that resolves domain typographical errors before cache lookup and retrieval without altering standard English.
 - **Microsecond Semantic Caching:** High-concurrency semantic vector cache in Redis Stack (`semantic_cache_idx`) serving repeat or semantically identical queries in **< 1ms (exact)** or **< 35ms (semantic)**, bypassing model inference completely.
 - **Strict Anti-Pollution Integrity:** Answers with zero retrieved documents or institutional refusals are strictly prevented from entering the semantic cache index.
 - **Single-Port Strict Perimeter:** Single public listener (Port 8080) encapsulating authentication, rate limiting, and fair queuing, while internal engines bind strictly to `127.0.0.1`.
@@ -42,7 +42,7 @@ flowchart TD
     subgraph "Perimeter Security & Ingress (Port 8080)"
         GW --> Auth["Email OTP Auth & Session Guard"]
         Auth --> Injection["Prompt Injection & Jailbreak Fence [NFR-7]"]
-        Injection --> TypoNorm["Typo Normalizer (3.95us)"]
+        Injection --> TypoNorm["Typo Normalizer (p99 ≤ 5 ms)"]
         TypoNorm --> FairQ["Token-Bucket Fair Queue & Admission Controller"]
     end
 
@@ -84,7 +84,7 @@ sequenceDiagram
     autonumber
     actor Client as Campus User / Browser
     participant GW as Institutional Gateway (Port 8080)
-    participant Norm as Typo Normalizer (3.95us)
+    participant Norm as Typo Normalizer
     participant Cache as Redis Semantic Cache (semantic_cache_idx)
     participant MLP as Neural MLP Router (400-d)
     participant Redis as Redis Stack (Port 6379)
@@ -180,7 +180,7 @@ Implemented in [`gateway/queue/admission.py`](file:///data2/home/ritujmanware/on
 Implemented in [`gateway/cache/redis_semantic_cache.py`](file:///data2/home/ritujmanware/onprem-rag-gateway/gateway/cache/redis_semantic_cache.py).
 
 ### Mechanism & Cache Topology
-1. Incoming queries are normalized via [`TypoNormalizer`](file:///data2/home/ritujmanware/onprem-rag-gateway/pipeline/text_processing/typo_normalizer.py) in $3.95\ \mu\text{s}$.
+1. Incoming queries are normalized via [`TypoNormalizer`](file:///data2/home/ritujmanware/onprem-rag-gateway/pipeline/text_processing/typo_normalizer.py) (p99 ≤ 5 ms; microseconds once its words have been seen).
 2. Query text is embedded into a 384-dimensional dense vector using [`all-MiniLM-L6-v2`](file:///data2/home/ritujmanware/onprem-rag-gateway/models/embeddings/all-MiniLM-L6-v2) on CPU (< 4ms).
 3. Performs HNSW cosine similarity search against index `semantic_cache_idx` (key prefix `semcache:`) using RediSearch `FT.SEARCH` with `EF_RUNTIME 64`.
 4. **Cache Hit Decision:**
@@ -335,7 +335,7 @@ Implemented in [`pipeline/serve_cpu_slm.py`](file:///data2/home/ritujmanware/onp
 │   ├── embeddings/
 │   │   └── embedder.py           # all-MiniLM-L6-v2 384-dim CPU vectorizer
 │   ├── text_processing/
-│   │   ├── typo_normalizer.py    # Ultra-low-latency 3.95us token typo normalizer
+│   │   ├── typo_normalizer.py    # Low-latency token typo normalizer (p99 <= 5 ms)
 │   │   ├── chunker.py            # Recursive character chunker (512/64)
 │   │   └── cleaner.py            # Academic text sanitization
 │   ├── query_metadata_extractor.py # Regex & department metadata extractor
