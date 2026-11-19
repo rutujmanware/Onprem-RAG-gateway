@@ -1,20 +1,24 @@
-.PHONY: help setup download-models dev prod-up prod-down prod-status prod-restart prod-restart-vllm prod-down-vllm vllm-check chat-up chat-down chat-restart chat-status chat-logs chat-code test-smtp cache-stats cache-clear otp-clear queue-stats redis-up redis-down redis-status redis-watch up down logs ingest-pdfs query ask rag-answer serve-slm serve-gpu serve-router generate-dataset eval load-test load-test-cold load-test-cache cache-check export-onnx test test-intensive injection-eval clean
+.PHONY: help setup install-serving download-models dev prod-up prod-down prod-status prod-restart prod-restart-vllm prod-down-vllm vllm-check chat-up chat-down chat-restart chat-status chat-logs chat-code test-smtp cache-stats cache-clear otp-clear queue-stats redis-up redis-down redis-status redis-watch up down logs ingest-pdfs query ask rag-answer serve-slm serve-gpu serve-router generate-dataset eval load-test load-test-cold load-test-cache cache-check export-onnx test test-intensive injection-eval clean
 
 -include .env
+# Machine-specific settings (ignored by Git), e.g. PYTHON := /path/to/env/bin/python
+-include Makefile.local
 export
 
 VENV ?= .venv
-# Interpreter: override with `make PYTHON=...`; otherwise the first that exists of
-#   the .venv made by `make setup`, the active conda env, the team server's rag_env, python3.
+# Interpreter: `make PYTHON=...`, PYTHON in Makefile.local or .env; otherwise the first that exists of
+#   the .venv made by `make setup`, the active conda env, python3.
 CONDA_ENV_PYTHON := $(if $(CONDA_PREFIX),$(CONDA_PREFIX)/bin/python,)
-TEAM_SERVER_PYTHON := /data2/home/ritujmanware/miniconda3/envs/rag_env/bin/python
-PYTHON ?= $(firstword $(wildcard $(VENV)/bin/python $(CONDA_ENV_PYTHON) $(TEAM_SERVER_PYTHON)) python3)
+PYTHON ?= $(firstword $(wildcard $(VENV)/bin/python $(CONDA_ENV_PYTHON)) python3)
+REDIS_PORT ?= 6379
+REDIS_CLI = ./redis-stack-server-7.2.0-v9/bin/redis-cli -p $(REDIS_PORT)
 REDIS_PASSWORD ?= $(shell grep -E '^REDIS_PASSWORD=' .env 2>/dev/null | cut -d '=' -f2-)
 MODEL_7B_PATH ?= models/llm_7b/qwen2.5-7b-instruct
 
 help:
 	@echo "Available commands:"
 	@echo "  make setup          - Create virtualenv and install dependencies"
+	@echo "  make install-serving - Install the model-serving runtimes (vLLM 0.6.3, llama-cpp-python) into that environment"
 	@echo "  make download-models - Download AI models to models/ (Embeddings, CPU SLM, GPU 7B) and export the ONNX embedder"
 	@echo "  make export-onnx    - Export MiniLM to ONNX (verified identical to PyTorch); the gateway uses it automatically"
 	@echo "  make dev            - Run Gateway service locally on port 8080 with live reload"
@@ -58,6 +62,11 @@ setup:
 	./$(VENV)/bin/pip install --upgrade pip
 	./$(VENV)/bin/pip install -r requirements.txt
 	@echo "Setup complete. Activate with: source $(VENV)/bin/activate"
+
+# Model-serving runtimes (not needed for `make test`): vLLM 0.6.3 for the GPU tier (pinned, see PRD §9.2) and
+# llama-cpp-python for the CPU tier (may compile from source: needs gcc, g++, cmake). Same interpreter as the gateway.
+install-serving:
+	$(PYTHON) -m pip install "vllm==0.6.3" "llama-cpp-python>=0.2.90"
 
 download-models:
 	$(PYTHON) scripts/download_models.py
@@ -137,16 +146,16 @@ otp-clear:
 queue-stats:
 	@$(ADMIN_CURL) http://127.0.0.1:8080/queue/stats || $(ADMIN_FAIL)
 
+# Loads redis_server_data/dump_final.rdb with the password from .env, loopback only (scripts/prod_stack.py)
 redis-up:
-	./redis-stack-server-7.2.0-v9/bin/redis-stack-server
-	@echo "Redis Stack daemon started."
+	$(PYTHON) scripts/prod_stack.py redis-start
 
 redis-down:
-	@REDISCLI_AUTH="$(REDIS_PASSWORD)" ./redis-stack-server-7.2.0-v9/bin/redis-cli shutdown 2>/dev/null || ./redis-stack-server-7.2.0-v9/bin/redis-cli shutdown 2>/dev/null || true
+	@REDISCLI_AUTH="$(REDIS_PASSWORD)" $(REDIS_CLI) shutdown 2>/dev/null || $(REDIS_CLI) shutdown 2>/dev/null || true
 	@echo "Redis Stack stopped."
 
 redis-status:
-	@REDISCLI_AUTH="$(REDIS_PASSWORD)" ./redis-stack-server-7.2.0-v9/bin/redis-cli info Persistence 2>/dev/null | grep -E "loading:|loading_loaded_perc:|loading_eta_seconds:|rdb_last_bgsave_status:" || echo "Redis is not running."
+	@REDISCLI_AUTH="$(REDIS_PASSWORD)" $(REDIS_CLI) info Persistence 2>/dev/null | grep -E "loading:|loading_loaded_perc:|loading_eta_seconds:|rdb_last_bgsave_status:" || echo "Redis is not running."
 
 redis-watch:
 	@$(PYTHON) scripts/track_redis.py

@@ -310,7 +310,7 @@ def fence_context_chunks(chunks: List[Dict[str, Any]]) -> str:
 
 #### Pytest Execution Log:
 ```bash
-PYTHONPATH=. /data2/home/ritujmanware/miniconda3/envs/rag_env/bin/python -m pytest tests/test_injection_fence.py tests/test_single_port_security.py tests/test_rate_limiting.py tests/test_admission_queue.py -v
+PYTHONPATH=. python -m pytest tests/test_injection_fence.py tests/test_single_port_security.py tests/test_rate_limiting.py tests/test_admission_queue.py -v
 ```
 
 ```
@@ -544,7 +544,7 @@ Added [`tests/test_otp_concurrency.py`](tests/test_otp_concurrency.py):
 
 #### Pytest Execution Log:
 ```bash
-PYTHONPATH=. /data2/home/ritujmanware/miniconda3/envs/rag_env/bin/python -m pytest tests/test_single_port_security.py tests/test_rate_limiting.py tests/test_injection_fence.py tests/test_admission_queue.py tests/test_otp_concurrency.py -v
+PYTHONPATH=. python -m pytest tests/test_single_port_security.py tests/test_rate_limiting.py tests/test_injection_fence.py tests/test_admission_queue.py tests/test_otp_concurrency.py -v
 ```
 
 ```
@@ -729,7 +729,7 @@ Added [`tests/test_dos_boundary_validation.py`](tests/test_dos_boundary_validati
 
 #### Pytest Execution Log:
 ```bash
-PYTHONPATH=. /data2/home/ritujmanware/miniconda3/envs/rag_env/bin/python -m pytest \
+PYTHONPATH=. python -m pytest \
     tests/test_single_port_security.py \
     tests/test_rate_limiting.py \
     tests/test_injection_fence.py \
@@ -858,7 +858,7 @@ Added [`tests/test_cache_purge_and_ttl.py`](tests/test_cache_purge_and_ttl.py):
 
 #### Pytest Execution Log:
 ```bash
-PYTHONPATH=. /data2/home/ritujmanware/miniconda3/envs/rag_env/bin/python -m pytest \
+PYTHONPATH=. python -m pytest \
     tests/test_single_port_security.py \
     tests/test_rate_limiting.py \
     tests/test_injection_fence.py \
@@ -1012,7 +1012,7 @@ Added [`tests/test_constant_time_and_cookie_security.py`](tests/test_constant_ti
 
 #### Pytest Execution Log:
 ```bash
-PYTHONPATH=. /data2/home/ritujmanware/miniconda3/envs/rag_env/bin/python -m pytest \
+PYTHONPATH=. python -m pytest \
     tests/test_single_port_security.py \
     tests/test_rate_limiting.py \
     tests/test_injection_fence.py \
@@ -1862,6 +1862,21 @@ tests/test_constant_time_and_cookie_security.py::test_secrets_compare_digest_tim
   - The 379 frozen questions are unchanged by the normaliser, so retrieval is unchanged (hit@3 0.711).
 - **Residual:** a correctly spelled coinage that is not built from known parts and absent from the corpus is still indistinguishable from a typo of a neighbouring term; the "Showing results for" notice tells the user what was searched.
 - **Tests:** [`tests/test_typo_protection.py`](tests/test_typo_protection.py): seven coinages kept without the corpus; six typos still corrected and not mistaken for terms; the exact path refuses a rewritten term's hit (graphane, ferrielectric) and serves a typo's (grapheen, neroscience); the corpus-only example is now *neurone*. [`tests/test_cache_owner_scoping.py`](tests/test_cache_owner_scoping.py) checks the owner through the new helper.
+
+## Reproducible Setup From a Fresh Clone (2026-11-19)
+
+**Problem:** following the README on another machine did not give a working system.
+- `make redis-up` and `make prod-up` started Redis Stack without arguments, so it used the `etc/redis-stack.conf` inside the Redis download. On the team server that file had been edited by hand (password, data directory as absolute paths). On a fresh install it is the stock file: Redis would start **without a password**, and not from `redis_server_data/dump_final.rdb` as the README said.
+- The Makefile fell back to an interpreter in one team member's home directory; `pipeline/slm_runner.py`, `scripts/dataset_generator.py` and `scripts/run_slurm.sh` contained machine-specific paths; documentation links were `file:///` links into that home directory.
+- The README never told the reader to download the models, generate the secrets, configure mail (sign-in codes), or install vLLM / llama-cpp-python, and it linked to `OPTIMIZATION_GUIDE.md` at the wrong path.
+
+**Fix:**
+- [`scripts/prod_stack.py`](scripts/prod_stack.py) builds the Redis configuration itself: `run/redis.conf` (mode 600, so the password never appears in the process list) with `requirepass` from `.env`, loopback bind, `REDIS_PORT`, `save ""`; the data directory is `REDIS_DATA_DIR` (default `redis_server_data`, relative to the repository) and the file `REDIS_DBFILENAME` (default `dump_final.rdb`). It refuses to start Redis when `REDIS_PASSWORD` is empty. `make redis-up` now calls `python scripts/prod_stack.py redis-start`, so both paths start Redis the same way.
+- Makefile: no machine-specific interpreter (`.venv`, else the active conda env, else `python3`). A machine can pin its own in `Makefile.local` (ignored by Git; the team server keeps its `rag_env` there), in `.env`, or on the command line. New `make install-serving` (vLLM 0.6.3, llama-cpp-python).
+- Machine-specific paths removed from code, scripts and docs (the remaining ones are recorded pytest output and history).
+- README rewritten as a numbered fresh-machine procedure (clone, environment, `.env` secrets and `smtp.env`, models, Redis Stack, corpus, start, verify), followed by daily operation and reference sections. `.env.example`: `REDIS_URL` shows that it must contain the password; `PYTHON`, `REDIS_DATA_DIR`, `REDIS_DBFILENAME` documented.
+
+**Verified:** the generated configuration started Redis Stack on a spare port with an empty data directory: unauthenticated `PING` refused, authenticated `PING` OK, bind `127.0.0.1 -::1`, `dbfilename dump_final.rdb`, `save ""`, all modules loaded (search, ReJSON, timeseries, bf, redisgears_2); production Redis untouched. The README's secret-generation commands, run on a copy of `.env.example`, filled all five secrets and `REDIS_URL`, and the file still loads in bash. All README links, anchors and `make` targets exist. `make test`: 574 + 37 + 627 passed, script suites OK.
 
 ## Measurement Run (2026-11-19): Previously Unmeasured PRD Targets
 

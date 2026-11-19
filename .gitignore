@@ -102,3 +102,6 @@ tests/test_injection_redteam_examples.py
 !pipeline/data/
 !pipeline/data/injection_classifier.json
 .dev_session_secret
+
+# Machine-specific make settings (interpreter path, ...)
+Makefile.local

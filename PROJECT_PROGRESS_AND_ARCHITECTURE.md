@@ -133,8 +133,8 @@ When tested on multi-document cross-paper questions where top-k context is incom
 
 ### 1. Activating the Environment
 ```bash
-cd /data2/home/ritujmanware/onprem-rag-gateway
-source /data2/home/ritujmanware/miniconda3/etc/profile.d/conda.sh
+cd Onprem-RAG-gateway   # the repository root
+source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate rag_env
 set -a && source .env && set +a
 ```
@@ -268,7 +268,7 @@ Teammates can reproduce and test today's work using these copy-paste commands:
 
 ```bash
 # 1. Activate Environment (Standard Conda Setup)
-cd /data2/home/ritujmanware/onprem-rag-gateway
+cd Onprem-RAG-gateway   # the repository root
 source ~/.bashrc
 conda activate rag_env
 set -a && source .env && set +a
@@ -401,7 +401,7 @@ Teammates can reproduce and test the complete system using these copy-paste comm
 
 ```bash
 # 1. Activate Environment
-cd /data2/home/ritujmanware/onprem-rag-gateway
+cd Onprem-RAG-gateway   # the repository root
 source ~/.bashrc
 conda activate rag_env
 set -a && source .env && set +a
@@ -590,7 +590,7 @@ To make all models and services live from scratch, follow these instructions:
 # -----------------------------------------------------------------------------
 # STEP 0: Environment Setup
 # -----------------------------------------------------------------------------
-cd /data2/home/ritujmanware/onprem-rag-gateway
+cd Onprem-RAG-gateway   # the repository root
 source ~/.bashrc
 conda activate rag_env
 set -a && source .env && set +a
@@ -1310,7 +1310,7 @@ The GPU tier (`Qwen/Qwen2.5-7B-Instruct`) was migrated from custom server script
 - **Engine Command (`make serve-gpu`):**
   ```bash
   CUDA_VISIBLE_DEVICES=$VLLM_GPU python scripts/serve_vllm.py \
-    --model /data2/home/ritujmanware/.cache/huggingface/hub/models--Qwen--Qwen2.5-7B-Instruct/snapshots/a09a35458c702b33eeacc393d103063234e8bc28 \
+    --model models/llm_7b/qwen2.5-7b-instruct \
     --served-model-name "Qwen/Qwen2.5-7B-Instruct" \
     --host 127.0.0.1 \
     --port 8000 \
@@ -2704,7 +2704,7 @@ Following the deployment of parallel fan-out and in-memory document slicing, two
    - **Median Cold Latency:** **4,602.55 ms** (including full Redis 2.26M chunk vector search + 7B model generation).
    - **Mean Vector Retrieval:** **404.33 ms** | **Avg CPU Load:** **6.5%** | **Peak GPU Load:** **90.0%**.
 
-Full telemetry report saved at: [`load_testing_report.md`](file:///data2/home/ritujmanware/.gemini/antigravity/brain/34485d79-7a30-4c0b-aaf2-f9338314cae2/load_testing_report.md).
+Full telemetry report saved at: `load_testing_report.md` (a local working file, not part of the repository).
 
 ---
 
@@ -2717,7 +2717,7 @@ In an on-premise institutional environment, model serving infrastructure faces h
 2. **The Noisy-Neighbor Problem:** If an automated evaluation script or a student writes a concurrent loop (`for i in range(100): post(...)`), standard unqueued HTTP servers would starve all other campus users.
 3. **Unbounded Backlog Memory Leaks:** Queuing requests indefinitely inside asynchronous task buffers inflates RAM and causes gateway timeouts.
 
-To address this, we developed a two-tier admission control and scheduling architecture implemented in [`gateway/queue/admission.py`](file:///data2/home/ritujmanware/onprem-rag-gateway/gateway/queue/admission.py) and [`gateway/queue/fair_queue.py`](file:///data2/home/ritujmanware/onprem-rag-gateway/gateway/queue/fair_queue.py).
+To address this, we developed a two-tier admission control and scheduling architecture implemented in [`gateway/queue/admission.py`](gateway/queue/admission.py) and [`gateway/queue/fair_queue.py`](gateway/queue/fair_queue.py).
 
 ---
 
@@ -2796,7 +2796,7 @@ The gateway exposes real-time queue telemetry through the `GET /queue/stats` end
 }
 ```
 
-The queue behavior is validated in [`tests/test_admission_queue.py`](file:///data2/home/ritujmanware/onprem-rag-gateway/tests/test_admission_queue.py):
+The queue behavior is validated in [`tests/test_admission_queue.py`](tests/test_admission_queue.py):
 ```bash
 PYTHONPATH=. python3 tests/test_admission_queue.py
 # Output:

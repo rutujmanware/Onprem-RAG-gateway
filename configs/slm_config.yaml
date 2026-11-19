@@ -4,7 +4,6 @@
 
 model:
   name: "models/slm_gguf/qwen2.5-3b-instruct-q4_k_m.gguf"
-  shm_path: "/dev/shm/models/qwen2.5-3b-instruct-q4_k_m.gguf"
   fallback_name: "Qwen/Qwen2.5-3B-Instruct"
   architecture: "qwen2.5"
   dtype: "q4_k_m"                                 # 4-bit medium K-quantization for fast CPU GEMM
