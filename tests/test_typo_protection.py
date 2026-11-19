@@ -53,10 +53,11 @@ def test_distinct_terms_no_longer_share_the_exact_cache_key(minimal_install, mon
 
 
 def test_decisions_made_without_the_corpus_are_not_cached(minimal_install, monkeypatch):
+    # neurone: a real spelling protected only by the corpus (graphane is now protected by its shape, DEFECT-62)
     corpus(monkeypatch, down=True)
-    assert minimal_install.normalize("graphane") == "graphene"      # index unavailable: dictionary only
-    corpus(monkeypatch, words={"graphane"})
-    assert minimal_install.normalize("graphane") == "graphane", "protected once the index is reachable again"
+    assert minimal_install.normalize("neurone") == "neurons"        # index unavailable: dictionary only
+    corpus(monkeypatch, words={"neurone"})
+    assert minimal_install.normalize("neurone") == "neurone", "protected once the index is reachable again"
 
 
 def test_bridge_forwards_the_correction_notice():
@@ -102,3 +103,64 @@ def test_typos_and_plurals_still_hit(monkeypatch, a, b):
     import pipeline.text_processing.typo_normalizer as t2
     monkeypatch.setattr(t2, "_is_english", lambda w: w in {"explain", "models"})
     assert not C.check_entity_conflict(a, b)[0]
+
+
+# ------------------------------------------- coinages absent from the corpus (DEFECT-62, follow-up to DEFECT-40)
+@pytest.mark.parametrize("term", ["ferrielectric", "graphane", "graphyne", "nanographene", "antiferroelectric",
+                                  "magnetoelectric", "germanene"])
+def test_coinages_are_kept_even_when_the_corpus_lacks_them(minimal_install, monkeypatch, term):
+    """ferrielectric appears in 0 production thesis chunks, and a small corpus may lack graphane / graphyne: the
+    dictionary and corpus checks saw typos and rewrote them. Words built from known parts are now kept."""
+    corpus(monkeypatch, words=())
+    assert tn.looks_like_term(term, minimal_install.vocab)      # nanographene: nano + graphene (a vocabulary term)
+    assert minimal_install.correct_word(term) == term
+
+
+@pytest.mark.parametrize("typo,fixed", [("grapheen", "graphene"), ("neroscience", "neuroscience"),
+                                        ("maerials", "materials"), ("comustion", "combustion"),
+                                        ("dielectic", "dielectric"), ("experimentol", "experimental")])
+def test_typos_are_not_mistaken_for_coinages(minimal_install, monkeypatch, typo, fixed):
+    corpus(monkeypatch, words=())
+    assert not tn.looks_like_term(typo, minimal_install.vocab)
+    assert minimal_install.correct_word(typo) == fixed
+
+
+def _run(coro):
+    import asyncio
+    return asyncio.new_event_loop().run_until_complete(coro)
+
+
+class _ExactCache:
+    """Returns the stored entry for the corrected text as an exact hit (the fast path skips the intent guard)."""
+    def __init__(self, stored_prompt):
+        self.stored, self.calls = stored_prompt, []
+
+    async def alookup(self, q, owner=None):
+        self.calls.append(q)
+        if q == self.stored:
+            return {"cached": True, "similarity": 1.0, "fast_exact": True, "matched_prompt": self.stored,
+                    "response": {"answer": "stored", "chunks": [{"doc_id": "d1"}]}}
+        return None
+
+
+@pytest.mark.parametrize("typed,corrected,stored,served", [
+    # a rewrite into another real term: refused (no other term's answer at similarity 1.0)
+    ("What are graphane transistors used for?", "What are graphene transistors used for?",
+     "What are graphene transistors used for?", False),
+    ("Explain ferrielectric ordering in thin films", "Explain ferroelectric ordering in thin films",
+     "Explain ferroelectric ordering in thin films", False),
+    # a typo: still served from the cache (Sub-FR-1.1)
+    ("What are grapheen transistors used for?", "What are graphene transistors used for?",
+     "What are graphene transistors used for?", True),
+    ("what is neroscience?", "what is neuroscience?", "what is neuroscience?", True),
+])
+def test_exact_hits_for_a_rewritten_question_run_the_intent_guard(monkeypatch, typed, corrected, stored, served):
+    """The reporter's suggestion: run the entity guard on the exact path too. Even if a coinage were rewritten,
+    the exact hit for the corrected text is checked against the question as typed."""
+    import gateway.main as gm
+    corpus(monkeypatch, words={"graphene", "transistors", "ferroelectric", "neuroscience"})
+    cache = _ExactCache(stored)
+    hit = _run(gm._cache_lookup(cache, corrected, typed, "alice@iisc.ac.in"))
+    assert (hit is not None) is served
+    if not served:
+        assert cache.calls == [corrected, typed]    # refused, then looked up as typed (a miss here)

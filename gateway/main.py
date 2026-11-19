@@ -218,6 +218,25 @@ async def _injection_refused(admission: AdmissionController, request: Request,
     return HTTPException(status_code=400, detail=str(e))
 
 
+async def _cache_lookup(cache, query: str, raw_query: str, owner: str):
+    """Cache lookup for the normalised question, then the question as typed (DEFECT-40).
+
+    DEFECT-62: when the typo normaliser changed the question, a hit found for the corrected text is also checked
+    against the question as typed with the intent guard (`check_entity_conflict`), exact hits included: an exact hit
+    returns at once and never ran the guard, so a rewritten term (ferrielectric -> ferroelectric) was served the other
+    term's cached answer at similarity 1.0. Typos pass the guard (a misspelling is not a real word), so they still hit.
+    """
+    hit = await cache.alookup(query, owner=owner)
+    if hit is not None and query != raw_query:
+        conflict, reason = RedisSemanticCache.check_entity_conflict(raw_query, hit.get("matched_prompt") or query)
+        if conflict:
+            logger.info("Cache hit for the corrected question refused (%s): %r", reason, raw_query)
+            hit = None
+    if hit is None and query != raw_query:
+        hit = await cache.alookup(raw_query, owner=owner)
+    return hit
+
+
 def _fence_messages(messages) -> None:
     """Patterns on every message, English-only on user messages. The classifier runs later, on a cache miss
     (`_classify_messages`, DEFECT-51)."""
@@ -745,9 +764,7 @@ async def chat_completions(
 
     # Step 0: Semantic Vector Cache Lookup
     try:
-        hit = await cache.alookup(query, owner=client_id)
-        if hit is None and query != raw_query:
-            hit = await cache.alookup(raw_query, owner=client_id)
+        hit = await _cache_lookup(cache, query, raw_query, client_id)   # DEFECT-62: rewrites checked
     except Exception:
         hit = None
     if hit is None:
@@ -1030,9 +1047,7 @@ async def query_endpoint(
     hit = None
     if use_cache:
         try:
-            hit = await cache.alookup(query, owner=client_id)
-            if hit is None and query != raw_query:
-                hit = await cache.alookup(raw_query, owner=client_id)
+            hit = await _cache_lookup(cache, query, raw_query, client_id)   # DEFECT-62: rewrites checked
         except Exception:
             hit = None
     if hit is None:

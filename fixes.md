@@ -1847,6 +1847,22 @@ tests/test_constant_time_and_cookie_security.py::test_secrets_compare_digest_tim
 - **Fix:** [`askiisc_chat/askiisc/auth.py`](askiisc_chat/askiisc/auth.py) retries the connection with a growing wait (5 s, doubling, at most 60 s) and logs the reconnect, as Anthropic's client libraries do for connection errors. Once connected, redis-py reconnects by itself after an outage. Codes issued in memory during an outage do not carry over; the user requests a new one.
 - **Tests:** [`tests/test_otp_isolation.py`](tests/test_otp_isolation.py): Redis down at first use → memory, no retry before the wait ends, the wait doubles, Redis back → connected.
 
+## DEFECT-62: Coinages Missing From the Corpus Were Still Rewritten; Exact Hits Skipped the Intent Guard
+
+- **Found by:** retest preparation for the red-team typo-normaliser report (DEFECT-40), after reviewing its suggested fix. On `8ab4bda`, `ferrielectric` was still rewritten to `ferroelectric` on production (it appears in **0** thesis chunks), and with a small corpus that lacks them (the red team's harness) `graphane` / `graphyne` were still rewritten to `graphene`. The rewritten question then hit the other term's exact cache entry at similarity 1.0: the exact fast path returns before the intent guard, which the report suggested running there too.
+- **Why the corpus could not tell them apart:** of 108 typos of the frozen questions that the normaliser corrects, 23 occur in 1–4 thesis chunks (PDF extraction errors such as *resaerch*, *structual*), while the real term *ferrielectric* occurs in none. Corpus presence is no signal for rare terms.
+- **Fix:**
+  - [`pipeline/text_processing/typo_normalizer.py`](pipeline/text_processing/typo_normalizer.py): `looks_like_term()` — a word built from known parts is never rewritten: a scientific prefix (*ferri, ferro, nano, poly, piezo, magneto, …*) followed by a known word of 4+ letters, or a known stem of 5+ letters followed by a chemical-nomenclature suffix (*-ane, -ene, -yne, -ide, -ite, -ium, …*). "Known" = the bundled English dictionary or the normaliser's vocabulary.
+  - [`gateway/cache/redis_semantic_cache.py`](gateway/cache/redis_semantic_cache.py): the intent guard's spelling rule counts such words as real, so *graphane* vs *graphene* is refused as a semantic hit even when the corpus lacks *graphane*.
+  - [`gateway/main.py`](gateway/main.py): `_cache_lookup()` — when the normaliser changed the question, a hit for the corrected text (exact hits included) is checked with the intent guard against the question **as typed**; a conflict is a miss (as the report suggested). Typos pass the guard, so they still hit (Sub-FR-1.1).
+- **Measured** ([`scripts/measure_typo_rewrites.py`](scripts/measure_typo_rewrites.py), production corpus):
+  - 416 typos of the frozen questions that the previous rule corrected (5 seeds; dropped, doubled, swapped, substituted letters): **414 still corrected**; 2 now kept as typed (*graphine*, itself a plausible material name, and *aerospade*). Two-letter suffixes and 4-letter stems were tried first and dropped (they kept *experimentol*, *studide*).
+  - 37 misspelled questions that the normaliser fully corrects: **0** lose their exact cache hit to the new guard.
+  - Reported terms: *graphane*, *graphyne*, *ferrielectric* kept as typed without any corpus help; their hits against *graphene* / *ferroelectric* refused. *grapheen* and *neroscience* still corrected and still hit.
+  - The 379 frozen questions are unchanged by the normaliser, so retrieval is unchanged (hit@3 0.711).
+- **Residual:** a correctly spelled coinage that is not built from known parts and absent from the corpus is still indistinguishable from a typo of a neighbouring term; the "Showing results for" notice tells the user what was searched.
+- **Tests:** [`tests/test_typo_protection.py`](tests/test_typo_protection.py): seven coinages kept without the corpus; six typos still corrected and not mistaken for terms; the exact path refuses a rewritten term's hit (graphane, ferrielectric) and serves a typo's (grapheen, neroscience); the corpus-only example is now *neurone*. [`tests/test_cache_owner_scoping.py`](tests/test_cache_owner_scoping.py) checks the owner through the new helper.
+
 ## Measurement Run (2026-11-19): Previously Unmeasured PRD Targets
 
 New scripts. Each runs on an isolated measurement gateway ([`scripts/eval_gateway.py`](scripts/eval_gateway.py)) with its own cache prefixes, deleted afterwards:
