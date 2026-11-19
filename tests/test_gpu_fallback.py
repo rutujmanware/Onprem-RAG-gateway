@@ -214,6 +214,9 @@ def test_chat_completions_hard_route_with_gpu_down_returns_200_from_cpu(net, mon
             return RouteDecision(target_tier=ModelTier.GPU_LLM, score=score, alpha=0.5, target_model="m", reason="t")
 
     class Adm:
+        async def charge(self, *a, **k):   # DEFECT-47: rate limit charged on arrival
+            return None
+
         @asynccontextmanager
         async def slot(self, *a, **k):
             yield

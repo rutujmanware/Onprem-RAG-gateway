@@ -37,7 +37,12 @@ class Model:
 
 
 @pytest.fixture
-def setup():
+def setup(monkeypatch):
+    import pipeline.embeddings.embedder as emb
+
+    class Emb:            # embedding model present (DEFECT-48 check)
+        _model = object()
+    monkeypatch.setattr(emb, "LocalEmbedder", Emb)
     over = gm.app.dependency_overrides
     saved = dict(over)
 
@@ -57,7 +62,7 @@ def test_ready_reflects_dependencies(setup, redis, cpu, gpu, status):
     c = setup(redis, cpu, gpu)
     r = c.get("/ready")
     assert r.status_code == status
-    assert r.json()["checks"] == {"redis_thesis_index": redis, "cpu_model": cpu, "gpu_model": gpu}
+    assert r.json()["checks"] == {"redis_thesis_index": redis, "embedding_model": True, "cpu_model": cpu, "gpu_model": gpu}
 
 
 def test_outsiders_see_only_the_status(setup):
@@ -67,3 +72,14 @@ def test_outsiders_see_only_the_status(setup):
 
 def test_health_stays_a_liveness_check(setup):
     assert setup(redis=False, cpu=False, gpu=False).get("/health").json() == {"status": "ok"}
+
+
+def test_missing_embedding_model_is_not_ready(setup, monkeypatch):
+    import pipeline.embeddings.embedder as emb
+
+    class NoEmb:
+        _model = None
+    c = setup()
+    monkeypatch.setattr(emb, "LocalEmbedder", NoEmb)
+    r = c.get("/ready")
+    assert r.status_code == 503 and r.json()["checks"]["embedding_model"] is False

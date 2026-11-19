@@ -44,6 +44,9 @@ except ImportError:
 # Target model repositories & directories
 EMBEDDING_REPO = "sentence-transformers/all-MiniLM-L6-v2"
 EMBEDDING_DIR = ROOT_DIR / "models" / "embeddings" / "all-MiniLM-L6-v2"
+# Injection classifier v2 (NFR-7): multilingual sentence embeddings, exported to ONNX by `make download-models`
+MULTILINGUAL_REPO = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+MULTILINGUAL_DIR = ROOT_DIR / "models" / "embeddings" / "paraphrase-multilingual-MiniLM-L12-v2"
 
 SLM_REPO = "Qwen/Qwen2.5-3B-Instruct-GGUF"
 SLM_FILENAME = "qwen2.5-3b-instruct-q4_k_m.gguf"
@@ -112,6 +115,23 @@ def download_embedding_model(force: bool = False) -> bool:
         return True
     except Exception as e:
         print(f"❌ Failed to download embedding model: {e}")
+        return False
+
+
+def download_multilingual_model(force: bool = False) -> bool:
+    """Multilingual sentence-embedding model used by the prompt-injection classifier (pipeline/injection_classifier.py)."""
+    print(f"\n📦 Provisioning injection-classifier model: {MULTILINGUAL_REPO} -> {MULTILINGUAL_DIR}")
+    if (MULTILINGUAL_DIR / "config.json").exists() and not force:
+        print("✅ Multilingual model already present. Skipping download.")
+        return True
+    try:
+        snapshot_download(repo_id=MULTILINGUAL_REPO, local_dir=str(MULTILINGUAL_DIR),
+                          allow_patterns=["*.json", "*.txt", "model.safetensors", "sentencepiece.bpe.model",
+                                          "tokenizer*", "1_Pooling/*", "unigram.json"])
+        print("✅ Multilingual model provisioned (run the ONNX export next; `make download-models` does)")
+        return True
+    except Exception as e:
+        print(f"❌ Failed to download multilingual model: {e}")
         return False
 
 
@@ -230,6 +250,8 @@ def main():
     if download_all or args.embeddings:
         ok = download_embedding_model(force=args.force)
         results.append(("Embeddings (all-MiniLM-L6-v2)", ok))
+        ok = download_multilingual_model(force=args.force)
+        results.append(("Injection classifier (paraphrase-multilingual-MiniLM-L12-v2)", ok))
 
     if download_all or args.slm:
         ok = download_slm_model(force=args.force)

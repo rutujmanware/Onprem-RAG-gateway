@@ -83,6 +83,15 @@ class Dispatcher:
 
 
 class Admission:
+    async def charge(self, *a, **k):   # DEFECT-47: rate limit charged on arrival
+        return None
+
+    async def check_injection_block(self, *a, **k):   # DEFECT-59: identified callers are checked for a block
+        return None
+
+    async def record_injection_refusal(self, *a, **k):
+        return False
+
     @asynccontextmanager
     async def slot(self, *a, **k):
         raise RuntimeError("stop after identification")  # the test only needs the identity

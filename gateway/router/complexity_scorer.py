@@ -44,7 +44,8 @@ class ComplexityScorer:
         # Priority 1: In-Process Neural MLP Router (< 5ms)
         if self.router is not None:
             try:
-                res = self.router.predict(query)
+                import asyncio
+                res = await asyncio.to_thread(self.router.predict, query)   # model inference off the event loop
                 return max(0.01, min(0.99, float(res["probability_hard"])))
             except Exception as e:
                 logger.error(f"Error during neural router scoring: {e}. Using fallback.")

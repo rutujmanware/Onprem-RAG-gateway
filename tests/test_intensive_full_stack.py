@@ -32,6 +32,7 @@ GATEWAY_URL = os.getenv("GATEWAY_URL", "http://127.0.0.1:8080").rstrip("/")
 VLLM_BASE = os.getenv("VLLM_BASE_URL", "http://127.0.0.1:8000").rstrip("/").rsplit("/v1", 1)[0]
 VLLM_HEADERS = {"Authorization": f"Bearer {os.getenv('VLLM_API_KEY', '')}"}
 SLM_BASE = os.getenv("SLM_BASE_URL", "http://127.0.0.1:8082").rstrip("/").rsplit("/v1", 1)[0]
+_SLM_HEADERS = {"Authorization": f"Bearer {os.getenv('SLM_API_KEY', '')}"} if os.getenv("SLM_API_KEY") else {}  # DEFECT-45
 
 FORBIDDEN_CHUNK_KEYS = {"chunk_key", "handle_id", "chunk_index", "vector", "embedding"}
 
@@ -153,7 +154,7 @@ slm_sample_messages = [
 try:
     t0 = time.time()
     r_slm_sync = httpx.post(
-        f"{SLM_BASE}/v1/chat/completions",
+        f"{SLM_BASE}/v1/chat/completions", headers=_SLM_HEADERS,
         json={"messages": slm_sample_messages, "max_tokens": 60, "temperature": 0.2},
         timeout=30.0,
     )
@@ -172,7 +173,7 @@ try:
     token_count = 0
     with httpx.stream(
         "POST",
-        f"{SLM_BASE}/v1/chat/completions",
+        f"{SLM_BASE}/v1/chat/completions", headers=_SLM_HEADERS,
         json={"messages": slm_sample_messages, "max_tokens": 60, "temperature": 0.2, "stream": True},
         timeout=30.0,
     ) as stream_resp:

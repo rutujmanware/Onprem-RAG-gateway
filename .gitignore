@@ -101,3 +101,4 @@ tests/test_injection_redteam_examples.py
 !tests/data/injection_eval/**
 !pipeline/data/
 !pipeline/data/injection_classifier.json
+.dev_session_secret

@@ -46,7 +46,7 @@ EMBED_QUERY_PREFIX = os.environ.get("EMBED_QUERY_PREFIX", "")  # e.g. bge: "Repr
 # --- Models (OpenAI-compatible /v1/chat/completions: vLLM, llama.cpp server, Ollama) ---
 SLM_URL          = os.environ.get("SLM_BASE_URL", os.environ.get("SLM_URL", "http://localhost:8082/v1"))
 SLM_MODEL        = os.environ.get("SLM_MODEL_NAME", os.environ.get("SLM_MODEL", "models/slm_gguf/qwen2.5-3b-instruct-q4_k_m.gguf"))
-SLM_KEY          = os.environ.get("SLM_KEY", "intranet-token")
+SLM_KEY          = os.environ.get("SLM_KEY") or os.environ.get("SLM_API_KEY") or "intranet-token"
 LLM_URL          = os.environ.get("VLLM_BASE_URL", os.environ.get("LLM_URL", "http://localhost:8000/v1"))
 LLM_MODEL        = os.environ.get("VLLM_MODEL_NAME", os.environ.get("LLM_MODEL", "Qwen/Qwen2.5-7B-Instruct"))
 LLM_KEY          = os.environ.get("LLM_KEY") or os.environ.get("VLLM_API_KEY") or "intranet-token"

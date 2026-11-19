@@ -6,12 +6,15 @@ model, so the ONNX model must produce the same vectors: the script refuses to fi
 sentence agrees with PyTorch to cosine >= 0.99999 after mean pooling + L2 normalisation (fp32, no
 quantisation, which would change the vectors).
 
-Output: models/embeddings/all-MiniLM-L6-v2/onnx/model.onnx (gitignored with the rest of models/embeddings).
-Usage:  python scripts/export_embedder_onnx.py
+Output: <model dir>/onnx/model.onnx (gitignored with the rest of models/embeddings).
+Usage:  python scripts/export_embedder_onnx.py                       # all-MiniLM-L6-v2 (retrieval, cache)
+        python scripts/export_embedder_onnx.py --model-dir models/embeddings/paraphrase-multilingual-MiniLM-L12-v2 \
+               --max-length 128                                     # injection classifier (multilingual)
 """
 
 from __future__ import annotations
 
+import argparse
 import sys
 from pathlib import Path
 
@@ -41,11 +44,19 @@ def mean_pool(hidden: np.ndarray, mask: np.ndarray) -> np.ndarray:
 
 
 def main() -> int:
+    global MODEL_DIR, OUT
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--model-dir", default=str(MODEL_DIR))
+    ap.add_argument("--max-length", type=int, default=512, help="the model's sequence limit (sentence-transformers max_seq_length)")
+    args = ap.parse_args()
+    MODEL_DIR = Path(args.model_dir) if Path(args.model_dir).is_absolute() else ROOT / args.model_dir
+    OUT = MODEL_DIR / "onnx" / "model.onnx"
+    max_len = args.max_length
     tok = AutoTokenizer.from_pretrained(str(MODEL_DIR))
     model = AutoModel.from_pretrained(str(MODEL_DIR)).eval()
     OUT.parent.mkdir(parents=True, exist_ok=True)
     enc = tok(["dummy input text", "a second, longer dummy input text"], padding=True, return_tensors="pt")
-    names = ["input_ids", "attention_mask", "token_type_ids"]
+    names = [n for n in ("input_ids", "attention_mask", "token_type_ids") if n in enc]
     with torch.no_grad():
         torch.onnx.export(
             model, tuple(enc[n] for n in names), str(OUT), input_names=names, output_names=["last_hidden_state"],
@@ -57,16 +68,16 @@ def main() -> int:
     sess = ort.InferenceSession(str(OUT), providers=["CPUExecutionProvider"])
     worst = 1.0
     for batch in ([s] for s in SENTENCES):  # single queries, as served
-        e = tok(batch, padding=True, truncation=True, max_length=512, return_tensors="np")
+        e = tok(batch, padding=True, truncation=True, max_length=max_len, return_tensors="np")
         onnx_vec = mean_pool(sess.run(None, {n: e[n].astype(np.int64) for n in names})[0], e["attention_mask"])
         with torch.no_grad():
-            te = tok(batch, padding=True, truncation=True, max_length=512, return_tensors="pt")
+            te = tok(batch, padding=True, truncation=True, max_length=max_len, return_tensors="pt")
             torch_vec = mean_pool(model(**te)[0].numpy(), te["attention_mask"].numpy())
         worst = min(worst, float((onnx_vec * torch_vec).sum(1).min()))
-    e = tok(SENTENCES, padding=True, truncation=True, max_length=512, return_tensors="np")  # padded batch
+    e = tok(SENTENCES, padding=True, truncation=True, max_length=max_len, return_tensors="np")  # padded batch
     onnx_b = mean_pool(sess.run(None, {n: e[n].astype(np.int64) for n in names})[0], e["attention_mask"])
     with torch.no_grad():
-        te = tok(SENTENCES, padding=True, truncation=True, max_length=512, return_tensors="pt")
+        te = tok(SENTENCES, padding=True, truncation=True, max_length=max_len, return_tensors="pt")
         torch_b = mean_pool(model(**te)[0].numpy(), te["attention_mask"].numpy())
     worst = min(worst, float((onnx_b * torch_b).sum(1).min()))
     print(f"worst cosine ONNX vs PyTorch over {len(SENTENCES)} sentences (single + padded batch): {worst:.7f}")

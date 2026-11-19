@@ -52,6 +52,16 @@ class CorpusUnavailable(RuntimeError):
     """The thesis index could not be asked; the decision must not be cached."""
 
 
+class CorpusBudgetExhausted(RuntimeError):
+    """More unknown words in one question than MAX_CORPUS_LOOKUPS; the word is left as typed (not cached)."""
+
+
+# DEFECT-47: at most this many index lookups per normalize() call (a question full of unknown words, or a stalled
+# Redis, must not cost seconds); further unknown words are left unchanged.
+MAX_CORPUS_LOOKUPS = int(os.getenv("TYPO_MAX_CORPUS_LOOKUPS", "3"))
+_BUDGET = threading.local()
+
+
 @functools.lru_cache(maxsize=65536)
 def _in_corpus(word: str) -> bool:
     """True if at least CORPUS_MIN_CHUNKS thesis chunks contain the word (verbatim). Raises CorpusUnavailable
@@ -64,11 +74,18 @@ def _in_corpus(word: str) -> bool:
         if _CORPUS_CLIENT is None:
             from gateway.cache.redis_semantic_cache import DEFAULT_REDIS_URL
             _CORPUS_CLIENT = redis.Redis.from_url(os.getenv("REDIS_URL") or DEFAULT_REDIS_URL,
-                                                  socket_connect_timeout=1, socket_timeout=2)
+                                                  socket_connect_timeout=1, socket_timeout=1)
+        remaining = getattr(_BUDGET, "left", None)
+        if remaining is not None:
+            if remaining <= 0:
+                raise CorpusBudgetExhausted(word)
+            _BUDGET.left = remaining - 1
         index = os.getenv("REDIS_INDEX_NAME", "rag_documents_idx")
         res = _CORPUS_CLIENT.execute_command("FT.SEARCH", index, f"@content:({word})", "VERBATIM", "LIMIT", "0", "0")
         n = res[0] if isinstance(res, list) else (res.get(b"total_results", res.get("total_results", 0)) or 0)
         return int(n) >= CORPUS_MIN_CHUNKS
+    except CorpusBudgetExhausted:
+        raise
     except Exception as e:
         raise CorpusUnavailable(str(e)) from e
 
@@ -210,6 +227,8 @@ class TypoNormalizer:
         the index (fresh clone, Redis down) the English dictionary alone protects words, uncached."""
         try:
             return self._correct_token_checked(token_lower)
+        except CorpusBudgetExhausted:
+            return token_lower
         except CorpusUnavailable:
             return self._correct_token(token_lower, check_corpus=False)
 
@@ -285,4 +304,8 @@ class TypoNormalizer:
         def _repl(match: re.Match[str]) -> str:
             return self.correct_word(match.group(0))
 
-        return re.sub(r"\b[A-Za-z0-9_-]+\b", _repl, query)
+        _BUDGET.left = MAX_CORPUS_LOOKUPS
+        try:
+            return re.sub(r"\b[A-Za-z0-9_-]+\b", _repl, query)
+        finally:
+            _BUDGET.left = None

@@ -51,6 +51,9 @@ class Dispatcher:
 
 
 class Admission:
+    async def charge(self, *a, **k):   # DEFECT-47: rate limit charged on arrival
+        return None
+
     @asynccontextmanager
     async def slot(self, *a, **k):
         yield
@@ -78,6 +81,8 @@ def app(monkeypatch):
     monkeypatch.setattr(pr.RedisChunkRetriever, "asearch", fake_asearch)
     from pipeline.text_processing.typo_normalizer import TypoNormalizer
     TypoNormalizer.get_instance().normalize("warm up")  # one-time dictionary load is not under test
+    from pipeline.sanitizer import detect_injection      # nor the classifier models' load (the gateway warms
+    detect_injection("What is graphene used for?")       # both at startup, rag_chain.warm_up)
     STARTED.clear()
     monkeypatch.setattr(gm, "RAGQAPipeline", SlowPipeline)
     over = gm.app.dependency_overrides

@@ -34,6 +34,24 @@ except ImportError:
 
 logger = logging.getLogger("gateway.admission")
 
+# DEFECT-59: repeat offenders. Each injection refusal of an identified user is a strike; this many strikes within an
+# hour block that user for INJECTION_BLOCK_SECONDS (HTTP 429). 0 turns it off. Anthropic's guidance on jailbreaks:
+# "consider throttling or banning users who repeatedly attempt to circumvent your application's guardrails".
+INJECTION_STRIKES_PER_HOUR = int(os.getenv("INJECTION_STRIKES_PER_HOUR", "5"))
+INJECTION_BLOCK_SECONDS = int(os.getenv("INJECTION_BLOCK_SECONDS", "900"))
+_STRIKE_WINDOW_SECONDS = 3600
+# KEYS: strikes, blocked; ARGV: window, limit, block seconds. Returns 1 when this strike starts a block.
+_INJECTION_STRIKE = """
+local n = redis.call('INCR', KEYS[1])
+if n == 1 then redis.call('EXPIRE', KEYS[1], ARGV[1]) end
+if n >= tonumber(ARGV[2]) then
+  redis.call('SET', KEYS[2], '1', 'EX', ARGV[3])
+  redis.call('DEL', KEYS[1])
+  return 1
+end
+return 0
+"""
+
 
 class TokenBucketLimiter:
     """Thread-safe and async-safe token bucket rate limiter per client/user."""
@@ -49,11 +67,22 @@ class TokenBucketLimiter:
         self._last_refill: Dict[str, float] = {}
         self._lock = asyncio.Lock()
 
+    MAX_TRACKED = 20000      # DEFECT-47: idle clients are forgotten, so the state cannot grow without bound
+
     async def acquire(self, client_id: str, cost: float = 1.0) -> bool:
         # VULN-03 Fix: Rate limit every client/user account fairly.
         # Do not allow unconditional rate limit bypass for loopback or web chat traffic.
         async with self._lock:
             now = time.time()
+            if len(self._tokens) > self.MAX_TRACKED:
+                full_after = self.capacity / max(self.refill_rate, 1e-6)
+                for k in [k for k, t in self._last_refill.items() if now - t > full_after]:
+                    self._tokens.pop(k, None)
+                    self._last_refill.pop(k, None)
+                if len(self._tokens) > self.MAX_TRACKED:   # still too many: forget the least recently seen half
+                    for k in sorted(self._last_refill, key=self._last_refill.get)[: len(self._tokens) // 2]:
+                        self._tokens.pop(k, None)
+                        self._last_refill.pop(k, None)
             if client_id not in self._tokens:
                 self._tokens[client_id] = self.capacity
                 self._last_refill[client_id] = now
@@ -130,6 +159,10 @@ class AdmissionController:
         self._pending_releases: set = set()
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._total_user_cap_rejections = 0
+        # DEFECT-59 fallback when Redis is unreachable: per-worker strikes and blocks
+        self._local_strikes: Dict[str, list] = {}
+        self._local_blocked: Dict[str, float] = {}
+        self._total_injection_blocks = 0
 
         self._active_count = 0
         self._queued_count = 0
@@ -212,7 +245,81 @@ class AdmissionController:
         else:
             self._local_user_active.pop(ticket.user_key, None)
 
-    async def acquire(self, user_id: str = "anonymous", cost: float = 1.0) -> AdmissionTicket:
+    # ------------------------------------------------------------------ repeat offenders (DEFECT-59)
+    @staticmethod
+    def _strike_keys(user_id: str):
+        h = hashlib.sha256((user_id or "anonymous").encode()).hexdigest()[:24]
+        return "admission:strikes:" + h, "admission:blocked:" + h
+
+    async def injection_block_remaining(self, user_id: str) -> int:
+        """Seconds left on this user's block for repeated injection attempts (0 = not blocked)."""
+        if INJECTION_STRIKES_PER_HOUR <= 0:
+            return 0
+        _, bkey = self._strike_keys(user_id)
+        r = await self._redis_client()
+        if r is not None:
+            try:
+                return max(0, int(await r.ttl(bkey)))   # -2 missing, -1 no expiry (never set that way)
+            except Exception as exc:
+                logger.warning("Injection strike counter: Redis error (%s); counting per worker", exc)
+                self._redis_retry_at = time.monotonic() + 30
+        return max(0, int(self._local_blocked.get(bkey, 0) - time.time()))
+
+    async def check_injection_block(self, user_id: str) -> None:
+        remaining = await self.injection_block_remaining(user_id)
+        if remaining > 0:
+            self._total_shed += 1
+            minutes = max(1, -(-remaining // 60))
+            raise HTTPException(
+                status_code=429,
+                detail=(f"Too many of your recent requests were refused as prompt-injection attempts. "
+                        f"Please try again in {minutes} minute{'s' if minutes != 1 else ''}."),
+                headers={"Retry-After": str(remaining)},
+            )
+
+    async def record_injection_refusal(self, user_id: str) -> bool:
+        """Count one strike; True if it started a block."""
+        if INJECTION_STRIKES_PER_HOUR <= 0:
+            return False
+        skey, bkey = self._strike_keys(user_id)
+        blocked = None
+        r = await self._redis_client()
+        if r is not None:
+            try:
+                blocked = bool(int(await r.eval(_INJECTION_STRIKE, 2, skey, bkey, _STRIKE_WINDOW_SECONDS,
+                                                INJECTION_STRIKES_PER_HOUR, INJECTION_BLOCK_SECONDS)))
+            except Exception as exc:
+                logger.warning("Injection strike counter: Redis error (%s); counting per worker", exc)
+                self._redis_retry_at = time.monotonic() + 30
+        if blocked is None:
+            now = time.time()
+            strikes = [t for t in self._local_strikes.get(skey, []) if now - t < _STRIKE_WINDOW_SECONDS] + [now]
+            blocked = len(strikes) >= INJECTION_STRIKES_PER_HOUR
+            if blocked:
+                self._local_blocked[bkey] = now + INJECTION_BLOCK_SECONDS
+                self._local_strikes.pop(skey, None)
+            else:
+                self._local_strikes[skey] = strikes
+        if blocked:
+            self._total_injection_blocks += 1
+            logger.warning("User %s blocked for %ds after %d prompt-injection refusals within an hour",
+                           user_id, INJECTION_BLOCK_SECONDS, INJECTION_STRIKES_PER_HOUR)
+        return blocked
+
+    async def charge(self, user_id: str = "anonymous", cost: float = 1.0) -> None:
+        """Token-bucket check alone (DEFECT-47): applied when a request arrives, before the cache lookup, so cache
+        hits and the work done before admission (fence, embedding, cache) are rate limited too."""
+        if not await self.rate_limiter.acquire(user_id, cost=cost):
+            self._total_shed += 1
+            logger.warning("Rate limit exceeded for user %s", user_id)
+            raise HTTPException(
+                status_code=429,
+                detail="Rate limit exceeded. Please wait a moment before sending more queries.",
+                headers={"Retry-After": "2"}
+            )
+
+    async def acquire(self, user_id: str = "anonymous", cost: float = 1.0,
+                      charge_rate: bool = True) -> AdmissionTicket:
         """Acquire an active inference slot or queue if at capacity. Returns a ticket for release().
 
         Raises:
@@ -221,8 +328,8 @@ class AdmissionController:
                                 or queue wait times out.
         """
         self._loop = asyncio.get_running_loop()
-        # 1. Per-client Token Bucket Rate Limit
-        allowed = await self.rate_limiter.acquire(user_id, cost=cost)
+        # 1. Per-client Token Bucket Rate Limit (skipped when charge() already ran for this request)
+        allowed = (await self.rate_limiter.acquire(user_id, cost=cost)) if charge_rate else True
         if not allowed:
             self._total_shed += 1
             logger.warning("Rate limit exceeded for user %s", user_id)
@@ -330,9 +437,9 @@ class AdmissionController:
                 pass
 
     @asynccontextmanager
-    async def slot(self, user_id: str = "anonymous", cost: float = 1.0):
+    async def slot(self, user_id: str = "anonymous", cost: float = 1.0, charge_rate: bool = True):
         """Async context manager: acquires a queue position and execution slot."""
-        ticket = await self.acquire(user_id=user_id, cost=cost)
+        ticket = await self.acquire(user_id=user_id, cost=cost, charge_rate=charge_rate)
         try:
             yield
         finally:
@@ -363,6 +470,9 @@ class AdmissionController:
             "total_timeouts": self._total_timeouts,
             "per_user_cap": self.per_user_cap,
             "total_user_cap_rejections": self._total_user_cap_rejections,
+            "injection_strikes_per_hour": INJECTION_STRIKES_PER_HOUR,
+            "injection_block_seconds": INJECTION_BLOCK_SECONDS,
+            "total_injection_blocks": self._total_injection_blocks,   # this worker
         }
 
 

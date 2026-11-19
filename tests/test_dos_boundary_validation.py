@@ -49,11 +49,14 @@ def test_query_length_bounds_enforced():
 def test_chat_message_length_bounds_enforced():
     """Verify that chat endpoints reject empty and oversized messages with HTTP 422."""
     # Empty chat message
-    r_empty = client.post("/chat", json={"message": ""})
+    # DEFECT-48: CSRF is always required on /chat, so send the token pair the UI sends
+    client.cookies.set("csrftoken", "t" * 32)
+    csrf = {"X-CSRF-Token": "t" * 32}
+    r_empty = client.post("/chat", json={"message": ""}, headers=csrf)
     assert r_empty.status_code == 422
 
     # Oversized chat message (> 1500 chars)
-    r_long = client.post("/chat", json={"message": "B" * 1501})
+    r_long = client.post("/chat", json={"message": "B" * 1501}, headers=csrf)
     assert r_long.status_code == 422
 
 

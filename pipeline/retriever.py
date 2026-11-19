@@ -645,7 +645,8 @@ class RedisChunkRetriever:
                 search_text = extracted_meta.clean_query
 
         # 2. Stage 1: KNN vector search (keyword-assisted for short topic questions)
-        r = redis.from_url(self.redis_url, encoding="utf-8", decode_responses=False)
+        r = redis.from_url(self.redis_url, encoding="utf-8", decode_responses=False,
+                           socket_connect_timeout=2, socket_timeout=10)   # explicit (older redis-py: no default)
         fallback_triggered = False
         raw_hits = []
         keyword_chunks: List[Dict[str, Any]] = []
@@ -725,7 +726,7 @@ class RedisChunkRetriever:
             raise RuntimeError("The 'redis' package is not installed. Run: pip install redis")
 
         from pipeline.text_processing.typo_normalizer import TypoNormalizer
-        query = TypoNormalizer.get_instance().normalize(query)
+        query = await asyncio.get_running_loop().run_in_executor(None, TypoNormalizer.get_instance().normalize, query)
 
         if top_k is not None:
             top_k = min(max(1, int(top_k)), 50)
@@ -743,7 +744,8 @@ class RedisChunkRetriever:
                 effective_filter = extracted_meta.filters
                 search_text = extracted_meta.clean_query
 
-        r = aioredis.from_url(self.redis_url, encoding="utf-8", decode_responses=False)
+        r = aioredis.from_url(self.redis_url, encoding="utf-8", decode_responses=False,
+                              socket_connect_timeout=2, socket_timeout=10)
         fallback_triggered = False
         raw_hits = []
         keyword_chunks: List[Dict[str, Any]] = []

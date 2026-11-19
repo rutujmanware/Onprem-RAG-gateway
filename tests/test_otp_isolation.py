@@ -131,3 +131,34 @@ def test_endpoints_victim_signs_in_despite_attacker_guesses(gw):
     st.by_ip.clear()                                                 # attacker and victim share the test client IP
     assert victim.post("/auth/otp/verify", json={"email": email, "code": code}, headers=H).status_code == 200
     assert victim.get("/me").json().get("email") == email
+
+
+def test_otp_store_reconnects_after_redis_was_down_at_first_use(monkeypatch):
+    """DEFECT-61: Redis unreachable at a worker's first sign-in used to pin that worker to its in-memory store
+    until a restart (codes from it failed on the other workers). It now retries with a growing wait."""
+    import redis as redis_mod
+
+    class FakeRedis:
+        def __init__(self, up): self.up = up
+        def ping(self):
+            if not self.up:
+                raise ConnectionError("down")
+            return True
+
+    state = {"up": False, "attempts": 0}
+
+    def from_url(*a, **k):
+        state["attempts"] += 1
+        return FakeRedis(state["up"])
+
+    monkeypatch.setattr(redis_mod.Redis, "from_url", staticmethod(from_url))
+    st = auth.OtpStore(clock=time.time, redis_client=None)
+    assert st._get_redis() is None and state["attempts"] == 1           # down: memory fallback for now
+    assert st._get_redis() is None and state["attempts"] == 1           # no retry storm before the backoff ends
+    first_wait = st._redis_backoff
+    st._redis_retry_at = 0.0                                             # backoff elapsed, still down
+    assert st._get_redis() is None and st._redis_backoff == min(60.0, first_wait * 2)
+    state["up"] = True
+    st._redis_retry_at = 0.0                                             # backoff elapsed, Redis back
+    assert isinstance(st._get_redis(), FakeRedis) and st._redis_backoff == 0.0
+    assert state["attempts"] == 3

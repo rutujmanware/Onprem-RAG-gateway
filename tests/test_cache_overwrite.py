@@ -4,6 +4,7 @@ Reported against rt-baseline: streaming /query ignored bypass_cache on store and
 so B's answer (temperature 2.0, 16 tokens) replaced A's for everyone. On main the store honours bypass_cache and
 shared exact entries are write-once; remaining gap closed here: the FIRST asker could still set the shared entry
 with a high-temperature or truncated answer. Only standard-settings answers are cached now.
+DEFECT-56: the same for a caller-chosen `top_k` (number of source documents, /query only).
 """
 
 import inspect
@@ -20,9 +21,16 @@ def test_only_standard_generation_settings_are_cacheable(t, m, ok):
     assert standard_generation(t, m) is ok
 
 
+@pytest.mark.parametrize("k", [1, 3, 10, 50])
+def test_a_caller_chosen_top_k_is_never_cacheable(k):
+    assert standard_generation(None, None, None) is True
+    assert standard_generation(None, None, k) is False
+
+
 def test_every_store_path_is_guarded():
     q = inspect.getsource(gm.query_endpoint)
-    assert "may_store = ((not req.bypass_cache) or regen is not None) and standard_generation(" in q
+    assert "standard_generation(req.temperature, req.max_tokens, req.top_k)" in q
+    assert "may_store = (((not req.bypass_cache) or regen is not None)" in q
     c = inspect.getsource(gm.chat_completions)
     assert c.count("standard_generation(req.temperature, req.max_tokens)") == 2
 
@@ -31,6 +39,59 @@ def test_shared_exact_entries_are_write_once():
     from gateway.cache import redis_semantic_cache as m
     src = inspect.getsource(m.RedisSemanticCache.store) + inspect.getsource(m.RedisSemanticCache.astore)
     assert src.count("nx=True") == 2
+
+
+def test_query_with_top_k_is_answered_but_not_stored(monkeypatch):
+    """DEFECT-56, route level with fakes: `top_k: 1` used to become the shared cached answer (write-once)."""
+    from contextlib import asynccontextmanager
+    from fastapi.testclient import TestClient
+    import pipeline.rag_chain as rc
+    import pipeline.retriever as pr
+    from gateway.dependencies import (get_admission_controller, get_complexity_scorer, get_dispatcher,
+                                      get_semantic_cache, get_vllm_client)
+    from gateway.router.dispatcher import RequestDispatcher
+
+    chunks = [{"title": f"T{i}", "content": f"content {i}", "similarity": 0.8 - i / 100, "doc_id": str(i)}
+              for i in range(10)]
+    stored, sent = [], []
+
+    class Cache:
+        async def alookup(self, *a, **k): return None
+        async def astore(self, q, resp, owner=None, regen_kind=None):
+            stored.append(len(resp.get("chunks") or [])); return True
+
+    class Adm:
+        async def charge(self, *a, **k): pass
+        @asynccontextmanager
+        async def slot(self, *a, **k): yield
+
+    class Scorer:
+        async def score(self, q): return 0.1
+
+    class Vllm:
+        async def check_health(self): return False
+
+    async def asearch(self, q, top_k=None, **k): return chunks
+
+    def answer_query(self, query, top_k=None, chunks=None, **k):
+        sent.append(len(chunks or []))
+        return {"answer": "Graphene is used in supercapacitor electrodes [Document 1].", "chunks": chunks}
+
+    monkeypatch.setenv("TYPO_CORPUS_PROTECTION", "0")
+    monkeypatch.setattr(pr.RedisChunkRetriever, "asearch", asearch)
+    monkeypatch.setattr(rc.RAGQAPipeline, "answer_query", answer_query)
+    monkeypatch.setattr(gm, "classifier_fence", lambda *a, **k: None)
+    monkeypatch.setitem(gm.app.dependency_overrides, get_semantic_cache, Cache)
+    monkeypatch.setitem(gm.app.dependency_overrides, get_admission_controller, Adm)
+    monkeypatch.setitem(gm.app.dependency_overrides, get_complexity_scorer, Scorer)
+    monkeypatch.setitem(gm.app.dependency_overrides, get_dispatcher, RequestDispatcher)
+    monkeypatch.setitem(gm.app.dependency_overrides, get_vllm_client, Vllm)
+    c = TestClient(gm.app)
+
+    r = c.post("/query", json={"query": "What is graphene used in?", "top_k": 1})
+    assert r.status_code == 200 and sent[-1] == 1 and stored == []     # answered from 1 document, not stored
+    r = c.post("/query", json={"query": "What is graphene used for?"})
+    assert r.status_code == 200 and len(stored) >= 1                   # the standard request is still cached
 
 
 # --------------------------------------------------------------------------- live (needs Redis)

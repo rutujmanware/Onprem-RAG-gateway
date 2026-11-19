@@ -99,7 +99,7 @@ async def login(request: Request):
 async def callback(request: Request, code: str = "", state: str = "", error: str = ""):
     if C.AUTH_MODE != "entra": return JSONResponse({"error": "not enabled"}, status_code=404)
     st = request.session.pop("oidc", None)
-    if error or not st or not code or not secrets.compare_digest(state, st["state"]):
+    if error or not st or not code or not secrets.compare_digest(state.encode(), str(st["state"]).encode()):   # bytes (DEFECT-54)
         return JSONResponse({"error": "Sign-in failed."}, status_code=400)
     try:
         user = await asyncio.to_thread(auth.validate_id_token, await auth.exchange_code(code, st["verifier"]), st["nonce"])
@@ -200,9 +200,9 @@ async def chat(req: ChatReq, request: Request):
                 except ModelError as e:
                     log.warning("%s failed: %s", which, e)
                     if which != order[-1]:
-                        yield sse("fallback", {"from": which, "to": order[-1], "why": str(e)[:160]})
+                        log.warning("fallback from %s: %s", which, e); yield sse("fallback", {"from": which, "to": order[-1], "why": "model unavailable"})
                         continue
-                    yield sse("error", {"msg": f"No model reachable: {e}"}); return
+                    log.warning("no model reachable: %s", e); yield sse("error", {"msg": "No answering model is reachable right now. Please try again shortly."}); return
                 conf = out.get("conf")
                 # Cascade: SLM low confidence -> discard and rerun on the 7B
                 if (C.CASCADE and which == "slm" and req.force != "slm" and conf is not None
@@ -220,7 +220,7 @@ async def chat(req: ChatReq, request: Request):
                                "escalated": bool(final and final.get("escalated"))})
             trace(tr | {"route0": first, "s": r["s"], "final": final, "chunks": [c.id for c in chunks], **tm})
         except Exception as e:
-            log.exception("chat failed"); yield sse("error", {"msg": f"{type(e).__name__}: {e}"})
+            log.exception("chat failed"); yield sse("error", {"msg": "Something went wrong while answering. Please try again."})
     return StreamingResponse(gen(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 @app.get("/theses")

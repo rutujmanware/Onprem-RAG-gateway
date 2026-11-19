@@ -25,6 +25,19 @@ MAX_AGE_SECONDS = 120
 _LABEL = b"askiisc-internal-user-v1"
 
 
+def consteq(a, b) -> bool:
+    """Constant-time equality for secrets taken from requests (keys, tokens, signatures).
+
+    DEFECT-54: compare_digest on two str raises TypeError when either holds a non-ASCII character, and header
+    values can (bytes 0x80-0xff arrive as latin-1 characters). The resulting HTTP 500 told an unauthenticated
+    caller that a hidden route exists. Comparing UTF-8 bytes never raises; None never matches."""
+    if a is None or b is None:
+        return False
+    a = a.encode("utf-8", "surrogatepass") if isinstance(a, str) else bytes(a)
+    b = b.encode("utf-8", "surrogatepass") if isinstance(b, str) else bytes(b)
+    return hmac.compare_digest(a, b)
+
+
 def _secret() -> str:
     secret = (os.getenv("INTERNAL_AUTH_KEY") or os.getenv("SESSION_SECRET") or "").strip()
     if secret:
@@ -69,4 +82,4 @@ def verify_internal_user(user: str, auth: str, now: Optional[float] = None) -> b
         return False
     if abs((now if now is not None else time.time()) - ts) > MAX_AGE_SECONDS:
         return False
-    return hmac.compare_digest(sig, _sig(key, user, ts))
+    return consteq(sig, _sig(key, user, ts))

@@ -37,6 +37,12 @@ from pipeline.slm_runner import CPUSLMEngine
 logger = logging.getLogger("pipeline.rag_chain")
 
 
+def _slm_auth_headers() -> Dict[str, str]:
+    """Bearer header for the CPU SLM server, which requires SLM_API_KEY on /v1/* (DEFECT-45)."""
+    key = os.getenv("SLM_API_KEY", "").strip()
+    return {"Authorization": f"Bearer {key}"} if key else {}
+
+
 def _vllm_auth_headers() -> Dict[str, str]:
     """Bearer header for the vLLM server, which requires VLLM_API_KEY on /v1/*."""
     key = os.getenv("VLLM_API_KEY", "").strip()
@@ -51,6 +57,9 @@ def _vllm_auth_headers() -> Dict[str, str]:
 PARTIAL_ANSWER_NOTE = "\n\n[Generation was interrupted. This answer is incomplete.]"
 # Nothing could be generated at all (every model tier down): say so instead of "incomplete" (DEFECT-36).
 GENERATION_UNAVAILABLE_NOTE = "[The answering service is temporarily unavailable. Please try again in a minute.]"
+# DEFECT-46: prompt (~6k tokens of context) + answer must fit the 8192-token GPU window; a larger request
+# made vLLM return 400, which was reported as a GPU outage.
+GPU_MAX_NEW_TOKENS = int(os.environ.get("GPU_MAX_NEW_TOKENS", "2048"))
 
 
 class UpstreamBusy(RuntimeError):
@@ -152,6 +161,8 @@ def _iter_sse_deltas(response):
             choice = (json.loads(data_str).get("choices") or [{}])[0]
         except Exception:
             continue
+        if choice.get("finish_reason") == "error":  # DEFECT-46: the server reported a generation failure
+            raise RuntimeError("upstream generation failed")
         delta = (choice.get("delta") or {}).get("content", "")
         if delta:
             yield delta
@@ -160,7 +171,9 @@ def _iter_sse_deltas(response):
 def _stream_chat_http(url: str, payload: Dict[str, Any], headers: Optional[Dict[str, str]] = None, timeout=None):
     """Stream content deltas from an OpenAI-compatible server. Raises UpstreamBusy on 503."""
     import httpx
-    with httpx.stream("POST", url, json={**payload, "stream": True}, headers=headers or {},
+    # calls without explicit headers go to the CPU SLM server (vLLM calls always pass their own)
+    headers = _slm_auth_headers() if headers is None else headers
+    with httpx.stream("POST", url, json={**payload, "stream": True}, headers=headers,
                       timeout=timeout if timeout is not None else _gpu_timeout()) as response:
         if response.status_code == 503:
             raise UpstreamBusy(f"{url} busy")
@@ -171,7 +184,8 @@ def _stream_chat_http(url: str, payload: Dict[str, Any], headers: Optional[Dict[
 def _complete_chat_http(url: str, payload: Dict[str, Any], headers: Optional[Dict[str, str]] = None, timeout=None):
     """Non-streaming chat completion. Returns (text, completion_tokens, model). Raises UpstreamBusy on 503."""
     import httpx
-    resp = httpx.post(url, json=payload, headers=headers or {}, timeout=timeout if timeout is not None else _gpu_timeout())
+    headers = _slm_auth_headers() if headers is None else headers
+    resp = httpx.post(url, json=payload, headers=headers, timeout=timeout if timeout is not None else _gpu_timeout())
     if resp.status_code == 503:
         raise UpstreamBusy(f"{url} busy")
     resp.raise_for_status()
@@ -216,6 +230,8 @@ def warm_up() -> None:
         p.router.predict("warm up query")
     p.retriever.search("explain transformers")  # keyword route: spell check + lemmas + title KNN
     p.retriever.search("What is the role of mycorrhizal fungi in plant nutrition?")  # dense route
+    from pipeline.sanitizer import detect_injection   # loads the injection classifier now, not on a request
+    detect_injection("What is graphene used for?")
 
 
 class RAGQAPipeline:
@@ -400,7 +416,7 @@ class RAGQAPipeline:
 
             from pipeline.gpu_llm_runner import GPULLMEngine
             messages = GPULLMEngine.build_rag_messages(query, chunks)
-            tokens_to_gen = max_new_tokens if (max_new_tokens and max_new_tokens > 160) else 1024
+            tokens_to_gen = min(max_new_tokens if (max_new_tokens and max_new_tokens > 160) else 1024, GPU_MAX_NEW_TOKENS)
 
             # Option A: Fast HTTP path if GPU LLM server daemon is running on port 8000
             # (skipped when the caller already found the GPU tier unable to answer).
@@ -522,7 +538,7 @@ class RAGQAPipeline:
         # Order: CPU SLM daemon -> GPU daemon overflow (SLM busy/down) -> in-process CPU SLM.
         slm_server_url = os.getenv("SLM_BASE_URL", "http://localhost:8082/v1").rstrip("/")
         server_root = slm_server_url.rsplit("/v1", 1)[0]
-        tokens_to_gen = max_new_tokens or 160
+        tokens_to_gen = min(max_new_tokens or 512, 1024)   # DEFECT-46: was 160, and that truncated answer was cached
         backends = []
         try:
             import httpx
@@ -620,12 +636,21 @@ class RAGQAPipeline:
 
         # Option B: last resort, in-process CPU SLM
         t0_gen = time.time()
-        gen_result = self.slm_engine.answer_rag(
-            question=query,
-            context_chunks=chunks,
-            max_new_tokens=tokens_to_gen,
-            temperature=temperature,
-        )
+        try:
+            gen_result = self.slm_engine.answer_rag(
+                question=query,
+                context_chunks=chunks,
+                max_new_tokens=tokens_to_gen,
+                temperature=temperature,
+            )
+        except Exception as exc:  # DEFECT-46: same outcome as the streaming path, not an HTTP 500
+            logger.warning("In-process SLM failed: %s", exc)
+            return {"query": query, "answer": GENERATION_UNAVAILABLE_NOTE, "route": route_label,
+                    "target_tier": "cpu_slm", **fallback, "probability_hard": easy_prob, "chunks": [],
+                    "incomplete": True,
+                    "stats": {"retrieval_seconds": round(retrieval_duration, 3), "generation_seconds": 0.0,
+                              "total_seconds": round(time.time() - t_start, 3), "model": "none",
+                              "server": "unavailable"}}
         gen_duration = time.time() - t0_gen
 
         total_duration = time.time() - t_start
@@ -815,7 +840,7 @@ class RAGQAPipeline:
 
             from pipeline.gpu_llm_runner import GPULLMEngine
             messages = GPULLMEngine.build_rag_messages(query, chunks)
-            tokens_to_gen = max_new_tokens if (max_new_tokens and max_new_tokens > 160) else 1024
+            tokens_to_gen = min(max_new_tokens if (max_new_tokens and max_new_tokens > 160) else 1024, GPU_MAX_NEW_TOKENS)
 
             # Option A: Fast HTTP streaming from GPU daemon
             gpu_server_url = os.getenv("VLLM_BASE_URL", "http://localhost:8000/v1").rstrip("/")

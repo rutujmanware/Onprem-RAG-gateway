@@ -72,7 +72,7 @@ def validate_id_token(token: str, nonce: str, key=None) -> dict:
     except jwt.PyJWTError as e:
         raise AuthError(f"invalid id_token: {type(e).__name__}") from e
     if c.get("tid") != C.ENTRA_TENANT_ID: raise AuthError("wrong tenant")
-    if not secrets.compare_digest(str(c.get("nonce", "")), nonce): raise AuthError("nonce mismatch")
+    if not secrets.compare_digest(str(c.get("nonce", "")).encode(), str(nonce).encode()): raise AuthError("nonce mismatch")  # bytes: never raises (DEFECT-54)
     ident = (c.get("preferred_username") or c.get("email") or "").lower()
     if "#ext#" in ident: raise AuthError("guest (B2B) account not allowed")   # interns/temp staff added as guests
     if not domain_ok(ident): raise AuthError("email domain not allowed")
@@ -154,6 +154,8 @@ return 0
         self.lock = threading.Lock()
         self._redis = redis_client
         self._redis_checked = False
+        self._redis_retry_at = 0.0    # DEFECT-61: next connection attempt (monotonic seconds)
+        self._redis_backoff = 0.0
 
     def _h(self, email: str, code: str) -> str:
         return hmac.new(_key(), f"{email}:{code}".encode(), hashlib.sha256).hexdigest()
@@ -162,7 +164,11 @@ return 0
         # When synthetic/mock clock is injected without an explicit redis_client, use in-memory store
         if self.clock is not time.time and self._redis is None:
             return None
-        if not self._redis_checked:
+        # DEFECT-61: if Redis is unreachable when this worker first needs it, retry later with a growing wait
+        # (5 s, doubling, at most 60 s) instead of staying on the per-worker memory store until a restart: codes
+        # issued by one worker would not verify on the others, and the send / guess limits became per worker.
+        # Once connected, redis-py reconnects by itself after an outage.
+        if self._redis is None and time.monotonic() >= self._redis_retry_at:
             self._redis_checked = True
             if self._redis is None:
                 try:
@@ -179,11 +185,18 @@ return 0
                         host = os.getenv("REDIS_HOST", "localhost")
                         port = os.getenv("REDIS_PORT", "6379")
                         redis_url = f"redis://{pw_str}{host}:{port}/0"
-                    self._redis = redis.Redis.from_url(redis_url, decode_responses=True)
-                    self._redis.ping()
+                    client = redis.Redis.from_url(redis_url, decode_responses=True)
+                    client.ping()
+                    self._redis = client
+                    if self._redis_backoff:
+                        logger.info("OtpStore reconnected to Redis")
+                    self._redis_backoff = 0.0
                 except Exception as e:
-                    logger.warning("Redis connection failed for OtpStore, using in-memory: %s", e)
                     self._redis = None
+                    self._redis_backoff = min(60.0, (self._redis_backoff * 2) or 5.0)
+                    self._redis_retry_at = time.monotonic() + self._redis_backoff
+                    logger.warning("Redis connection failed for OtpStore, using in-memory for %.0f s: %s",
+                                   self._redis_backoff, e)
         return self._redis
 
     def _recent(self, log, key, now, window=3600):

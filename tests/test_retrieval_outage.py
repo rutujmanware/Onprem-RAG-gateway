@@ -59,6 +59,9 @@ class Dispatcher:
 
 
 class Admission:
+    async def charge(self, *a, **k):   # DEFECT-47: rate limit charged on arrival
+        return None
+
     @asynccontextmanager
     async def slot(self, *a, **k):
         yield

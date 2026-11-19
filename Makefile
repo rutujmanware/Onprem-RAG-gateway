@@ -62,12 +62,14 @@ setup:
 download-models:
 	$(PYTHON) scripts/download_models.py
 	$(PYTHON) scripts/export_embedder_onnx.py
+	$(PYTHON) scripts/export_embedder_onnx.py --model-dir models/embeddings/paraphrase-multilingual-MiniLM-L12-v2 --max-length 128
 
 export-onnx:
 	$(PYTHON) scripts/export_embedder_onnx.py
+	$(PYTHON) scripts/export_embedder_onnx.py --model-dir models/embeddings/paraphrase-multilingual-MiniLM-L12-v2 --max-length 128
 
 dev:
-	uvicorn gateway.main:app --host 0.0.0.0 --port 8080 --reload
+	uvicorn gateway.main:app --host 0.0.0.0 --port 8080 --reload --no-proxy-headers
 
 prod-up:
 	$(PYTHON) scripts/prod_stack.py start
@@ -217,7 +219,7 @@ test: export TRANSFORMERS_OFFLINE ?= $(HF_HUB_OFFLINE)
 test:
 	PYTHONPATH=. $(PYTHON) tests/test_admission_queue.py
 	PYTHONPATH=. $(PYTHON) -m pytest tests/test_single_port_security.py
-	PYTHONPATH=. $(PYTHON) -m pytest tests/test_vllm_launcher.py tests/test_dispatcher_threshold.py tests/test_cache_owner_scoping.py tests/test_cache_regenerate.py tests/test_premise_rules.py tests/test_premise_routing.py tests/test_topic_retrieval.py tests/test_topic_speller.py tests/test_rare_terms.py tests/test_ungrounded_and_admin_guard.py tests/test_standalone_app_identity.py tests/test_gpu_fallback.py tests/test_event_loop_not_blocked.py tests/test_per_user_cap.py tests/test_admission_cancellation.py tests/test_otp_isolation.py tests/test_failure_not_cached.py tests/test_context_escaping.py tests/test_mail_error_disclosure.py tests/test_cache_overwrite.py tests/test_typo_protection.py tests/test_readiness.py tests/test_requirements.py tests/test_retrieval_outage.py tests/test_internal_identity.py tests/test_injection_all_messages.py tests/test_injection_detection.py tests/test_metadata_queries.py tests/test_slm_slots.py tests/test_retrieval_warmup.py tests/test_embedder_onnx.py tests/test_cache_index_alter.py
+	PYTHONPATH=. $(PYTHON) -m pytest tests/test_vllm_launcher.py tests/test_dispatcher_threshold.py tests/test_cache_owner_scoping.py tests/test_cache_regenerate.py tests/test_premise_rules.py tests/test_premise_routing.py tests/test_topic_retrieval.py tests/test_topic_speller.py tests/test_rare_terms.py tests/test_ungrounded_and_admin_guard.py tests/test_standalone_app_identity.py tests/test_gpu_fallback.py tests/test_event_loop_not_blocked.py tests/test_per_user_cap.py tests/test_admission_cancellation.py tests/test_otp_isolation.py tests/test_failure_not_cached.py tests/test_context_escaping.py tests/test_mail_error_disclosure.py tests/test_cache_overwrite.py tests/test_typo_protection.py tests/test_readiness.py tests/test_requirements.py tests/test_hardening_round2.py tests/test_language_gate.py tests/test_hidden_routes.py tests/test_frontend_xss.py tests/test_security_headers.py tests/test_repeat_offenders.py tests/test_retrieval_outage.py tests/test_internal_identity.py tests/test_injection_all_messages.py tests/test_injection_detection.py tests/test_metadata_queries.py tests/test_slm_slots.py tests/test_retrieval_warmup.py tests/test_embedder_onnx.py tests/test_cache_index_alter.py
 	PYTHONPATH=. $(PYTHON) -m pytest tests/test_break_hardening.py tests/test_cache_purge_and_ttl.py tests/test_constant_time_and_cookie_security.py tests/test_dos_boundary_validation.py tests/test_otp_concurrency.py tests/test_refusal_chunks.py tests/test_typo_normalizer.py
 	@present="$(wildcard $(PRIVATE_TESTS))"; \
 	if [ -n "$$present" ]; then PYTHONPATH=. $(PYTHON) -m pytest $$present; \
@@ -229,8 +231,8 @@ test:
 	PYTHONPATH=. $(PYTHON) -m unittest tests/test_dynamic_retrieval.py
 	PYTHONPATH=. $(PYTHON) -m unittest tests/test_query_metadata_extractor.py
 
-# NFR-7 measurement of the prompt-injection fence on the frozen suites (DEFECT-32); ROUND=round3 is the final test set
-ROUND ?= round3
+# NFR-7 measurement of the prompt-injection fence on the frozen suites (DEFECT-32); ROUND=round4 is the latest set
+ROUND ?= round4
 injection-eval:
 	PYTHONPATH=. $(PYTHON) scripts/eval_injection_fence.py measure --dir tests/data/injection_eval/$(ROUND) --split heldout
 

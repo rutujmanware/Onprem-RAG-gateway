@@ -1,6 +1,6 @@
 # 🏛️ On-Premise Institutional RAG Gateway (AskIISc)
 
-A 100% bare-metal, zero-egress Retrieval-Augmented Generation (RAG) platform and API Gateway built for the Indian Institute of Science (IISc). The entire corpus of institutional theses and research papers (**2,261,664 chunks**) is indexed in **Redis Stack** RAM. An ONNX Two-Tower **complexity router** dynamically dispatches queries to either an ultra-fast **CPU Small Language Model** (Qwen 2.5 3B across 6 workers $\times$ 16 threads) or a high-capacity **GPU Large Language Model** (Qwen 2.5 7B served via **vLLM** on an NVIDIA A100), with automatic fallback to CPU on GPU saturation.
+A 100% bare-metal, zero-egress Retrieval-Augmented Generation (RAG) platform and API Gateway built for the Indian Institute of Science (IISc). The entire corpus of institutional theses and research papers (**2,261,664 chunks**) is indexed in **Redis Stack** RAM. A PyTorch Two-Tower **complexity router** dynamically dispatches queries to either an ultra-fast **CPU Small Language Model** (Qwen 2.5 3B across 6 workers $\times$ 16 threads) or a high-capacity **GPU Large Language Model** (Qwen 2.5 7B served via **vLLM** on an NVIDIA A100), with automatic fallback to CPU on GPU saturation.
 
 The platform runs behind a single-port secure perimeter (**Port 8080**) featuring email OTP authentication, CSRF protection, token-bucket admission control, microsecond-tier typo normalization, and a two-level semantic cache.
 
@@ -161,12 +161,18 @@ ROUTING_ALPHA=0.65
 COMPLEXITY_SCORER_PATH=gateway/router/models/scorer.onnx
 GLOBAL_CONCURRENCY_LIMIT=30
 PER_USER_CONCURRENCY_LIMIT=6   # in-flight inferences per user across all workers (Redis); HTTP 429 above it
-RATE_LIMIT_BURST=60.0
-RATE_LIMIT_RPS=20.0
+RATE_LIMIT_BURST=10      # per caller and per gateway worker; charged on arrival, cache hits included (DEFECT-47)
+RATE_LIMIT_RPS=5
+INJECTION_STRIKES_PER_HOUR=5   # injection refusals per identified user per hour before a 15-min block (0 = off)
+INJECTION_BLOCK_SECONDS=900
+MAX_REQUEST_BODY_BYTES=262144   # larger bodies -> 413 (DEFECT-48)
+GATEWAY_ALLOWED_CIDRS=          # optional network gate, e.g. 10.0.0.0/8; empty = off (loopback always allowed)
 
 # Session & Authentication
 SESSION_SECRET=<YOUR_RANDOM_64_CHAR_HEX_SECRET>
-COOKIE_SECURE=0
+COOKIE_SECURE=0   # plain HTTP on the campus network (no TLS); set 1 only behind HTTPS
+SLM_API_KEY=<YOUR_RANDOM_64_CHAR_HEX_KEY>   # required by the CPU model server on :8082 (DEFECT-45)
+ENGLISH_ONLY=1    # refuse non-English questions politely (0 = accept all languages)
 ALLOWED_EMAIL_DOMAINS=iisc.ac.in
 OTP_MAX_PER_HOUR=10      # codes per address per hour from one IP
 OTP_MAX_PER_EMAIL_HOUR=30          # codes per address per hour in total (mail-bombing ceiling)
@@ -359,7 +365,7 @@ python -m pipeline.serve_cpu_slm --port 8082 --slots 6 --threads 16
 ### Testing CPU SLM Endpoint
 ```bash
 curl -s http://localhost:8082/v1/chat/completions \
-  -H "Content-Type: application/json" \
+  -H "Content-Type: application/json" -H "Authorization: Bearer $SLM_API_KEY" \
   -d '{"messages":[{"role":"user","content":"What is vermiculite?"}],"max_tokens":64}' | jq .
 ```
 
@@ -426,7 +432,7 @@ The Gateway binds to **Port 8080** and serves the AskIISc Web Chat interface (`/
 make dev
 
 # Via Native Uvicorn:
-uvicorn gateway.main:app --host 0.0.0.0 --port 8080 --reload
+uvicorn gateway.main:app --host 0.0.0.0 --port 8080 --reload --no-proxy-headers
 ```
 
 #### Production Mode (6 Uvicorn Workers):
@@ -435,7 +441,7 @@ uvicorn gateway.main:app --host 0.0.0.0 --port 8080 --reload
 make chat-up
 
 # Via Native Uvicorn:
-uvicorn gateway.main:app --host 0.0.0.0 --port 8080 --workers 6
+uvicorn gateway.main:app --host 0.0.0.0 --port 8080 --workers 6 --no-proxy-headers   # never trust X-Forwarded-For
 ```
 
 ### Testing In-Process Endpoints
@@ -451,6 +457,12 @@ curl -s -X POST http://localhost:8080/query \
 # Administrative semantic cache statistics:
 make cache-stats   # admin routes need ADMIN_API_KEY from .env, even on this server (sent via X-Admin-Key)
 ```
+
+Non-public routes (`/query`, `/v1/chat/completions`, `/cache/*`, `/queue/stats`) answer a caller without access exactly like a missing page (404), whatever the method, body or headers (DEFECT-54). A wrong `ADMIN_API_KEY` therefore also gives 404, not 401/403.
+
+Every response carries a Content-Security-Policy and related headers (DEFECT-55): the browser runs only the page's own scripts (`/static/app.js` and the vendored libraries; no inline script), loads no images from other servers, and refuses to show the page inside another site's frame. Keep page logic in `app.js` when editing the UI: an inline `<script>` or `onclick=` would be blocked. Model answers are rendered without `style`, `id` or `class` attributes (DEFECT-57); math keeps KaTeX's styling. Answers never load images, and only links to the gateway or `*.iisc.ac.in` are clickable; other links appear as text (DEFECT-58: instructions planted in a retrieved document can make the 7B model add them).
+
+Accepted limitation: a single `/v1/chat/completions` request with 50 long messages can occupy a gateway worker for about 3 s (PRD §9.1b L25).
 
 ---
 
@@ -507,12 +519,13 @@ skip with a reason instead of failing, and run once those services are available
 | Needs | Tests | How to enable |
 |---|---|---|
 | Nothing | unit, security, routing, gate and route-level tests (fakes for Redis and models) | always run |
+| Firefox | chat-page rendering security (`tests/test_frontend_xss.py`, headless) | install `firefox` |
 | Redis Stack | exact-match cache, regenerate tokens, purge | §4, `make redis-up` |
 | Redis Stack + embedding model | semantic (paraphrase) cache, owner scoping | `make download-models` |
 | Ingested thesis index | live retrieval (topic, rare-term, dynamic floor) | §5 ingestion |
 | Running gateway on :8080 | live `/query` and `/chat` checks | `make prod-up` |
 
-`make injection-eval` measures the prompt-injection fence (NFR-7) on the frozen suites in `tests/data/injection_eval/` (`ROUND=round3` is the final test set).
+`make injection-eval` measures the prompt-injection fence (NFR-7) on the frozen suites in `tests/data/injection_eval/` (`ROUND=round4` is the latest set; the classifier was trained on rounds 1–3; PRD NFR-7 says how round 4 was used). Since DEFECT-51 the gateway runs the classifier only on cache misses; the patterns and the English-only check run on every question.
 
 `make test` never downloads models (`HF_HUB_OFFLINE=1`; override with `make test HF_HUB_OFFLINE=0`).
 Run it through `make`: several files in `tests/` are standalone scripts, so a bare `pytest tests/` is not supported.
@@ -549,7 +562,7 @@ make otp-clear
 | Port | Service Component | Host Binding | Access Restriction |
 | :---: | :--- | :---: | :--- |
 | **`8080`** | **Unified Gateway & AskIISc Web UI** | `0.0.0.0` | **Public/Campus Facing**; Session Auth, CSRF, Token-Bucket Admission |
-| **`8082`** | **CPU SLM Daemon (Qwen 2.5 3B)** | `127.0.0.1` | **Internal Loopback Only**; 1 process, 6 slots $\times$ 16 threads |
+| **`8082`** | **CPU SLM Daemon (Qwen 2.5 3B)** | `127.0.0.1` | **Internal Loopback Only**, `SLM_API_KEY` required; 1 process, 6 slots $\times$ 16 threads |
 | **`8000`** | **GPU LLM Engine (vLLM Qwen 2.5 7B)** | `127.0.0.1` | **Internal Loopback Only**; PagedAttention v2 on NVIDIA A100 |
 | **`6379`** | **Redis Stack Server (Vector DB & Cache)** | `127.0.0.1` | **Internal Loopback Only**; Protected by `REDIS_PASSWORD` |
 
@@ -565,14 +578,18 @@ make otp-clear
 | **Is the gateway able to answer?** | `/health` (and `/healthz`) only say the process is up. | Use `/ready`: HTTP 200 when Redis with the thesis index and at least one model tier are up, otherwise 503; `curl -s localhost:8080/ready` on the server shows which check failed. |
 | **HTTP 503 "The thesis search service is temporarily unavailable"** | Redis is down, still loading its snapshot, or the `rag_documents_idx` index is missing (the cause and stack trace are in `logs/gateway.log`). | Start Redis (`make redis-up`) and wait until `redis-cli ping` returns `PONG` (a cold start loads for up to ~1 h); check the index with `FT._LIST`. The gateway reconnects on its own. |
 | **Zero chunks retrieved / out-of-domain refusal** | Similarity below 0.52 floor or index empty. | Check that `FT.SEARCH rag_documents_idx "*" LIMIT 0 0` returns 2261664 (never `FT.INFO`: it can deadlock Redis, DEFECT-21). Ensure `all-MiniLM-L6-v2` is installed. |
-| **Gateway returns 429 Too Many Requests** | Client token bucket capacity exhausted. | Wait 2 seconds for bucket refill (20 tokens/sec), or increase `RATE_LIMIT_BURST` and `RATE_LIMIT_RPS` in `.env`. |
+| **Gateway returns 429 Too Many Requests** | Client token bucket exhausted (10 burst, 5/s per caller per worker; every question counts, cached ones too), or more than `PER_USER_CONCURRENCY_LIMIT` answers in flight. | Wait a few seconds, or raise `RATE_LIMIT_BURST` / `RATE_LIMIT_RPS` in `.env`. |
+| **429 "Too many of your recent requests were refused as prompt-injection attempts"** | The user had `INJECTION_STRIKES_PER_HOUR` (5) injection refusals within an hour (DEFECT-59). | Wait for `Retry-After` (15 min by default). A false positive streak is unlikely (0/453 genuine questions refused in NFR-7); to lift a block early: `DEL admission:blocked:<sha256(user)[:24]>` in Redis. |
 | **OTP Email not received** | SMTP credentials invalid or rate limit hit. | Run `python scripts/clear_otp_limits.py <your_email>`. Verify SMTP credentials with `python scripts/test_smtp.py <your_email>`. |
 | **vLLM CUDA Out-of-Memory** | GPU VRAM over-allocation. | Set `--gpu-memory-utilization 0.85` or decrease `--max-model-len 4096` in `Makefile` / `scripts/prod_stack.py`. |
 | **vLLM: `No available memory for the cache blocks`** | vLLM 0.6.3 counts other users' memory changes on a shared GPU during start-up profiling. | Choose a GPU with steady usage and ~19 GB free (`nvidia-smi`), set `VLLM_GPU` in `.env`, then `make prod-restart-vllm`. |
 | **vLLM: `Address already in use` on restart** | Previous server's connections on port 8000 still closing. | Already handled by `scripts/serve_vllm.py` (`SO_REUSEADDR`); if it persists, check `ss -ltnp \| grep :8000` for a stray process. |
 | **`make vllm-check` fails / 🚨 warning in `make prod-status`** | vLLM was started without `scripts/serve_vllm.py`, so it is bound to `0.0.0.0` without an API key. | `make prod-restart-vllm`, then `make vllm-check`. |
 | **Cached answer not reused for a rephrased question** | Near-duplicate hits are per user (another user's entry is never reused; only exact repeats are shared), or the intent guard rejected the match (different question type, opposite terms, quantifiers, swapped roles), or similarity < 0.90. | Expected behaviour; the gateway logs `rejected by entity/intent guard: <reason>`. See PRD §9.1. |
-| **CSRF Error: 403 Forbidden** | Missing or mismatched CSRF cookie/header. | Ensure client passes `X-CSRF-Token` header matching the `csrftoken` cookie issued by `GET /me` or `GET /`. |
+| **CSRF Error: 403 Forbidden** | Missing or mismatched CSRF cookie/header. Required on every browser POST, also before sign-in (DEFECT-48). | Ensure client passes `X-CSRF-Token` header matching the `csrftoken` cookie issued by `GET /me` or `GET /`. API clients using `Authorization: Bearer` are exempt. |
+| **400 "AskIISc answers questions in English only"** | The question was judged not to be English (`pipeline/language_gate.py`). | Ask in English; set `ENGLISH_ONLY=0` to accept all languages. Questions of fewer than 4 words always pass. |
+| **413 Request body too large** | Body over `MAX_REQUEST_BODY_BYTES` (256 KiB). | Questions are short; raise the limit only if a legitimate client needs it. |
+| **CPU tier fails, `:8082` returns 401** | `SLM_API_KEY` missing or different between the CPU server and the gateway. | Set the same `SLM_API_KEY` in `.env` and restart both (`python scripts/prod_stack.py restart`). |
 
 ---
 
