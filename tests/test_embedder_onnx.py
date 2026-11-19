@@ -56,5 +56,6 @@ def test_forced_onnx_without_model_fails_loudly(monkeypatch, tmp_path):
     monkeypatch.setenv("HF_HUB_OFFLINE", "1")  # never download in tests
     monkeypatch.setenv("TRANSFORMERS_OFFLINE", "1")
     monkeypatch.chdir(tmp_path)  # no models/ here -> remote name, no onnx file
+    monkeypatch.setattr(emb, "REPO_MODEL_DIR", str(tmp_path / "missing"))  # model resolved from the repo since DEFECT-48
     with pytest.raises(RuntimeError, match="EMBED_BACKEND=onnx"):
         emb.LocalEmbedder(model_name_or_path="sentence-transformers/all-MiniLM-L6-v2")

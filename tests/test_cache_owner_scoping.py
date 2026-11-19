@@ -16,6 +16,7 @@ import pytest
 
 from tests._live import SEMANTIC_REASON, embedder_available
 from gateway.cache.redis_semantic_cache import RedisSemanticCache
+from gateway.auth.internal import internal_user_headers  # signed X-Internal-User (DEFECT-30)
 
 ALICE, BOB, MALLORY = "alice@iisc.ac.in", "bob@iisc.ac.in", "mallory@iisc.ac.in"
 ANSWER = {"answer": "[owner-scope-test] temporary grounded answer used only by this test.", "chunks": [{"text": "t"}]}
@@ -160,7 +161,7 @@ def test_live_gateway_does_not_share_semantic_hits_between_users(cache, q):
 
     def first_event(user):
         with client.stream("POST", "http://127.0.0.1:8080/query", json={"query": para, "stream": True},
-                           headers={"X-Internal-User": user}, timeout=60) as r:
+                           headers=internal_user_headers(user), timeout=60) as r:
             assert r.status_code == 200
             for line in r.iter_lines():
                 if line.startswith("data: "):

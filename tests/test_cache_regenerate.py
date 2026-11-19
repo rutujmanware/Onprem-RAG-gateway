@@ -19,6 +19,7 @@ import pytest
 
 import gateway.cache.redis_semantic_cache as M
 from gateway.cache.redis_semantic_cache import RedisSemanticCache
+from gateway.auth.internal import internal_user_headers  # signed X-Internal-User (DEFECT-30)
 
 # Fresh identities per run: the live tests make several regenerate attempts and the real per-user quota
 # (20 per hour) would otherwise reject repeated runs of `make test` with HTTP 429.
@@ -138,6 +139,35 @@ def test_purge_removes_overrides_too(cache, q):
     assert cache.lookup(q, owner=BOB) is None and cache.lookup(q) is None
 
 
+# ------------------------------------------------------------------ bounded tokens (DEFECT-60)
+def test_one_live_token_per_user_and_question(cache, q):
+    """Each cache hit used to add a 15-minute token holding the full question: one user repeating a padded
+    question filled Redis (no eviction). Re-issuing now replaces the previous token for that user and question."""
+    old = [cache.issue_regen_token(ALICE, q, "exact", q) for _ in range(20)]
+    other_q = cache.issue_regen_token(ALICE, q + " in batteries", "exact", q)
+    other_user = cache.issue_regen_token(BOB, q, "exact", q)
+    assert all(cache.consume_regen_token(t, ALICE, q) is None for t in old[:-1]), "older tokens were replaced"
+    assert cache.consume_regen_token(old[-1], ALICE, q) is not None
+    assert cache.consume_regen_token(other_q, ALICE, q + " in batteries") is not None   # other questions unaffected
+    assert cache.consume_regen_token(other_user, BOB, q) is not None                   # other users unaffected
+
+
+def test_token_record_size_is_bounded_and_eviction_uses_the_full_question(cache, q, monkeypatch):
+    padded = q + " " + "\u2211" * 1500
+    tok = cache.issue_regen_token(ALICE, padded, "exact", padded)
+    raw = cache.sync_client.get(RedisSemanticCache._regen_token_key(tok))
+    assert len(raw) < 2000, len(raw)                                  # was 8,937 bytes for this question
+    rec = cache.consume_regen_token(tok, ALICE, padded)
+    assert len(rec["matched_prompt"]) == M.REGEN_PROMPT_LOG_CHARS
+    assert rec["matched_hash"] == RedisSemanticCache._query_hash(padded)
+    monkeypatch.setattr(M, "REGEN_EVICT_USERS", 1)
+    cache.store(padded, _ans("A"), owner=ALICE)
+    assert cache.lookup(padded) is not None
+    assert cache.record_shared_regen(rec["matched_prompt"], BOB, matched_hash=rec["matched_hash"]) is True
+    assert cache.lookup(padded) is None, "the shortened text still evicts the right shared entry"
+    cache.purge(padded, threshold=0.99)
+
+
 # ------------------------------------------------------------------ eviction, quota, feedback
 def test_shared_entry_evicted_only_after_distinct_users(cache, q, monkeypatch):
     monkeypatch.setattr(M, "REGEN_EVICT_USERS", 3)
@@ -182,7 +212,7 @@ def test_gateway_wiring():
 
 
 def test_ui_offers_regenerate_only_on_cached_answers():
-    html = (ROOT / "askiisc_chat" / "static" / "index.html").read_text()
+    html = (ROOT / "askiisc_chat" / "static" / "app.js").read_text()   # the page's logic (DEFECT-55)
     calls = [m.start() for m in re.finditer(r"(?<!function )addRegenerateButton\(foot", html)]
     assert len(calls) == 1, "the button must be added from exactly one place"
     assert "cacheInfo && cacheInfo.regenerate_token" in html[calls[0] - 80:calls[0]]
@@ -204,7 +234,7 @@ def gw():
 
 def _first_event(client, query, user, **extra):
     with client.stream("POST", "http://127.0.0.1:8080/query", json={"query": query, "stream": True, **extra},
-                       headers={"X-Internal-User": user}, timeout=60) as r:
+                       headers=internal_user_headers(user), timeout=60) as r:
         if r.status_code != 200:
             return {"http": r.status_code, "detail": json.loads(r.read() or b"{}").get("detail")}
         for line in r.iter_lines():

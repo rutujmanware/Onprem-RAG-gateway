@@ -40,6 +40,10 @@ def _ort_session(path: str):
         return _ORT_SESSIONS[path]
 
 
+# DEFECT-48: the bundled model, located from this file (not the working directory)
+REPO_MODEL_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+                              "models", "embeddings", "all-MiniLM-L6-v2")
+
 class LocalEmbedder:
     """Robust dense embedder using direct Hugging Face transformers with mean-pooling,
 
@@ -61,7 +65,10 @@ class LocalEmbedder:
         self._F = None
         self._tok_lock = threading.Lock()
 
-        local_dir = os.path.abspath("models/embeddings/all-MiniLM-L6-v2")
+        # DEFECT-48: resolve from the repository, not the current directory (a gateway started elsewhere silently
+        # fell back to hash vectors and every question got "no theses found")
+        repo_dir = REPO_MODEL_DIR
+        local_dir = repo_dir if os.path.exists(repo_dir) else os.path.abspath("models/embeddings/all-MiniLM-L6-v2")
         if os.path.exists(local_dir):
             hf_name = local_dir
         else:
@@ -118,6 +125,9 @@ class LocalEmbedder:
             raise RuntimeError(f"EMBED_BACKEND=onnx but no usable ONNX model for {self.hf_name}: "
                                "run scripts/export_embedder_onnx.py")
         self.backend = "onnx" if self._ort is not None else ("torch" if self._model is not None else "fallback")
+        if self.backend == "fallback" and getattr(self, "_st_model", None) is None:
+            logger.error("No embedding model loaded (%s): using hash vectors, retrieval will not work. "
+                         "Run `make download-models`.", self.hf_name)
 
     def _ort_embed(self, texts: List[str]):
         import numpy as np

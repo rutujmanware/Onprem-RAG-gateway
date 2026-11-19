@@ -64,8 +64,8 @@ def test_context_fencing():
     assert "<context_data>" in fenced
     assert "</context_data>" in fenced
     assert "<document id=\"1\" title=\"Thesis A\">" in fenced
-    # Malicious breakout tag inside chunk must be escaped
-    assert "[escaped_tag]" in fenced
+    # Malicious breakout tag inside chunk must be escaped (DEFECT-37: all tags are HTML-escaped)
+    assert "&lt;/context_data&gt;" in fenced and fenced.count("</context_data>") == 1
 
 
 def test_user_screenshot_prompt_1_blocked():

@@ -68,8 +68,9 @@ async def otp_request(body: OtpReq, request: Request):
         return JSONResponse({"error": str(e), "resend_in": getattr(e, "resend_in", int(C.OTP_RESEND_SECS))}, status_code=429)
     try: await asyncio.to_thread(auth.send_mail, email, "Your AskIISc sign-in code", auth.otp_mail_body(code))
     except auth.MailError as e:
-        auth.otp_store.revoke(email); log.error("otp mail failed: %s", e)
-        return JSONResponse({"error": f"Could not send email: {e}"}, status_code=503)
+        auth.otp_store.revoke(email, code.challenge); log.error("otp mail failed: %s", e)
+        return JSONResponse({"error": "We could not send the sign-in code right now. Please try again in a few minutes."}, status_code=503)   # details only in the log (DEFECT-38)
+    request.session["otp_challenge"] = {"email": email, "c": code.challenge}   # DEFECT-35: bound to this browser
     is_resend = request.url.path.endswith("/resend")
     prefix = "A new 6-digit verification code" if is_resend else "A 6-digit verification code"
     return {"ok": True, "message": f"{prefix} has been sent to your email address.", "resend_in": int(C.OTP_RESEND_SECS)}
@@ -79,7 +80,9 @@ async def otp_verify(body: OtpVerify, request: Request):
     if C.AUTH_MODE != "otp": return JSONResponse({"error": "not enabled"}, status_code=404)
     try: email = auth.normalize_email(body.email)
     except auth.AuthError: return JSONResponse({"error": "Invalid or expired code."}, status_code=401)
-    if not auth.otp_store.verify(email, body.code.strip()):
+    pending = request.session.get("otp_challenge") or {}
+    challenge = pending.get("c", "") if pending.get("email") == email else ""
+    if not auth.otp_store.verify(email, body.code.strip(), challenge):
         return JSONResponse({"error": "Invalid or expired code."}, status_code=401)   # same message for wrong/expired/locked
     request.session.clear()
     request.session["user"] = {"sub": hashlib.sha256(email.encode()).hexdigest(), "name": email, "email": email,
@@ -96,7 +99,7 @@ async def login(request: Request):
 async def callback(request: Request, code: str = "", state: str = "", error: str = ""):
     if C.AUTH_MODE != "entra": return JSONResponse({"error": "not enabled"}, status_code=404)
     st = request.session.pop("oidc", None)
-    if error or not st or not code or not secrets.compare_digest(state, st["state"]):
+    if error or not st or not code or not secrets.compare_digest(state.encode(), str(st["state"]).encode()):   # bytes (DEFECT-54)
         return JSONResponse({"error": "Sign-in failed."}, status_code=400)
     try:
         user = await asyncio.to_thread(auth.validate_id_token, await auth.exchange_code(code, st["verifier"]), st["nonce"])
@@ -197,9 +200,9 @@ async def chat(req: ChatReq, request: Request):
                 except ModelError as e:
                     log.warning("%s failed: %s", which, e)
                     if which != order[-1]:
-                        yield sse("fallback", {"from": which, "to": order[-1], "why": str(e)[:160]})
+                        log.warning("fallback from %s: %s", which, e); yield sse("fallback", {"from": which, "to": order[-1], "why": "model unavailable"})
                         continue
-                    yield sse("error", {"msg": f"No model reachable: {e}"}); return
+                    log.warning("no model reachable: %s", e); yield sse("error", {"msg": "No answering model is reachable right now. Please try again shortly."}); return
                 conf = out.get("conf")
                 # Cascade: SLM low confidence -> discard and rerun on the 7B
                 if (C.CASCADE and which == "slm" and req.force != "slm" and conf is not None
@@ -217,7 +220,7 @@ async def chat(req: ChatReq, request: Request):
                                "escalated": bool(final and final.get("escalated"))})
             trace(tr | {"route0": first, "s": r["s"], "final": final, "chunks": [c.id for c in chunks], **tm})
         except Exception as e:
-            log.exception("chat failed"); yield sse("error", {"msg": f"{type(e).__name__}: {e}"})
+            log.exception("chat failed"); yield sse("error", {"msg": "Something went wrong while answering. Please try again."})
     return StreamingResponse(gen(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 @app.get("/theses")

@@ -67,14 +67,26 @@ def save_pids(pids: Dict[str, int]):
         json.dump(pids, f, indent=2)
 
 
-def is_pid_running(pid: int) -> bool:
+_PID_MARKERS = {"gateway": "gateway.main:app", "slm": "serve_cpu_slm", "vllm": "serve_vllm", "redis": "redis"}
+
+
+def is_pid_running(pid: int, name: Optional[str] = None) -> bool:
+    """True if the PID exists and, when `name` is given, is still that service (DEFECT-44: a reused PID of an
+    unrelated process must never be treated as ours, or signalled)."""
     if pid <= 0:
         return False
     try:
         os.kill(pid, 0)
-        return True
     except OSError:
         return False
+    marker = _PID_MARKERS.get(name or "")
+    if marker:
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as fh:
+                return marker in fh.read().replace(b"\0", b" ").decode("utf-8", "replace")
+        except OSError:
+            return False
+    return True
 
 
 def check_port_health(port: int, path: str = "/healthz") -> Tuple[str, str]:
@@ -136,7 +148,7 @@ def start_all():
     # 1. Start Redis Stack
     redis_st, _ = check_port_health(REDIS_PORT)
     if redis_st == "DOWN":
-        if not is_pid_running(pids.get("redis", 0)):
+        if not is_pid_running(pids.get("redis", 0), "redis"):
             print(f"📦 Starting Redis Stack Server on port {REDIS_PORT}...")
             pid = start_service("redis", [str(REDIS_SERVER_BIN)])
             pids["redis"] = pid
@@ -149,7 +161,7 @@ def start_all():
     # 2. Start vLLM GPU Server
     vllm_st, _ = check_port_health(VLLM_PORT, "/health")
     if vllm_st != "READY":
-        if not is_pid_running(pids.get("vllm", 0)):
+        if not is_pid_running(pids.get("vllm", 0), "vllm"):
             print(f"🔥 Starting vLLM GPU Server on port {VLLM_PORT} (NVIDIA A100)...")
             vllm_cmd = [
                 # Hardened launcher: vLLM 0.6.3 ignores --host on its pre-bound
@@ -175,7 +187,7 @@ def start_all():
     # 3. Start CPU SLM Server
     slm_st, _ = check_port_health(SLM_PORT, "/healthz")
     if slm_st != "READY":
-        if not is_pid_running(pids.get("slm", 0)):
+        if not is_pid_running(pids.get("slm", 0), "slm"):
             print(f"⚡ Starting CPU SLM Server on port {SLM_PORT} (Qwen 2.5 3B GGUF, 1 process with 6 model slots)...")
             slm_cmd = [
                 PYTHON_BIN, "-m", "pipeline.serve_cpu_slm",
@@ -192,7 +204,7 @@ def start_all():
     # 4. Start Production Gateway (No reload, production uvicorn with 6 workers)
     gw_st, _ = check_port_health(GATEWAY_PORT, "/healthz")
     if gw_st != "READY":
-        if not is_pid_running(pids.get("gateway", 0)):
+        if not is_pid_running(pids.get("gateway", 0), "gateway"):
             print(f"🌐 Starting Institutional Gateway on port {GATEWAY_PORT} (0.0.0.0:8080 with 6 workers)...")
             gw_cmd = [
                 PYTHON_BIN, "-m", "uvicorn",
@@ -201,6 +213,9 @@ def start_all():
                 "--port", str(GATEWAY_PORT),
                 "--workers", "6",
                 "--no-access-log",
+                # DEFECT-44: never trust X-Forwarded-For (uvicorn trusts it from 127.0.0.1 by default, so any
+                # local user of this shared host could choose their own client IP)
+                "--no-proxy-headers",
             ]
             pid = start_service("gateway", gw_cmd)
             pids["gateway"] = pid
@@ -293,7 +308,7 @@ def stop_all(stop_redis: bool = False, stop_vllm: bool = False):
     service_names = ["gateway", "slm"]
     if stop_vllm:
         vllm_pid = pids.get("vllm")
-        if vllm_pid and is_pid_running(vllm_pid):
+        if vllm_pid and is_pid_running(vllm_pid, "vllm"):
             stop_process_group("vllm", vllm_pid)
         else:
             print("ℹ️ No vLLM PID recorded; if port 8000 is still busy, stop that process manually.")
@@ -307,7 +322,11 @@ def stop_all(stop_redis: bool = False, stop_vllm: bool = False):
 
     for name in service_names:
         pid = pids.get(name)
-        if pid and is_pid_running(pid):
+        if name in ("gateway", "slm") and pid and is_pid_running(pid, name):
+            # whole process group: uvicorn's worker processes must not be left behind (DEFECT-44)
+            stop_process_group(name, pid, timeout=30.0)
+            continue
+        if pid and is_pid_running(pid, name):
             print(f"Stopping {name} (PID {pid})...")
             try:
                 os.kill(pid, signal.SIGTERM)
@@ -329,7 +348,7 @@ def stop_all(stop_redis: bool = False, stop_vllm: bool = False):
     # Check if any lingering
     for name in service_names:
         pid = pids.get(name)
-        if pid and is_pid_running(pid):
+        if pid and is_pid_running(pid, name):
             print(f"Force killing {name} (PID {pid})...")
             try:
                 os.kill(pid, signal.SIGKILL)

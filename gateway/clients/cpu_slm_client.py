@@ -24,9 +24,11 @@ class CPUSLMClient:
     @property
     def client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
+            key = os.getenv("SLM_API_KEY", "").strip()   # DEFECT-45
             self._client = httpx.AsyncClient(
                 base_url=self.base_url,
                 timeout=self.timeout,
+                headers={"Authorization": f"Bearer {key}"} if key else None,
             )
         return self._client
 

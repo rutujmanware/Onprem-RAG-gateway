@@ -22,7 +22,7 @@ def test_in_memory_otp_concurrency_lockout():
 
     def attempt_wrong(worker_id):
         wrong_code = f"{(worker_id + 99999) % 1000000:06d}"
-        return store.verify(email, wrong_code)
+        return store.verify(email, wrong_code, code.challenge)
 
     # 25 concurrent threads attempting wrong codes
     with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
@@ -35,7 +35,7 @@ def test_in_memory_otp_concurrency_lockout():
         assert email not in store.rec
 
     # Verifying even with the correct code now must fail because it was locked out
-    assert store.verify(email, code) is False
+    assert store.verify(email, code, code.challenge) is False
 
 
 def test_redis_otp_concurrency_lockout():
@@ -50,13 +50,13 @@ def test_redis_otp_concurrency_lockout():
     code = auth.otp_store.issue(email, ip)
     assert code is not None
 
-    key = f"auth:otp:{email}"
+    key = f"auth:otp:{email}:{code.challenge}"
     assert r.exists(key) == 1
 
     def attempt_wrong(worker_id):
         # Distinct wrong 6-digit codes
         wrong_code = f"{(worker_id + 88888) % 1000000:06d}"
-        return auth.otp_store.verify(email, wrong_code)
+        return auth.otp_store.verify(email, wrong_code, code.challenge)
 
     # 30 concurrent requests attempting wrong OTPs simultaneously
     with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
@@ -69,7 +69,7 @@ def test_redis_otp_concurrency_lockout():
     assert r.exists(key) == 0
 
     # Any subsequent verification (even with the original valid code) must be rejected
-    assert auth.otp_store.verify(email, code) is False
+    assert auth.otp_store.verify(email, code, code.challenge) is False
 
 
 def test_redis_otp_success_burns_key_immediately():
@@ -84,15 +84,15 @@ def test_redis_otp_success_burns_key_immediately():
     code = auth.otp_store.issue(email, ip)
     assert code is not None
 
-    key = f"auth:otp:{email}"
+    key = f"auth:otp:{email}:{code.challenge}"
     assert r.exists(key) == 1
 
     # First attempt with correct code must succeed
-    assert auth.otp_store.verify(email, code) is True
+    assert auth.otp_store.verify(email, code, code.challenge) is True
 
     # Key must be deleted immediately after single use
     assert r.exists(key) == 0
 
     # Second attempt with same code must fail (replay prevented)
-    assert auth.otp_store.verify(email, code) is False
+    assert auth.otp_store.verify(email, code, code.challenge) is False
 

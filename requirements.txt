@@ -36,7 +36,9 @@ pyyaml>=6.0.1
 
 # --- Institutional Authentication & Security ---
 python-jose[cryptography]>=3.3.0
-jwt>=1.3.1
+# PyJWT (PyJWKClient, used by askiisc_chat/askiisc/auth.py). NOT the unrelated PyPI package 'jwt': both own the
+# 'jwt' import name and must not be installed together (DEFECT-43).
+PyJWT[crypto]>=2.4.0
 cryptography>=42.0.0
 
 # --- Document Parsing & Ingestion ---

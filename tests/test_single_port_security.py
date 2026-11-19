@@ -7,6 +7,8 @@ os.environ.pop("ENABLE_API_DOCS", None)
 os.environ["ADMIN_API_KEY"] = "supersecretadminkey"
 
 from gateway.main import app
+import gateway.main as _gm
+_gm.ADMIN_KEY = "supersecretadminkey"  # also when another test imported gateway.main first
 
 client = TestClient(app)
 

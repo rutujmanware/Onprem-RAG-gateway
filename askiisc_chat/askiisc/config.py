@@ -46,7 +46,7 @@ EMBED_QUERY_PREFIX = os.environ.get("EMBED_QUERY_PREFIX", "")  # e.g. bge: "Repr
 # --- Models (OpenAI-compatible /v1/chat/completions: vLLM, llama.cpp server, Ollama) ---
 SLM_URL          = os.environ.get("SLM_BASE_URL", os.environ.get("SLM_URL", "http://localhost:8082/v1"))
 SLM_MODEL        = os.environ.get("SLM_MODEL_NAME", os.environ.get("SLM_MODEL", "models/slm_gguf/qwen2.5-3b-instruct-q4_k_m.gguf"))
-SLM_KEY          = os.environ.get("SLM_KEY", "intranet-token")
+SLM_KEY          = os.environ.get("SLM_KEY") or os.environ.get("SLM_API_KEY") or "intranet-token"
 LLM_URL          = os.environ.get("VLLM_BASE_URL", os.environ.get("LLM_URL", "http://localhost:8000/v1"))
 LLM_MODEL        = os.environ.get("VLLM_MODEL_NAME", os.environ.get("LLM_MODEL", "Qwen/Qwen2.5-7B-Instruct"))
 LLM_KEY          = os.environ.get("LLM_KEY") or os.environ.get("VLLM_API_KEY") or "intranet-token"
@@ -90,8 +90,10 @@ REQUIRE_LOGIN    = os.environ.get("REQUIRE_LOGIN", "1") == "1"   # 1 = no chat/t
 ALLOW_SUBDOMAINS = os.environ.get("ALLOW_SUBDOMAINS", "0") == "1"  # accept dept subdomains like csa.iisc.ac.in? CHECK what your real mail addresses look like
 OTP_TTL          = _f("OTP_TTL", 180)              # seconds a code stays valid (default: 180s = 3 minutes)
 OTP_MAX_TRIES    = _f("OTP_MAX_TRIES", 5)          # wrong guesses before the code is destroyed
-OTP_RESEND_SECS  = _f("OTP_RESEND_SECS", 60)       # min gap between codes per address
-OTP_MAX_PER_HOUR = _f("OTP_MAX_PER_HOUR", 10)       # codes per address per hour (stops mail-bombing a victim)
+OTP_RESEND_SECS  = _f("OTP_RESEND_SECS", 60)       # min gap between codes per address and IP
+OTP_MAX_PER_HOUR = _f("OTP_MAX_PER_HOUR", 10)       # codes per address per hour from one IP
+OTP_MAX_PER_EMAIL_HOUR = _f("OTP_MAX_PER_EMAIL_HOUR", 30)   # codes per address per hour in total (mail-bombing ceiling)
+OTP_MAX_FAILS_PER_EMAIL_HOUR = _f("OTP_MAX_FAILS_PER_EMAIL_HOUR", 20)  # wrong guesses per address per hour (first try on a fresh code always counts)
 OTP_MAX_PER_IP_HOUR = _f("OTP_MAX_PER_IP_HOUR", 1000)
 # --- Outgoing mail: use IISc's INTERNAL relay. smtp.office365.com would be external egress and needs a mailbox credential.
 SMTP_HOST        = os.environ.get("SMTP_HOST", "")

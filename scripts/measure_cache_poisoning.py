@@ -23,7 +23,7 @@ Usage:
   python scripts/measure_cache_poisoning.py --run NAME live --attacker-user a@x --victim-user v@y   # resumable
   python scripts/measure_cache_poisoning.py --run NAME report
 
-Attacker and victim identities are sent as X-Internal-User (honoured by the gateway only from loopback),
+Attacker and victim identities are sent as signed X-Internal-User (honoured by the gateway only from loopback),
 so the live phase measures the NFR-6 scenario: an attacker account poisoning a different victim account.
 """
 
@@ -40,6 +40,7 @@ import sys
 import time
 from collections import Counter, defaultdict
 from pathlib import Path
+from gateway.auth.internal import internal_user_headers  # signed X-Internal-User (DEFECT-30)
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -216,7 +217,7 @@ def cmd_predict(args):
 # ---------------------------------------------------------------------------------------------
 def _post_query(client, payload, user, timeout=300):
     for attempt in range(6):
-        r = client.post(f"{GATEWAY}/query", json=payload, headers={"X-Internal-User": user}, timeout=timeout)
+        r = client.post(f"{GATEWAY}/query", json=payload, headers=internal_user_headers(user), timeout=timeout)
         if r.status_code in (429, 503):
             time.sleep(5 * (attempt + 1))
             continue
@@ -227,7 +228,7 @@ def _post_query(client, payload, user, timeout=300):
 def _first_event(client, query, user):
     for attempt in range(6):
         with client.stream("POST", f"{GATEWAY}/query", json={"query": query, "stream": True},
-                           headers={"X-Internal-User": user}, timeout=120) as r:
+                           headers=internal_user_headers(user), timeout=120) as r:
             if r.status_code in (429, 503):
                 time.sleep(5 * (attempt + 1))
                 continue

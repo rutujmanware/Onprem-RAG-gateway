@@ -12,10 +12,82 @@ are never corrupted into 'cell').
 from __future__ import annotations
 
 import functools
+import logging
 import os
 import re
+import threading
 from collections import defaultdict
 from typing import Dict, List, Optional, Set
+
+
+logger = logging.getLogger(__name__)
+_EN_LOCK = threading.Lock()
+_EN_WORDS: Optional[Set[str]] = None
+
+
+def _is_english(word: str) -> bool:
+    """In the English frequency dictionary bundled with symspellpy (a project dependency)."""
+    global _EN_WORDS
+    if _EN_WORDS is None:
+        with _EN_LOCK:
+            if _EN_WORDS is None:
+                words: Set[str] = set()
+                try:
+                    from importlib.resources import files
+                    with open(str(files("symspellpy") / "frequency_dictionary_en_82_765.txt")) as fh:
+                        words = {line.split()[0] for line in fh if line.strip()}
+                except Exception as e:
+                    logger.warning("English dictionary unavailable for typo protection: %s", e)
+                _EN_WORDS = words
+    return word in _EN_WORDS
+
+
+_CORPUS_CLIENT = None
+# A word counts as a real corpus term from this many chunks on. Measured: real terms 9-1323 chunks (stanene 9,
+# fluxonium 12, graphane 18, ...); typos/extraction fragments 0-3 (nanoscienc 2, machne 3, catalist 1).
+CORPUS_MIN_CHUNKS = int(os.getenv("TYPO_CORPUS_MIN_CHUNKS", "5"))
+
+
+class CorpusUnavailable(RuntimeError):
+    """The thesis index could not be asked; the decision must not be cached."""
+
+
+class CorpusBudgetExhausted(RuntimeError):
+    """More unknown words in one question than MAX_CORPUS_LOOKUPS; the word is left as typed (not cached)."""
+
+
+# DEFECT-47: at most this many index lookups per normalize() call (a question full of unknown words, or a stalled
+# Redis, must not cost seconds); further unknown words are left unchanged.
+MAX_CORPUS_LOOKUPS = int(os.getenv("TYPO_MAX_CORPUS_LOOKUPS", "3"))
+_BUDGET = threading.local()
+
+
+@functools.lru_cache(maxsize=65536)
+def _in_corpus(word: str) -> bool:
+    """True if at least CORPUS_MIN_CHUNKS thesis chunks contain the word (verbatim). Raises CorpusUnavailable
+    (not cached) if the index cannot be asked."""
+    global _CORPUS_CLIENT
+    if os.getenv("TYPO_CORPUS_PROTECTION", "1") == "0" or not re.fullmatch(r"[a-z]{4,40}", word):
+        return False
+    try:
+        import redis
+        if _CORPUS_CLIENT is None:
+            from gateway.cache.redis_semantic_cache import DEFAULT_REDIS_URL
+            _CORPUS_CLIENT = redis.Redis.from_url(os.getenv("REDIS_URL") or DEFAULT_REDIS_URL,
+                                                  socket_connect_timeout=1, socket_timeout=1)
+        remaining = getattr(_BUDGET, "left", None)
+        if remaining is not None:
+            if remaining <= 0:
+                raise CorpusBudgetExhausted(word)
+            _BUDGET.left = remaining - 1
+        index = os.getenv("REDIS_INDEX_NAME", "rag_documents_idx")
+        res = _CORPUS_CLIENT.execute_command("FT.SEARCH", index, f"@content:({word})", "VERBATIM", "LIMIT", "0", "0")
+        n = res[0] if isinstance(res, list) else (res.get(b"total_results", res.get("total_results", 0)) or 0)
+        return int(n) >= CORPUS_MIN_CHUNKS
+    except CorpusBudgetExhausted:
+        raise
+    except Exception as e:
+        raise CorpusUnavailable(str(e)) from e
 
 
 class TypoNormalizer:
@@ -150,9 +222,22 @@ class TypoNormalizer:
             prev = curr
         return prev[l2]
 
-    @functools.lru_cache(maxsize=32768)
     def _correct_token_cached(self, token_lower: str) -> str:
-        """Correct a single lowercased token with LRU caching."""
+        """Correct a single lowercased token. Decisions are cached only when the corpus could be checked; without
+        the index (fresh clone, Redis down) the English dictionary alone protects words, uncached."""
+        try:
+            return self._correct_token_checked(token_lower)
+        except CorpusBudgetExhausted:
+            return token_lower
+        except CorpusUnavailable:
+            return self._correct_token(token_lower, check_corpus=False)
+
+    @functools.lru_cache(maxsize=32768)
+    def _correct_token_checked(self, token_lower: str) -> str:
+        return self._correct_token(token_lower, check_corpus=True)
+
+    def _correct_token(self, token_lower: str, check_corpus: bool = True) -> str:
+        """Correct a single lowercased token."""
         # 1. Skip if already valid institutional vocab, valid English word, too short, or contains digits
         if (
             token_lower in self.vocab
@@ -160,6 +245,11 @@ class TypoNormalizer:
             or len(token_lower) < 4
             or any(c.isdigit() for c in token_lower)
         ):
+            return token_lower
+        # DEFECT-40: a word that is a real word is never rewritten into a different one. Real = in the English
+        # dictionary bundled with symspellpy (82,765 words; no system word list needed) or present in at least
+        # CORPUS_MIN_CHUNKS thesis chunks (graphane, graphyne, ...). Only words found in neither are treated as typos.
+        if _is_english(token_lower) or (check_corpus and _in_corpus(token_lower)):
             return token_lower
 
         max_allowed = 1 if len(token_lower) <= 6 else 2
@@ -214,4 +304,8 @@ class TypoNormalizer:
         def _repl(match: re.Match[str]) -> str:
             return self.correct_word(match.group(0))
 
-        return re.sub(r"\b[A-Za-z0-9_-]+\b", _repl, query)
+        _BUDGET.left = MAX_CORPUS_LOOKUPS
+        try:
+            return re.sub(r"\b[A-Za-z0-9_-]+\b", _repl, query)
+        finally:
+            _BUDGET.left = None

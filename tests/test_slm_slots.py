@@ -226,6 +226,7 @@ def test_two_slots_generate_concurrently():
 def client(monkeypatch):
     monkeypatch.setattr(srv, "_engines", [FakeEngine(n_tokens=3, delay=0)])
     monkeypatch.setattr(srv, "QUEUE_TIMEOUT_SECONDS", 0.2)
+    monkeypatch.setattr(srv, "SLM_API_KEY", "")   # key enforcement: test_hardening_round2
     with TestClient(srv.app) as c:
         yield c
 

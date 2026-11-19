@@ -9,7 +9,8 @@ async def test_admission_concurrency_and_timeout():
         global_concurrency_cap=2,
         max_queue_depth=2,
         queue_timeout_seconds=0.3,
-        rate_limiter=TokenBucketLimiter(capacity=100, refill_rate=100)
+        rate_limiter=TokenBucketLimiter(capacity=100, refill_rate=100),
+        use_redis=False,  # global slots/queue only; the per-user cap is tested in test_per_user_cap.py
     )
 
     active_tasks = []

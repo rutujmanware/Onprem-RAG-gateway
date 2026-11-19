@@ -72,7 +72,7 @@ def validate_id_token(token: str, nonce: str, key=None) -> dict:
     except jwt.PyJWTError as e:
         raise AuthError(f"invalid id_token: {type(e).__name__}") from e
     if c.get("tid") != C.ENTRA_TENANT_ID: raise AuthError("wrong tenant")
-    if not secrets.compare_digest(str(c.get("nonce", "")), nonce): raise AuthError("nonce mismatch")
+    if not secrets.compare_digest(str(c.get("nonce", "")).encode(), str(nonce).encode()): raise AuthError("nonce mismatch")  # bytes: never raises (DEFECT-54)
     ident = (c.get("preferred_username") or c.get("email") or "").lower()
     if "#ext#" in ident: raise AuthError("guest (B2B) account not allowed")   # interns/temp staff added as guests
     if not domain_ok(ident): raise AuthError("email domain not allowed")
@@ -102,56 +102,60 @@ def _key() -> bytes:
     if _secret is None: _secret = (C.SESSION_SECRET or secrets.token_urlsafe(32)).encode()
     return _secret
 
+class IssuedCode(str):
+    """The 6-digit code (a str, for the e-mail) plus the challenge id that must accompany it on verification."""
+    challenge: str = ""
+
+
 class OtpStore:
     """Distributed OTP store backed by Redis (with fallback to in-memory for unit tests / single-process).
-    Codes are stored strictly as HMAC-SHA256 hashes. Shared across all Gateway workers via Redis."""
+    Codes are stored strictly as HMAC-SHA256 hashes. Shared across all Gateway workers via Redis.
+
+    DEFECT-35: one person must not be able to stop another from signing in.
+      * Every code belongs to a challenge (random id) that is kept in the requesting browser's signed session;
+        verification needs the challenge and the code, and wrong guesses count against that challenge only. An
+        attacker's guesses burn only the challenges the attacker requested (whose codes went to the victim's
+        mailbox), never the victim's; a new request does not cancel an older pending code.
+      * Request limits (cooldown, hourly cap) are per (email, requesting IP); a per-email ceiling
+        (OTP_MAX_PER_EMAIL_HOUR) only bounds mail volume.
+      * Brute force: wrong guesses per email per hour are capped (OTP_MAX_FAILS_PER_EMAIL_HOUR), but the first
+        attempt on a fresh challenge is always evaluated, so the cap cannot lock the real user out.
+    """
 
     LUA_VERIFY_SCRIPT = """
 local raw = redis.call('GET', KEYS[1])
-if not raw then
-    return -1
-end
+if not raw then return -1 end
 local status, data = pcall(cjson.decode, raw)
-if not status or type(data) ~= 'table' then
-    redis.call('DEL', KEYS[1])
-    return -1
-end
+if not status or type(data) ~= 'table' then redis.call('DEL', KEYS[1]) return -1 end
 local now = tonumber(ARGV[3])
-if now > tonumber(data['exp'] or 0) then
-    redis.call('DEL', KEYS[1])
-    return -2
-end
-
-local tries = tonumber(data['tries'] or 0) + 1
+if now > tonumber(data['exp'] or 0) then redis.call('DEL', KEYS[1]) return -2 end
+redis.call('ZREMRANGEBYSCORE', KEYS[2], '-inf', now - 3600)
+local tries = tonumber(data['tries'] or 0)
+if tries > 0 and redis.call('ZCARD', KEYS[2]) >= tonumber(ARGV[4]) then return -3 end
+tries = tries + 1
 data['tries'] = tries
-
-if ARGV[1] ~= '' and data['h'] == ARGV[1] then
-    redis.call('DEL', KEYS[1])
-    return 1
-end
-
+if ARGV[1] ~= '' and data['h'] == ARGV[1] then redis.call('DEL', KEYS[1]) return 1 end
+redis.call('ZADD', KEYS[2], now, ARGV[5])
+redis.call('EXPIRE', KEYS[2], 3600)
 if tries >= tonumber(ARGV[2]) then
     redis.call('DEL', KEYS[1])
-    return 0
 else
     local ttl = redis.call('TTL', KEYS[1])
-    if ttl > 0 then
-        redis.call('SET', KEYS[1], cjson.encode(data), 'EX', ttl)
-    else
-        redis.call('DEL', KEYS[1])
-    end
-    return 0
+    if ttl > 0 then redis.call('SET', KEYS[1], cjson.encode(data), 'EX', ttl) else redis.call('DEL', KEYS[1]) end
 end
+return 0
 """
 
     def __init__(self, clock=time.time, redis_client=None):
         self.clock = clock
-        self.rec = {}
-        self.by_email = defaultdict(list)
+        self.rec = {}                       # (email, challenge) -> record (in-memory mode)
+        self.by_email = defaultdict(list)   # rate-limit logs (in-memory mode)
         self.by_ip = defaultdict(list)
         self.lock = threading.Lock()
         self._redis = redis_client
         self._redis_checked = False
+        self._redis_retry_at = 0.0    # DEFECT-61: next connection attempt (monotonic seconds)
+        self._redis_backoff = 0.0
 
     def _h(self, email: str, code: str) -> str:
         return hmac.new(_key(), f"{email}:{code}".encode(), hashlib.sha256).hexdigest()
@@ -160,7 +164,11 @@ end
         # When synthetic/mock clock is injected without an explicit redis_client, use in-memory store
         if self.clock is not time.time and self._redis is None:
             return None
-        if not self._redis_checked:
+        # DEFECT-61: if Redis is unreachable when this worker first needs it, retry later with a growing wait
+        # (5 s, doubling, at most 60 s) instead of staying on the per-worker memory store until a restart: codes
+        # issued by one worker would not verify on the others, and the send / guess limits became per worker.
+        # Once connected, redis-py reconnects by itself after an outage.
+        if self._redis is None and time.monotonic() >= self._redis_retry_at:
             self._redis_checked = True
             if self._redis is None:
                 try:
@@ -177,129 +185,107 @@ end
                         host = os.getenv("REDIS_HOST", "localhost")
                         port = os.getenv("REDIS_PORT", "6379")
                         redis_url = f"redis://{pw_str}{host}:{port}/0"
-                    self._redis = redis.Redis.from_url(redis_url, decode_responses=True)
-                    self._redis.ping()
+                    client = redis.Redis.from_url(redis_url, decode_responses=True)
+                    client.ping()
+                    self._redis = client
+                    if self._redis_backoff:
+                        logger.info("OtpStore reconnected to Redis")
+                    self._redis_backoff = 0.0
                 except Exception as e:
-                    logger.warning("Redis connection failed for OtpStore, using in-memory: %s", e)
                     self._redis = None
+                    self._redis_backoff = min(60.0, (self._redis_backoff * 2) or 5.0)
+                    self._redis_retry_at = time.monotonic() + self._redis_backoff
+                    logger.warning("Redis connection failed for OtpStore, using in-memory for %.0f s: %s",
+                                   self._redis_backoff, e)
         return self._redis
 
-    def _recent(self, log, key, now):
-        log[key] = [t for t in log[key] if now - t < 3600]
+    def _recent(self, log, key, now, window=3600):
+        log[key] = [t for t in log[key] if now - t < window]
         return log[key]
 
-    def issue(self, email: str, ip: str) -> str:
+    @staticmethod
+    def _ipk(ip: str) -> str:
+        return hashlib.sha256((ip or "?").encode()).hexdigest()[:16]
+
+    def _limits(self, email, ip, now, counts):
+        """counts: callable(kind, key) -> (number in the last hour, seconds since the last one or None)."""
+        n_pair, since_pair = counts("pair", f"{email}|{self._ipk(ip)}")
+        if since_pair is not None and since_pair < C.OTP_RESEND_SECS:
+            rem = max(1, int(round(C.OTP_RESEND_SECS - since_pair)))
+            raise RateLimited(f"Please wait {rem}s before requesting another code.", resend_in=rem)
+        if n_pair >= C.OTP_MAX_PER_HOUR:
+            raise RateLimited("too many codes requested for this address")
+        if counts("email", email)[0] >= C.OTP_MAX_PER_EMAIL_HOUR:
+            raise RateLimited("too many codes requested for this address")
+        if counts("ip", ip)[0] >= C.OTP_MAX_PER_IP_HOUR:
+            raise RateLimited("too many requests from this network address")
+
+    def issue(self, email: str, ip: str) -> IssuedCode:
         r = self._get_redis()
         now = self.clock()
         ttl = int(C.OTP_TTL)
+        code = IssuedCode(f"{secrets.randbelow(10**6):06d}")
+        code.challenge = secrets.token_urlsafe(18)
+        record = {"h": self._h(email, code), "exp": now + ttl, "tries": 0, "sent": now}
+        keys = {"pair": "auth:rate:pair:", "email": "auth:rate:email:", "ip": "auth:rate:ip:"}
 
         if r is not None:
             try:
-                # 1. Resend cooldown check
-                raw = r.get(f"auth:otp:{email}")
-                if raw:
-                    try:
-                        existing = json.loads(raw)
-                        elapsed = now - existing.get("sent", 0)
-                        if elapsed < C.OTP_RESEND_SECS:
-                            rem = max(1, int(round(C.OTP_RESEND_SECS - elapsed)))
-                            raise RateLimited(f"Please wait {rem}s before requesting another code.", resend_in=rem)
-                    except (json.JSONDecodeError, TypeError):
-                        pass
-
-                # 2. Hourly rate limit per email
-                r.zremrangebyscore(f"auth:rate:email:{email}", 0, now - 3600)
-                if r.zcard(f"auth:rate:email:{email}") >= C.OTP_MAX_PER_HOUR:
-                    raise RateLimited("too many codes requested for this address")
-
-                # 3. Hourly rate limit per IP
-                r.zremrangebyscore(f"auth:rate:ip:{ip}", 0, now - 3600)
-                if r.zcard(f"auth:rate:ip:{ip}") >= C.OTP_MAX_PER_IP_HOUR:
-                    raise RateLimited("too many requests from this network address")
-
-                # Generate 6-digit OTP code
-                code = f"{secrets.randbelow(10**6):06d}"
-                record = {
-                    "h": self._h(email, code),
-                    "exp": now + ttl,
-                    "tries": 0,
-                    "sent": now,
-                }
-                r.set(f"auth:otp:{email}", json.dumps(record), ex=ttl)
-
-                # Record rate-limiting events in Redis
+                def counts(kind, key):
+                    k = keys[kind] + key
+                    r.zremrangebyscore(k, 0, now - 3600)
+                    last = r.zrange(k, -1, -1, withscores=True)
+                    return r.zcard(k), (now - last[0][1]) if last else None
+                self._limits(email, ip, now, counts)
+                r.set(f"auth:otp:{email}:{code.challenge}", json.dumps(record), ex=ttl)
                 token = f"{now}:{secrets.token_hex(4)}"
-                r.zadd(f"auth:rate:email:{email}", {token: now})
-                r.expire(f"auth:rate:email:{email}", 3600)
-                r.zadd(f"auth:rate:ip:{ip}", {token: now})
-                r.expire(f"auth:rate:ip:{ip}", 3600)
-
-                with self.lock:
-                    self.rec[email] = record
-
+                for kind, key in (("pair", f"{email}|{self._ipk(ip)}"), ("email", email), ("ip", ip)):
+                    r.zadd(keys[kind] + key, {token: now})
+                    r.expire(keys[kind] + key, 3600)
                 return code
             except RateLimited:
                 raise
             except Exception as e:
                 logger.warning("Redis issue failed, falling back to memory: %s", e)
 
-        # In-memory fallback
         with self.lock:
-            rec = self.rec.get(email)
-            if rec:
-                elapsed = now - rec.get("sent", 0)
-                if elapsed < C.OTP_RESEND_SECS:
-                    rem = max(1, int(round(C.OTP_RESEND_SECS - elapsed)))
-                    raise RateLimited(f"Please wait {rem}s before requesting another code.", resend_in=rem)
-            if len(self._recent(self.by_email, email, now)) >= C.OTP_MAX_PER_HOUR:
-                raise RateLimited("too many codes requested for this address")
-            if len(self._recent(self.by_ip, ip, now)) >= C.OTP_MAX_PER_IP_HOUR:
-                raise RateLimited("too many requests from this network address")
-            code = f"{secrets.randbelow(10**6):06d}"
-            record = {"h": self._h(email, code), "exp": now + ttl, "tries": 0, "sent": now}
-            self.rec[email] = record
-            self.by_email[email].append(now)
-            self.by_ip[ip].append(now)
+            logs = {"pair": self.by_email, "email": self.by_email, "ip": self.by_ip}
+            def counts(kind, key):
+                lst = self._recent(logs[kind], f"{kind}:{key}", now)
+                return len(lst), (now - lst[-1]) if lst else None
+            self._limits(email, ip, now, counts)
+            self.rec[(email, code.challenge)] = record
+            for kind, key in (("pair", f"{email}|{self._ipk(ip)}"), ("email", email), ("ip", ip)):
+                logs[kind][f"{kind}:{key}"].append(now)
             return code
 
-    def revoke(self, email: str):
+    def revoke(self, email: str, challenge: str = ""):
         r = self._get_redis()
         if r is not None:
             try:
-                r.delete(f"auth:otp:{email}")
+                r.delete(f"auth:otp:{email}:{challenge}")
             except Exception as e:
                 logger.warning("Redis revoke failed: %s", e)
         with self.lock:
-            self.rec.pop(email, None)
+            self.rec.pop((email, challenge), None)
 
-    def check_verify_rate_limit(self, ip: str, email: str):
-        """Strict rate limit on OTP verification attempts: max 10 attempts per minute per IP, max 10 per email."""
+    def check_verify_rate_limit(self, ip: str, email: str = ""):
+        """Max 10 verification attempts per minute per IP. (No per-email limit here: it would let anyone who knows
+        an address lock its owner out; guesses per email are bounded in verify().)"""
         r = self._get_redis()
         now = self.clock()
         if r is not None:
             try:
-                # 1. IP rate limit: max 10 attempts per minute
                 r.zremrangebyscore(f"auth:rate:verify:ip:{ip}", 0, now - 60)
                 if r.zcard(f"auth:rate:verify:ip:{ip}") >= 10:
                     raise RateLimited("Too many verification attempts from this IP address. Please wait 60 seconds.")
-
-                # 2. Email rate limit: max 10 attempts per minute
-                r.zremrangebyscore(f"auth:rate:verify:email:{email}", 0, now - 60)
-                if r.zcard(f"auth:rate:verify:email:{email}") >= 10:
-                    raise RateLimited("Too many verification attempts for this account. Please wait 60 seconds.")
-
-                token = f"{now}:{secrets.token_hex(4)}"
-                r.zadd(f"auth:rate:verify:ip:{ip}", {token: now})
+                r.zadd(f"auth:rate:verify:ip:{ip}", {f"{now}:{secrets.token_hex(4)}": now})
                 r.expire(f"auth:rate:verify:ip:{ip}", 60)
-                r.zadd(f"auth:rate:verify:email:{email}", {token: now})
-                r.expire(f"auth:rate:verify:email:{email}", 60)
                 return
             except RateLimited:
                 raise
             except Exception as e:
                 logger.warning("Redis verify rate limit check failed, falling back to memory: %s", e)
-
-        # In-memory fallback
         with self.lock:
             recent_ip = [t for t in self.by_ip.get(f"v:{ip}", []) if now - t < 60]
             if len(recent_ip) >= 10:
@@ -307,50 +293,38 @@ end
             recent_ip.append(now)
             self.by_ip[f"v:{ip}"] = recent_ip
 
-            recent_em = [t for t in self.by_email.get(f"v:{email}", []) if now - t < 60]
-            if len(recent_em) >= 10:
-                raise RateLimited("Too many verification attempts for this account. Please wait 60 seconds.")
-            recent_em.append(now)
-            self.by_email[f"v:{email}"] = recent_em
-
-    def verify(self, email: str, code: str) -> bool:
+    def verify(self, email: str, code: str, challenge: str = "") -> bool:
+        """True only for the right code of a pending challenge requested from this browser."""
+        if not challenge:
+            return False
         r = self._get_redis()
         now = self.clock()
+        candidate_hash = self._h(email, code) if (code and re.fullmatch(r"\d{6}", code)) else ""
 
         if r is not None:
             try:
-                candidate_hash = self._h(email, code) if (code and re.fullmatch(r"\d{6}", code)) else ""
-                res = r.eval(self.LUA_VERIFY_SCRIPT, 1, f"auth:otp:{email}", candidate_hash, C.OTP_MAX_TRIES, now)
-                res = int(res)
-                if res == 1:
-                    with self.lock:
-                        self.rec.pop(email, None)
-                    return True
-                elif res == 0:
-                    with self.lock:
-                        if email in self.rec:
-                            self.rec[email]["tries"] = self.rec[email].get("tries", 0) + 1
-                            if self.rec[email]["tries"] >= C.OTP_MAX_TRIES:
-                                self.rec.pop(email, None)
-                    return False
-                else:
-                    # -1 (not found / corrupt) or -2 (expired)
-                    with self.lock:
-                        self.rec.pop(email, None)
-                    return False
+                res = int(r.eval(self.LUA_VERIFY_SCRIPT, 2, f"auth:otp:{email}:{challenge}", f"auth:fail:{email}",
+                                 candidate_hash, C.OTP_MAX_TRIES, now, C.OTP_MAX_FAILS_PER_EMAIL_HOUR,
+                                 f"{now}:{secrets.token_hex(4)}"))
+                return res == 1
             except Exception as e:
                 logger.warning("Redis verify failed, falling back to memory: %s", e)
 
-        # In-memory fallback (thread-safe within single process via self.lock)
         with self.lock:
-            rec = self.rec.get(email)
+            key = (email, challenge)
+            rec = self.rec.get(key)
             if not rec or now > rec.get("exp", 0):
-                self.rec.pop(email, None)
+                self.rec.pop(key, None)
+                return False
+            fails = self._recent(self.by_email, f"fail:{email}", now)
+            if rec.get("tries", 0) > 0 and len(fails) >= C.OTP_MAX_FAILS_PER_EMAIL_HOUR:
                 return False
             rec["tries"] = rec.get("tries", 0) + 1
-            ok = bool(re.fullmatch(r"\d{6}", code or "")) and hmac.compare_digest(rec["h"], self._h(email, code))
+            ok = bool(candidate_hash) and hmac.compare_digest(rec["h"], candidate_hash)
+            if not ok:
+                fails.append(now)
             if ok or rec["tries"] >= C.OTP_MAX_TRIES:
-                self.rec.pop(email, None)
+                self.rec.pop(key, None)
             return ok
 
 otp_store = OtpStore()

@@ -70,7 +70,7 @@ dump.rdb
 dump_final.rdb
 
 # Scraped Data
-data/
+/data/
 data/raw_pdfs/
 *.pdf
 *.json
@@ -94,3 +94,11 @@ Thumbs.db
 tests/test_cache_intent_guard.py
 tests/test_cache_intent_guard_extensive.py
 tests/test_refusal_mixed.py
+tests/test_injection_redteam_examples.py
+
+# Committed evaluation data (DEFECT-32): NFR-7 injection suites and the classifier weights
+!tests/data/
+!tests/data/injection_eval/**
+!pipeline/data/
+!pipeline/data/injection_classifier.json
+.dev_session_secret

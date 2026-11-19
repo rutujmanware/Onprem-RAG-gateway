@@ -21,6 +21,8 @@ import hashlib
 import hmac
 import secrets
 from pathlib import Path
+
+from gateway.auth.internal import consteq
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -64,6 +66,7 @@ DEFAULT_TTL_SECONDS = int(os.getenv("SEMANTIC_CACHE_TTL", str(4 * 3600)))  # 4 h
 # "Regenerate" for cached answers: single-use tokens issued only with cache hits.
 REGEN_PREFIX = os.getenv("REDIS_REGEN_KEY_PREFIX", "semregen:")
 REGEN_TOKEN_TTL = int(os.getenv("REGEN_TOKEN_TTL", "900"))          # token valid for 15 minutes
+REGEN_PROMPT_LOG_CHARS = 500   # DEFECT-60: matched question kept in a token (the feedback log reads 500 characters)
 REGEN_MAX_PER_HOUR = int(os.getenv("REGEN_MAX_PER_HOUR", "20"))     # per user
 # Index names whose 'owner' TAG field is known to exist in this process (see _ensure_owner_field).
 _OWNER_FIELD_READY: set = set()
@@ -276,6 +279,14 @@ class RedisSemanticCache:
             logger.warning("Async index init warning: %s", e)
             return False
 
+    GENERATION_FAILURE_MARKERS = (
+        "[generation was interrupted",
+        "answering service is temporarily unavailable",
+        "partial response recorded",
+        "[inference complete",
+        "[inference note",
+        "[generation note",
+    )
     INSUFFICIENT_DATA_PHRASES = (
         "insufficient information",
         "insufficient data",
@@ -347,6 +358,10 @@ class RedisSemanticCache:
             return False, f"Answer is too short ({len(ans)} chars) to be cacheable"
 
         ans_lower = ans.lower()
+        # DEFECT-36: generation-failure placeholders are never answers (current and earlier wordings)
+        for marker in cls.GENERATION_FAILURE_MARKERS:
+            if marker in ans_lower:
+                return False, f"Response is a generation-failure placeholder: '{marker}'"
         for phrase in cls.INSUFFICIENT_DATA_PHRASES:
             if phrase in ans_lower:
                 return False, f"Response indicates insufficient data / unretrieved documents: '{phrase}'"
@@ -573,7 +588,7 @@ class RedisSemanticCache:
         """Synchronously store query and generated answer in Redis semantic cache."""
         cacheable, cache_reason = self.is_cacheable_response(response)
         if not cacheable:
-            logger.info("Semantic cache STORE bypassed for query '%s': %s", query, cache_reason)
+            logger.info("Semantic cache STORE bypassed for query %r: %s", query, cache_reason)
             return False
 
         if isinstance(response, dict):
@@ -601,8 +616,8 @@ class RedisSemanticCache:
             if owner_tag:
                 payload["owner"] = owner_tag  # semantic lookups only consider entries with the asking user's tag (NFR-6)
 
-            self.sync_client.hset(key, mapping=payload)
-            self.sync_client.expire(key, ttl)
+            # one transaction: an entry can never be left without its TTL (DEFECT-48)
+            self.sync_client.pipeline(transaction=True).hset(key, mapping=payload).expire(key, ttl).execute()
 
             # Store exact hash key for sub-millisecond fast path
             try:
@@ -633,7 +648,7 @@ class RedisSemanticCache:
         """Asynchronously store query and generated answer in Redis semantic cache."""
         cacheable, cache_reason = self.is_cacheable_response(response)
         if not cacheable:
-            logger.info("Async semantic cache ASTORE bypassed for query '%s': %s", query, cache_reason)
+            logger.info("Async semantic cache ASTORE bypassed for query %r: %s", query, cache_reason)
             return False
 
         if isinstance(response, dict):
@@ -663,8 +678,7 @@ class RedisSemanticCache:
             if owner_tag:
                 payload["owner"] = owner_tag  # semantic lookups only consider entries with the asking user's tag (NFR-6)
 
-            await self.async_client.hset(key, mapping=payload)
-            await self.async_client.expire(key, ttl)
+            await self.async_client.pipeline(transaction=True).hset(key, mapping=payload).expire(key, ttl).execute()
 
             # Store exact hash key for sub-millisecond fast path
             try:
@@ -701,9 +715,27 @@ class RedisSemanticCache:
     def _regen_token_key(token: str) -> str:
         return f"{REGEN_PREFIX}tok:{hashlib.sha256(token.encode('utf-8')).hexdigest()}"
 
+    def _regen_live_key(self, owner, query) -> str:
+        """DEFECT-60: the one live token of this user for this question."""
+        return f"{REGEN_PREFIX}live:{self.owner_tag(owner)}:{self._query_hash(query)}"
+
+    # DEFECT-60: issuing replaces the user's previous token for the same question (one live token per user and
+    # question), atomically. KEYS: live index, new token key; ARGV: record, ttl.
+    _REGEN_ISSUE = """
+local old = redis.call('GET', KEYS[1])
+if old and old ~= KEYS[2] then redis.call('DEL', old) end
+redis.call('SET', KEYS[2], ARGV[1], 'EX', ARGV[2])
+redis.call('SET', KEYS[1], KEYS[2], 'EX', ARGV[2])
+return 1
+"""
+
     def _regen_record(self, owner, query, kind, matched_prompt, similarity) -> str:
+        # DEFECT-60: bounded size. The matched question is kept only as far as the feedback log reads it (500
+        # characters) and as a hash for the shared-entry eviction count; UTF-8, not JSON escapes (each '∑' was 6 bytes).
+        mp = matched_prompt or ""
         return json.dumps({"owner": self.owner_tag(owner), "query": self._query_hash(query), "kind": kind,
-                           "matched_prompt": matched_prompt or "", "similarity": similarity, "issued_at": time.time()})
+                           "matched_prompt": mp[:REGEN_PROMPT_LOG_CHARS], "matched_hash": self._query_hash(mp),
+                           "similarity": similarity, "issued_at": time.time()}, ensure_ascii=False)
 
     def _check_regen_record(self, raw, owner, query) -> Optional[Dict[str, Any]]:
         if not raw:
@@ -713,7 +745,7 @@ class RedisSemanticCache:
         except Exception:
             return None
         tag = self.owner_tag(owner)
-        if not tag or not secrets.compare_digest(str(rec.get("owner", "")), tag):
+        if not tag or not consteq(str(rec.get("owner", "")), tag):   # DEFECT-54: never raises
             return None
         if rec.get("query") != self._query_hash(query) or rec.get("kind") not in REGEN_KINDS:
             return None
@@ -724,7 +756,8 @@ class RedisSemanticCache:
             return None
         token = secrets.token_urlsafe(24)
         try:
-            self.sync_client.set(self._regen_token_key(token), self._regen_record(owner, query, kind, matched_prompt, similarity), ex=REGEN_TOKEN_TTL)
+            self.sync_client.eval(self._REGEN_ISSUE, 2, self._regen_live_key(owner, query), self._regen_token_key(token),
+                                  self._regen_record(owner, query, kind, matched_prompt, similarity), REGEN_TOKEN_TTL)
             return token
         except Exception as e:
             logger.warning("Could not issue regenerate token: %s", e)
@@ -735,7 +768,9 @@ class RedisSemanticCache:
             return None
         token = secrets.token_urlsafe(24)
         try:
-            await self.async_client.set(self._regen_token_key(token), self._regen_record(owner, query, kind, matched_prompt, similarity), ex=REGEN_TOKEN_TTL)
+            await self.async_client.eval(self._REGEN_ISSUE, 2, self._regen_live_key(owner, query),
+                                         self._regen_token_key(token),
+                                         self._regen_record(owner, query, kind, matched_prompt, similarity), REGEN_TOKEN_TTL)
             return token
         except Exception as e:
             logger.warning("Could not issue regenerate token: %s", e)
@@ -768,9 +803,7 @@ class RedisSemanticCache:
             return False
         try:
             key = self._quota_key(owner)
-            n = self.sync_client.incr(key)
-            if n == 1:
-                self.sync_client.expire(key, 3600)
+            n = self.sync_client.pipeline(transaction=True).incr(key).expire(key, 3600, nx=True).execute()[0]
             return n <= REGEN_MAX_PER_HOUR
         except Exception:
             return False  # fail closed
@@ -780,16 +813,15 @@ class RedisSemanticCache:
             return False
         try:
             key = self._quota_key(owner)
-            n = await self.async_client.incr(key)
-            if n == 1:
-                await self.async_client.expire(key, 3600)
+            n = (await self.async_client.pipeline(transaction=True).incr(key).expire(key, 3600, nx=True).execute())[0]
             return n <= REGEN_MAX_PER_HOUR
         except Exception:
             return False  # fail closed
 
-    def record_shared_regen(self, matched_prompt, owner) -> bool:
-        """Count distinct users who regenerated a SHARED exact entry; evict it at REGEN_EVICT_USERS. Returns True if evicted."""
-        h = self._query_hash(matched_prompt)
+    def record_shared_regen(self, matched_prompt, owner, matched_hash: Optional[str] = None) -> bool:
+        """Count distinct users who regenerated a SHARED exact entry; evict it at REGEN_EVICT_USERS. Returns True if evicted.
+        `matched_hash` (from the token, DEFECT-60) identifies the entry when the stored prompt text was shortened."""
+        h = matched_hash or self._query_hash(matched_prompt)
         flags = f"{REGEN_PREFIX}flags:{h}"
         try:
             self.sync_client.sadd(flags, self.owner_tag(owner))
@@ -802,8 +834,8 @@ class RedisSemanticCache:
             logger.warning("Could not record shared regenerate: %s", e)
         return False
 
-    async def arecord_shared_regen(self, matched_prompt, owner) -> bool:
-        h = self._query_hash(matched_prompt)
+    async def arecord_shared_regen(self, matched_prompt, owner, matched_hash: Optional[str] = None) -> bool:
+        h = matched_hash or self._query_hash(matched_prompt)
         flags = f"{REGEN_PREFIX}flags:{h}"
         try:
             await self.async_client.sadd(flags, self.owner_tag(owner))
@@ -1049,7 +1081,7 @@ class RedisSemanticCache:
                 del_count = self.sync_client.delete(*keys_to_delete)
                 purged += del_count
 
-            logger.info("Purged %d semantic cache entries for query '%s' at threshold >= %.2f", purged, query, threshold)
+            logger.info("Purged %d semantic cache entries for query %r at threshold >= %.2f", purged, query, threshold)
             return purged
         except Exception as e:
             logger.warning("Error during semantic cache purge: %s", e)
@@ -1130,7 +1162,7 @@ class RedisSemanticCache:
                 del_count = await self.async_client.delete(*keys_to_delete)
                 purged += del_count
 
-            logger.info("Async purged %d semantic cache entries for query '%s' at threshold >= %.2f", purged, query, threshold)
+            logger.info("Async purged %d semantic cache entries for query %r at threshold >= %.2f", purged, query, threshold)
             return purged
         except Exception as e:
             logger.warning("Error during async semantic cache purge: %s", e)
@@ -1228,8 +1260,74 @@ class RedisSemanticCache:
         if has_neg_a != has_neg_b:
             return True, f"Polarity / Negation mismatch: {has_neg_a} vs {has_neg_b}"
 
-        # 3. Intent equivalence (red-team finding: semantic cache intent collisions)
+        # 3. Near-spelling entity swap (DEFECT-40): graphane vs graphene, neutrons vs neurons embed almost
+        #    identically, but both are real terms; a typo of the earlier question (not a real word) still hits.
+        swap = _near_spelling_swap(words_a, words_b)
+        if swap:
+            return True, f"Different terms with similar spelling: {swap[0]!r} vs {swap[1]!r}"
+
+        # 4. Intent equivalence (red-team finding: semantic cache intent collisions)
         return check_intent_conflict(query_a, query_b)
+
+
+def _edit_distance_le2(a: str, b: str) -> bool:
+    if abs(len(a) - len(b)) > 2:
+        return False
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i] + [0] * len(b)
+        for j, cb in enumerate(b, 1):
+            cur[j] = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb))
+        if min(cur) > 2:
+            return False
+        prev = cur
+    return prev[-1] <= 2
+
+
+def _same_lemma(a: str, b: str) -> bool:
+    """Inflections of one word (corrode/corrodes/corroded, thesis/theses, engine/engines) are not different terms."""
+    try:
+        from lemminflect import getAllLemmas
+        la = {l for v in getAllLemmas(a).values() for l in v} | {a}
+        lb = {l for v in getAllLemmas(b).values() for l in v} | {b}
+        if la & lb:
+            return True
+    except Exception:
+        pass
+    strip = lambda w: w[:-2] if w.endswith("es") else (w[:-1] if w.endswith("s") else w)
+    return strip(a) == strip(b)
+
+
+# Pairs of everyday words (effect/affect, dependent/dependence) are left to the other rules; the swap rule is for
+# technical terms: the rarer word of the pair must be below this English frequency (neutrons 0.7 M, neurons 3.5 M).
+SWAP_MAX_COMMON_FREQ = 5_000_000
+
+
+def _english_freq(w: str) -> int:
+    from pipeline.retriever import RedisChunkRetriever
+    return RedisChunkRetriever._english_freq(w)
+
+
+def _real_word(w: str) -> bool:
+    from pipeline.text_processing import typo_normalizer as tn
+    if tn._is_english(w):
+        return True
+    try:
+        return tn._in_corpus(w)
+    except tn.CorpusUnavailable:
+        return True     # cannot tell: treat as real, so the hit is refused (a fresh answer is always safe)
+
+
+def _near_spelling_swap(words_a, words_b):
+    only_a = [w for w in words_a - words_b if len(w) >= 4 and w.isalpha()]
+    only_b = [w for w in words_b - words_a if len(w) >= 4 and w.isalpha()]
+    for a in only_a:
+        for b in only_b:
+            if (_edit_distance_le2(a, b) and not _same_lemma(a, b)
+                    and min(_english_freq(a), _english_freq(b)) < SWAP_MAX_COMMON_FREQ
+                    and _real_word(a) and _real_word(b)):
+                return a, b
+    return None
 
 
 # ---------------------------------------------------------------------------

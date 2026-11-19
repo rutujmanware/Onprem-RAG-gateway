@@ -36,14 +36,21 @@ from gateway.cache.redis_semantic_cache import RedisSemanticCache
 GATEWAY_URL = "http://127.0.0.1:8080/query"
 CLEAR_URL = "http://127.0.0.1:8080/cache/clear"
 STATS_URL = "http://127.0.0.1:8080/cache/stats"
+try:  # ADMIN_API_KEY for the admin routes (DEFECT-29)
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+import os
+ADMIN_HEADERS = {"X-Admin-Key": os.getenv("ADMIN_API_KEY", "")}
 
 def clear_cache():
-    req = urllib.request.Request(CLEAR_URL, data=b"{}", headers={"Content-Type": "application/json"}, method="POST")
+    req = urllib.request.Request(CLEAR_URL, data=b"{}", headers={"Content-Type": "application/json", **ADMIN_HEADERS}, method="POST")
     with urllib.request.urlopen(req) as resp:
         return json.loads(resp.read().decode())
 
 def get_cache_stats():
-    req = urllib.request.Request(STATS_URL, method="GET")
+    req = urllib.request.Request(STATS_URL, headers=ADMIN_HEADERS, method="GET")
     with urllib.request.urlopen(req) as resp:
         return json.loads(resp.read().decode())
 

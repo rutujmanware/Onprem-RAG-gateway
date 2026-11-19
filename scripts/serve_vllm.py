@@ -121,6 +121,10 @@ def main() -> None:
     except ValueError as exc:
         sys.exit(f"[serve_vllm] refusing to start: {exc}")
 
+    _key = (os.getenv("VLLM_API_KEY") or args.api_key or "").strip()
+    if _key and (len(_key) < 32 or "<" in _key or "GENERATE" in _key.upper() or "CHANGE" in _key.upper()):
+        sys.exit("[serve_vllm] refusing to start: VLLM_API_KEY looks like a placeholder or is shorter than "
+                 "32 characters (DEFECT-48). Generate one: python -c 'import secrets;print(secrets.token_hex(32))'")
     if not (os.getenv("VLLM_API_KEY") or args.api_key):
         sys.exit(
             "[serve_vllm] refusing to start: no API key. Set VLLM_API_KEY in .env "

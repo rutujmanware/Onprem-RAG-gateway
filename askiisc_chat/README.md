@@ -74,6 +74,8 @@ Enforcement is in the Redis query (`@access:{public}`), not in the prompt. If a 
 
 ## Running with the team gateway (real answers)
 `BACKEND=gateway` forwards each question to the team gateway (`POST /query`, stream=true), which routes (two-tower MLP), retrieves from Redis and
+
+The signed-in user is forwarded as `X-Internal-User` with an HMAC signature (`X-Internal-Auth`); the gateway refuses unsigned identities (HTTP 403). The standalone app must therefore use the same `SESSION_SECRET` (or `INTERNAL_AUTH_KEY`) as the gateway.
 generates with the CPU SLM or the 7B. This app keeps the login, the network gate and the chat page. Copy `app.env.example` to `app.env`, set
 `SESSION_SECRET`, then `./app.sh start`; read the demo sign-in code with `./app.sh code`. Append `?debug=1` to the page URL to see routing details.
 Limits of this mode: no chat history and no per-thesis filter (the gateway's /query takes only the question).

@@ -40,7 +40,7 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -242,17 +242,32 @@ app = FastAPI(
 )
 
 
+# DEFECT-45: like vLLM, the CPU model server requires a key, so other users of this shared host cannot use it
+# directly (no grounding, no injection fence) or occupy all of its slots. /healthz stays open for monitoring.
+SLM_API_KEY = os.getenv("SLM_API_KEY", "").strip()
+
+
+def require_api_key(request: Request) -> None:
+    if not SLM_API_KEY:
+        return
+    import hmac
+    auth = request.headers.get("authorization", "")
+    token = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
+    if not (token and hmac.compare_digest(token, SLM_API_KEY)):
+        raise HTTPException(status_code=401, detail="Missing or invalid API key")
+
+
 class ChatMessage(BaseModel):
-    role: str
-    content: str
+    role: str = Field(..., max_length=20)
+    content: str = Field(..., max_length=40000)
 
 
 class ChatCompletionRequest(BaseModel):
     model: Optional[str] = DEFAULT_MODEL_NAME
-    messages: List[ChatMessage]
-    temperature: Optional[float] = 0.7
-    top_p: Optional[float] = 0.8
-    max_tokens: Optional[int] = Field(default=512, alias="max_tokens")
+    messages: List[ChatMessage] = Field(..., max_length=50)
+    temperature: Optional[float] = Field(default=0.7, ge=0.0, le=2.0)
+    top_p: Optional[float] = Field(default=0.8, gt=0.0, le=1.0)
+    max_tokens: Optional[int] = Field(default=512, alias="max_tokens", ge=1, le=4096)
     stream: Optional[bool] = False
 
 
@@ -272,7 +287,7 @@ def healthz():
     }
 
 
-@app.get("/v1/models")
+@app.get("/v1/models", dependencies=[Depends(require_api_key)])
 def list_models():
     return {
         "object": "list",
@@ -320,7 +335,10 @@ async def _sse(stream: GenerationStream, p: SlotPool):
                 yield _chunk(cmpl_id, created, {"content": delta}, None)
         except Exception as err:
             print(f"⚠️ [SLM] Error during stream: {err}")
-            yield _chunk(cmpl_id, created, {"content": f"\n\n[Inference note: {err}]"}, "error")
+            # DEFECT-46: signal the failure (finish_reason "error"), never send the error text as answer content
+            yield _chunk(cmpl_id, created, {}, "error")
+            yield "data: [DONE]\n\n"
+            return
         yield _chunk(cmpl_id, created, {}, "stop")
         yield "data: [DONE]\n\n"
     finally:
@@ -338,7 +356,7 @@ def _busy_response() -> JSONResponse:
     )
 
 
-@app.post("/v1/chat/completions")
+@app.post("/v1/chat/completions", dependencies=[Depends(require_api_key)])
 async def chat_completions(req: ChatCompletionRequest):
     if pool is None:
         raise HTTPException(status_code=503, detail="SLM server initializing")
@@ -375,7 +393,8 @@ async def chat_completions(req: ChatCompletionRequest):
         async for delta in stream:
             parts.append(delta)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Generation failed: {e}")
+        print(f"⚠️ [SLM] Generation failed: {e}")
+        raise HTTPException(status_code=500, detail="Generation failed")
     finally:
         stream.stop()
         _log_end(stream, pool)
@@ -408,7 +427,7 @@ def main():
     os.environ["SLM_SLOTS"] = str(args.slots)
     print(f"🚀 Starting CPU SLM Server on http://{args.host}:{args.port} (Slots: {args.slots}, Threads/slot: {args.threads})")
     # One process on purpose: the slot pool is the scheduler (see module docstring).
-    uvicorn.run(app, host=args.host, port=args.port, workers=1, reload=False)
+    uvicorn.run(app, host=args.host, port=args.port, workers=1, reload=False, proxy_headers=False)  # DEFECT-44
 
 
 if __name__ == "__main__":
