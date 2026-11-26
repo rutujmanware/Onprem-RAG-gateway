@@ -176,13 +176,17 @@ ls redis-stack-server-7.2.0-v9/bin/redis-stack-server     # must exist; rename t
 The configuration Redis runs with is generated from `.env` at start-up (`run/redis.conf`, readable by you only): password from `REDIS_PASSWORD`, loopback only, port `REDIS_PORT`, snapshot never rewritten. The `etc/redis-stack.conf` inside the download is not used.
 
 ### Step 6: Load the thesis corpus
-The pre-built snapshot `dump_final.rdb` (12.67 GB, 2,261,664 chunks with their vector index) is **not stored in Git**. Its download link is shared personally by the project maintainers; ask them for it, download the file and place it here:
+The pre-built snapshot `dump_final.rdb` (12.67 GB, 2,261,664 chunks with their vector index) is **not stored in Git**. Its download link is shared personally by the project maintainers; ask them for it, download the file and place it in **either** of these folders (found automatically, as `dump_final.rdb` or `dump.rdb`):
 ```text
 Onprem-RAG-gateway/
-└── redis_server_data/
-    └── dump_final.rdb       <-- 12.67 GB snapshot
+├── redis_server_data/
+│   └── dump_final.rdb                  <-- 12.67 GB snapshot (recommended)
+└── redis-stack-server-7.2.0-v9/var/db/redis-stack/
+    └── dump.rdb                        <-- or here, Redis Stack's own data folder
 ```
-*(No snapshot? Start Redis with an empty `redis_server_data/` and build the index yourself, see [§6](#6-building-the-corpus-yourself-ingestion).)*
+Anywhere else: set `REDIS_DATA_DIR` (folder) and `REDIS_DBFILENAME` (file name) in `.env`.
+
+*(No snapshot? Build the index yourself, see [§6](#6-building-the-corpus-yourself-ingestion). Without one, `make redis-up` / `make prod-up` refuse to start Redis rather than run with an empty database.)*
 
 Start Redis and wait for the snapshot to load (**35–50 minutes**, depending on disk speed):
 ```bash
@@ -331,7 +335,7 @@ make serve-router    # optional standalone service on port 8090 (the gateway use
 
 ## 6. Building the Corpus Yourself (Ingestion)
 
-Use this instead of the snapshot (step 6), or to add documents. Redis must be running (`make redis-up`; with an empty `redis_server_data/` it starts in seconds), and the embedding model must be downloaded (step 4). The index `rag_documents_idx` is created automatically on the first ingest.
+Use this instead of the snapshot (step 6), or to add documents. Redis must be running: start it empty on purpose with `REDIS_ALLOW_EMPTY=1 make redis-up` (it starts in seconds), and the embedding model must be downloaded (step 4). The index `rag_documents_idx` is created automatically on the first ingest.
 
 ### Option A: Streaming ingestion from IISc DSpace
 Downloads each thesis, extracts layout-aware text, chunks it (512 tokens with 64 overlap), embeds it with `all-MiniLM-L6-v2`, indexes it into RediSearch, and deletes the PDF to save disk space:
@@ -480,6 +484,8 @@ After changing `.env`, apply it with `make prod-restart` (or `make prod-restart-
 | :--- | :--- | :--- |
 | **`make` uses the wrong Python / `ModuleNotFoundError`** | `make` picks `.venv/bin/python`, else the active conda env, else `python3`. | Activate your environment, or put `PYTHON := <path to python>` in `Makefile.local` (ignored by Git), or pass it on the command line (`make test PYTHON=...`). |
 | **`REDIS_PASSWORD is empty`** on `make redis-up` | `.env` not created or secrets not generated. | Run step 3a. |
+| **`No thesis snapshot found`** on `make redis-up` / `make prod-up` | No `dump_final.rdb` / `dump.rdb` in `redis_server_data/`, in `redis-stack-server-7.2.0-v9/var/db/redis-stack/`, or at `REDIS_DATA_DIR` / `REDIS_DBFILENAME`. | Put the snapshot in one of those folders (step 6). To start empty on purpose: `REDIS_ALLOW_EMPTY=1 make redis-up`. |
+| **`/ready` says `redis_thesis_index: false` although Redis is up** | Redis started without loading the snapshot (an empty database), or is still loading it. | `make redis-status`: `loading:1` means wait. If Redis came up within seconds, it did not load the snapshot: `make redis-down`, then `make redis-up` and check that it prints `loading <snapshot path>`. |
 | **`NOAUTH Authentication required`** | `redis-cli` or a script started without the password. | `export REDISCLI_AUTH="$(grep '^REDIS_PASSWORD=' .env \| cut -d= -f2)"`. `REDIS_URL` in `.env` must be `redis://:<REDIS_PASSWORD>@localhost:6379/0`. |
 | **`LOADING Redis is loading the dataset in memory`** | Redis is reading `dump_final.rdb` into RAM. | **Do not stop Redis.** `make redis-watch` shows progress and ETA. Wait for `loading:0`. |
 | **`unknown command 'FT.SEARCH'`** | Plain Redis is running on 6379 instead of Redis Stack. | Stop it, then `make redis-up`. |

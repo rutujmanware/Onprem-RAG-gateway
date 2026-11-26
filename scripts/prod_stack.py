@@ -33,7 +33,9 @@ from typing import Dict, Optional, Tuple
 
 try:
     from dotenv import load_dotenv
-    load_dotenv()
+    # .env wins over variables exported in the shell, as with make (-include .env); a stale export in ~/.bashrc
+    # must not start Redis with a password the gateway's .env does not have
+    load_dotenv(Path(__file__).resolve().parent.parent / ".env", override=True)
 except ImportError:
     pass
 
@@ -45,9 +47,12 @@ PYTHON_BIN = sys.executable
 # Default configuration
 REDIS_SERVER_BIN = ROOT_DIR / "redis-stack-server-7.2.0-v9" / "bin" / "redis-stack-server"
 REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
-# The thesis snapshot: <REDIS_DATA_DIR>/<REDIS_DBFILENAME>, relative to the repository root unless absolute
+# The thesis snapshot: <REDIS_DATA_DIR>/<REDIS_DBFILENAME> when set (relative to the repository root unless
+# absolute); otherwise the first that exists of SNAPSHOT_DIRS x SNAPSHOT_NAMES (find_snapshot).
 REDIS_DATA_DIR = ROOT_DIR / os.getenv("REDIS_DATA_DIR", "redis_server_data")
 REDIS_DBFILENAME = os.getenv("REDIS_DBFILENAME", "dump_final.rdb")
+SNAPSHOT_DIRS = (ROOT_DIR / "redis_server_data", ROOT_DIR / "redis-stack-server-7.2.0-v9" / "var" / "db" / "redis-stack")
+SNAPSHOT_NAMES = ("dump_final.rdb", "dump.rdb")
 RUN_DIR = ROOT_DIR / "run"
 VLLM_PORT = 8000
 SLM_PORT = 8082
@@ -127,19 +132,53 @@ def check_port_health(port: int, path: str = "/healthz") -> Tuple[str, str]:
     return "DOWN", "Unreachable"
 
 
-def redis_start_cmd() -> list[str]:
-    """Redis Stack with this repository's settings. Nothing depends on the config file shipped inside the Redis
-    download: settings go into run/redis.conf (mode 600, so the password never shows in the process list), and the
-    data directory is passed last because the redis-stack-server wrapper sets its own --dir after the config file."""
+def find_snapshot() -> Optional[Path]:
+    """The thesis snapshot to load: the configured REDIS_DATA_DIR / REDIS_DBFILENAME first, then dump_final.rdb or
+    dump.rdb in redis_server_data/ or in the Redis Stack data folder (where Redis Stack keeps its own dump.rdb)."""
+    seen, candidates = set(), []
+    for d in (REDIS_DATA_DIR, *SNAPSHOT_DIRS):
+        for n in (REDIS_DBFILENAME, *SNAPSHOT_NAMES):
+            c = d / n
+            if c not in seen:
+                seen.add(c)
+                candidates.append(c)
+    return next((c for c in candidates if c.is_file()), None)
+
+
+def _rel(path: Path) -> str:
+    try:
+        return str(path.relative_to(ROOT_DIR))
+    except ValueError:
+        return str(path)
+
+
+def redis_start_cmd() -> tuple[list[str], Optional[Path]]:
+    """Redis Stack with this repository's settings, and the snapshot it will load (None: empty on purpose).
+    Nothing depends on the config file shipped inside the Redis download: settings go into run/redis.conf (mode 600,
+    so the password never shows in the process list), and the data directory is passed last because the
+    redis-stack-server wrapper sets its own --dir after the config file."""
     password = os.getenv("REDIS_PASSWORD", "")
     if not password:
         sys.exit("REDIS_PASSWORD is empty: set it in .env before starting Redis (README, step 3).")
     if not REDIS_SERVER_BIN.exists():
-        sys.exit(f"{REDIS_SERVER_BIN.relative_to(ROOT_DIR)} not found: download Redis Stack first (README, step 5).")
-    if " " in str(REDIS_DATA_DIR):
+        sys.exit(f"{_rel(REDIS_SERVER_BIN)} not found: download Redis Stack first (README, step 5).")
+    snapshot = find_snapshot()
+    if snapshot is None:
+        if os.getenv("REDIS_ALLOW_EMPTY", "0") != "1":
+            # Without a snapshot Redis starts empty: the gateway would run but find no theses (/ready not_ready).
+            looked = ", ".join(_rel(d) + "/" for d in dict.fromkeys((REDIS_DATA_DIR, *SNAPSHOT_DIRS)))
+            sys.exit(f"No thesis snapshot found (looked for {', '.join(dict.fromkeys((REDIS_DBFILENAME, *SNAPSHOT_NAMES)))} "
+                     f"in {looked}): Redis would start with an empty database.\n"
+                     f"Put the snapshot in one of those folders (README, step 6), or set REDIS_DATA_DIR / "
+                     f"REDIS_DBFILENAME to where it is.\n"
+                     f"To start empty on purpose (building the index, README §6): REDIS_ALLOW_EMPTY=1 make redis-up")
+        data_dir, dbfilename = REDIS_DATA_DIR, REDIS_DBFILENAME
+    else:
+        data_dir, dbfilename = snapshot.parent, snapshot.name
+    if " " in str(data_dir):
         sys.exit("The Redis data directory path contains a space, which the redis-stack-server wrapper cannot handle.")
     RUN_DIR.mkdir(parents=True, exist_ok=True)
-    REDIS_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    data_dir.mkdir(parents=True, exist_ok=True)
     quoted = password.replace("\\", "\\\\").replace('"', '\\"')
     conf = RUN_DIR / "redis.conf"
     fd = os.open(conf, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -149,21 +188,22 @@ def redis_start_cmd() -> list[str]:
             "bind 127.0.0.1 -::1\n"          # loopback only
             "protected-mode yes\n"
             f"port {REDIS_PORT}\n"
-            f"dbfilename {REDIS_DBFILENAME}\n"
+            f"dbfilename {dbfilename}\n"
             'save ""\n'                      # read-only snapshot use: never rewrite the 12.67 GB file
             "daemonize no\n"                 # stays under this script's PID tracking; output -> logs/redis.log
         )
     os.chmod(conf, 0o600)
-    return [str(REDIS_SERVER_BIN), str(conf), "--dir", str(REDIS_DATA_DIR)]
+    return [str(REDIS_SERVER_BIN), str(conf), "--dir", str(data_dir)], snapshot
 
 
 def start_redis(pids: Dict[str, int]) -> None:
     redis_st, _ = check_port_health(REDIS_PORT)
     if redis_st == "DOWN":
         if not is_pid_running(pids.get("redis", 0), "redis"):
-            print(f"📦 Starting Redis Stack Server on port {REDIS_PORT} "
-                  f"(snapshot: {REDIS_DATA_DIR.relative_to(ROOT_DIR) if REDIS_DATA_DIR.is_relative_to(ROOT_DIR) else REDIS_DATA_DIR}/{REDIS_DBFILENAME})...")
-            pids["redis"] = start_service("redis", redis_start_cmd())
+            cmd, snapshot = redis_start_cmd()
+            what = f"loading {_rel(snapshot)}, 35-50 min" if snapshot else "EMPTY database (REDIS_ALLOW_EMPTY=1)"
+            print(f"📦 Starting Redis Stack Server on port {REDIS_PORT} ({what})...")
+            pids["redis"] = start_service("redis", cmd)
             time.sleep(1.0)
     elif redis_st == "LOADING":
         print(f"🟡 Redis Stack is running and actively loading 12GB dataset into RAM...")
