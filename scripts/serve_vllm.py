@@ -98,8 +98,18 @@ def _load_env() -> None:
     load_dotenv(ROOT_DIR / ".env", override=False)
 
 
+def disable_usage_stats() -> None:
+    """vLLM reports anonymous usage statistics to stats.vllm.ai by default (GPU type, model architecture, vLLM
+    version, CPU and memory size, then a heartbeat every 10 minutes). No question or answer is sent, but the
+    deployment promises that the model server makes no outside connections, so reporting is switched off here,
+    before vLLM is imported, whatever .env or the shell says (2026-11-28)."""
+    for var in ("VLLM_NO_USAGE_STATS", "VLLM_DO_NOT_TRACK", "DO_NOT_TRACK"):
+        os.environ[var] = "1"
+
+
 def main() -> None:
     _load_env()
+    disable_usage_stats()
 
     import uvloop
     import vllm.entrypoints.openai.api_server as api_server

@@ -242,20 +242,156 @@ function parseSSEBlock(blk) {
 // -------------------------------------------------------------------------
 // UI Helpers
 // -------------------------------------------------------------------------
-const el = (c, t) => {
+// Icons are constant markup written here, never built from server or answer text.
+const ICONS = {
+  send: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5"/><path d="m5 12 7-7 7 7"/></svg>',
+  stop: '<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><rect x="5" y="5" width="14" height="14" rx="2.5"/></svg>',
+  copy: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>',
+  check: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>',
+  trash: '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="m6 6 1 14h10l1-14"/></svg>'
+};
+function icon(name) {
+  const s = document.createElement('span');
+  s.className = 'ic';
+  s.innerHTML = ICONS[name];
+  return s;
+}
+const div = (cls, txt) => {
   const d = document.createElement('div');
-  d.className = c;
-  if (t !== undefined) d.textContent = t;
-  log.append(d);
-  log.scrollTop = log.scrollHeight;
+  if (cls) d.className = cls;
+  if (txt !== undefined) d.textContent = txt;
   return d;
 };
+
+const GEN_LABEL = 'Send code';
+const VER_LABEL = 'Verify &amp; continue';
+const RESEND_LABEL = 'Resend code';
+const MAX_CHATS = 30;     // chats kept in this browser per signed-in user
+const MAX_MSGS = 40;      // messages kept per chat
+const scroller = $('#scroll');
+const mobile = () => window.matchMedia('(max-width: 767px)').matches;
+
+let me = { email: null };
+let chats = [];           // [{ id, title, updated, msgs: [{ role, text, route?, notes?, sources? }] }]
+let currentId = null;
+let busy = false;
+let controller = null;
+
+// Keep the view pinned to the newest text unless the reader has scrolled up.
+let stick = true;
+scroller.addEventListener('scroll', () => {
+  stick = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 80;
+});
+function toBottom(force) {
+  if (force || stick) scroller.scrollTop = scroller.scrollHeight;
+}
+function updateEmpty() {
+  $('#chat').classList.toggle('empty', !log.children.length);
+}
+
+function addUserTurn(q) {
+  const t = div('turn user');
+  t.append(div('bubble', q));
+  log.append(t);
+  updateEmpty();
+  stick = true;
+  toBottom(true);
+}
+
+function addBotTurn() {
+  const t = div('turn bot');
+  const avatar = div('avatar', 'A');
+  avatar.setAttribute('aria-hidden', 'true');
+  const box = div('msg');
+  const head = div('head');
+  const body = div('body');
+  const foot = div('note foot');
+  const actions = div('actions');
+  box.append(head, body, foot, actions);
+  t.append(avatar, box);
+  log.append(t);
+  updateEmpty();
+  toBottom();
+  return { head, body, foot, actions };
+}
+
+function badge(label, cls) {
+  const b = document.createElement('span');
+  b.className = 'badge ' + cls;
+  b.textContent = label;
+  return b;
+}
+const ROUTES = { slm: 'SLM', llm: 'LLM', cache: 'Cached answer' };
+function routeBadge(route) {
+  return badge(ROUTES[route] || 'LLM', ROUTES[route] ? route : 'llm');
+}
+
+function typingDots() {
+  const d = div('dots');
+  d.setAttribute('aria-label', 'Thinking');
+  d.append(document.createElement('i'), document.createElement('i'), document.createElement('i'));
+  return d;
+}
+
+// navigator.clipboard needs HTTPS or localhost; the campus page is plain HTTP, so fall back to execCommand.
+function copyText(s) {
+  if (navigator.clipboard && window.isSecureContext) return navigator.clipboard.writeText(s);
+  const ta = document.createElement('textarea');
+  ta.value = s;
+  ta.setAttribute('readonly', '');
+  ta.style.position = 'fixed';
+  ta.style.opacity = '0';
+  document.body.append(ta);
+  ta.select();
+  try { document.execCommand('copy'); } finally { ta.remove(); }
+  return Promise.resolve();
+}
+function addCopyButton(actions, s) {
+  const b = document.createElement('button');
+  b.type = 'button';
+  b.className = 'icon-btn';
+  b.title = 'Copy';
+  b.setAttribute('aria-label', 'Copy answer');
+  b.append(icon('copy'));
+  b.onclick = async () => {
+    try {
+      await copyText(s);
+      b.replaceChildren(icon('check'));
+      setTimeout(() => b.replaceChildren(icon('copy')), 1500);
+    } catch (e) {}
+  };
+  actions.prepend(b);
+}
+
+// The [Document n] numbers a source covers (several passages of one thesis are one source).
+function docNumbers(c) {
+  return Array.isArray(c && c.documents) ? c.documents.filter(n => Number.isInteger(n) && n > 0 && n <= 50) : [];
+}
+
+// Sources list, built from text only. `list` is already de-duplicated.
+function sourcesEl(list) {
+  const dt = document.createElement('details');
+  dt.className = 'sources';
+  const sm = document.createElement('summary');
+  sm.textContent = list.length + ' source' + (list.length > 1 ? 's' : '');
+  dt.append(sm);
+  list.forEach((c, idx) => {
+    const docs = docNumbers(c);
+    dt.append(div('citation-card',
+      `[${idx + 1}] ${c.title || c.thesis_id || 'Untitled Document'}` +
+      (docs.length ? ` · ${docs.length > 1 ? 'Documents' : 'Document'} ${docs.join(', ')}` : '') +
+      (c.chapter ? ` · ${c.chapter}` : '') +
+      (c.version ? ` · v${c.version}` : '') +
+      (DEBUG && c.distance ? ` (dist: ${Number(c.distance).toFixed(3)})` : '') +
+      (c.text ? `\n${c.text}…` : '')));
+  });
+  return dt;
+}
 
 let cd = null;
 function showGate(on) {
   $('#gate').style.display = on ? 'flex' : 'none';
   $('#chat').style.display = on ? 'none' : 'flex';
-  $('#clear').style.display = on ? 'none' : 'inline-block';
 }
 
 async function post(u, b) {
@@ -273,6 +409,119 @@ async function post(u, b) {
 }
 
 // -------------------------------------------------------------------------
+// Chat list (this browser only; cleared on sign-out)
+// -------------------------------------------------------------------------
+const storeKey = () => 'askiisc.chats.' + (me.email || 'open');
+function loadChats() {
+  try {
+    const v = JSON.parse(localStorage.getItem(storeKey()) || '[]');
+    chats = Array.isArray(v) ? v.filter(c => c && typeof c.id === 'string' && Array.isArray(c.msgs)) : [];
+  } catch (e) {
+    chats = [];
+  }
+}
+function saveChats() {
+  chats.sort((a, b) => (b.updated || 0) - (a.updated || 0));
+  chats = chats.slice(0, MAX_CHATS);
+  try { localStorage.setItem(storeKey(), JSON.stringify(chats)); } catch (e) {}
+}
+function forgetChats() {
+  try { localStorage.removeItem(storeKey()); } catch (e) {}
+}
+
+function renderHistory() {
+  const nav = $('#hist');
+  nav.replaceChildren();
+  $('#hist-label').hidden = !chats.length;
+  for (const c of chats) {
+    const item = div('hist-item' + (c.id === currentId ? ' active' : ''));
+    item.tabIndex = 0;
+    item.setAttribute('role', 'button');
+    const title = String(c.title || 'Untitled');
+    item.title = title;
+    const t = document.createElement('span');
+    t.className = 't';
+    t.textContent = title;
+    const del = document.createElement('button');
+    del.type = 'button';
+    del.className = 'icon-btn del';
+    del.title = 'Delete chat';
+    del.setAttribute('aria-label', 'Delete chat');
+    del.append(icon('trash'));
+    del.onclick = e => { e.stopPropagation(); deleteChat(c.id); };
+    item.onclick = () => openChat(c.id);
+    item.onkeydown = e => { if (e.key === 'Enter') openChat(c.id); };
+    item.append(t, del);
+    nav.append(item);
+  }
+}
+
+function closeSideOnMobile() {
+  document.body.classList.remove('side-open');
+}
+
+function newChat() {
+  if (busy) return;
+  currentId = null;
+  history = [];
+  log.replaceChildren();
+  updateEmpty();
+  renderHistory();
+  closeSideOnMobile();
+  $('#q').focus();
+}
+
+function renderSavedAnswer(m) {
+  const t = addBotTurn();
+  if (m.route) t.head.append(routeBadge(m.route));
+  (Array.isArray(m.notes) ? m.notes : []).forEach(n => t.foot.before(div('note fix-note', String(n))));
+  const text = String(m.text || '');
+  t.body.replaceChildren(renderMathAndMarkdown(text));
+  if (Array.isArray(m.sources) && m.sources.length) t.foot.before(sourcesEl(m.sources));
+  addCopyButton(t.actions, text);
+}
+
+function openChat(id) {
+  if (busy) return;
+  const c = chats.find(x => x.id === id);
+  if (!c) return;
+  currentId = id;
+  log.replaceChildren();
+  for (const m of c.msgs) {
+    if (m.role === 'user') addUserTurn(String(m.text || ''));
+    else renderSavedAnswer(m);
+  }
+  history = c.msgs.map(m => ({ role: m.role === 'user' ? 'user' : 'assistant', content: String(m.text || '') })).slice(-20);
+  updateEmpty();
+  renderHistory();
+  closeSideOnMobile();
+  toBottom(true);
+}
+
+function deleteChat(id) {
+  if (busy) return;
+  chats = chats.filter(c => c.id !== id);
+  saveChats();
+  if (id === currentId) newChat();
+  else renderHistory();
+}
+
+function record(q, answer, isRegen) {
+  let c = chats.find(x => x.id === currentId);
+  if (!c) {
+    c = { id: Date.now().toString(36) + Math.random().toString(36).slice(2, 7), title: q.slice(0, 60), updated: 0, msgs: [] };
+    chats.unshift(c);
+    currentId = c.id;
+  }
+  if (!isRegen) c.msgs.push({ role: 'user', text: q });
+  c.msgs.push(answer);
+  c.msgs = c.msgs.slice(-MAX_MSGS);
+  c.updated = Date.now();
+  saveChats();
+  renderHistory();
+}
+
+// -------------------------------------------------------------------------
 // Authentication Handlers
 // -------------------------------------------------------------------------
 function startResendCountdown(seconds) {
@@ -280,63 +529,62 @@ function startResendCountdown(seconds) {
   const resendBtn = $('#resend-btn');
   if (!resendBtn) return;
   resendBtn.disabled = true;
-  resendBtn.textContent = `Resend OTP (${t}s)`;
+  resendBtn.textContent = `${RESEND_LABEL} (${t}s)`;
   clearInterval(cd);
   cd = setInterval(() => {
     t--;
     if (t > 0) {
-      resendBtn.textContent = `Resend OTP (${t}s)`;
+      resendBtn.textContent = `${RESEND_LABEL} (${t}s)`;
     } else {
       clearInterval(cd);
       resendBtn.disabled = false;
-      resendBtn.textContent = 'Resend OTP';
+      resendBtn.textContent = RESEND_LABEL;
     }
   }, 1000);
+}
+
+function gateMessage(msg, ok) {
+  $('#gerr').className = 'err-line ' + (ok ? 'slm' : 'err');
+  $('#gerr').textContent = msg || '';
 }
 
 async function requestOtp(isResend = false) {
   const email = $('#em').value.trim();
   if (!email) {
-    $('#gerr').style.color = 'crimson';
-    $('#gerr').textContent = 'Please enter your IISc email address.';
+    gateMessage('Please enter your IISc email address.');
     return;
   }
-  $('#gerr').textContent = '';
-  $('#gerr').style.color = '';
+  gateMessage('');
   const genBtn = $('#gen');
   const resendBtn = $('#resend-btn');
 
   if (isResend) {
     if (resendBtn) {
       resendBtn.disabled = true;
-      resendBtn.innerHTML = '<span class="spinner" style="border-top-color:var(--ac);border-color:rgba(122,31,43,0.25)"></span> Sending...';
+      resendBtn.innerHTML = '<span class="spinner"></span> Sending...';
     }
   } else {
     genBtn.disabled = true;
-    genBtn.innerHTML = '<span class="spinner"></span> Generating OTP...';
+    genBtn.innerHTML = '<span class="spinner"></span> Sending code...';
   }
 
   const endpoint = isResend ? '/auth/otp/resend' : '/auth/otp/request';
   try {
     const r = await post(endpoint, { email });
     if (!r.ok) {
-      $('#gerr').style.color = 'crimson';
-      $('#gerr').textContent = r.d.error || 'Failed to request OTP';
+      gateMessage(r.d.error || 'Failed to request OTP');
       genBtn.disabled = false;
-      genBtn.innerHTML = 'Generate OTP';
+      genBtn.innerHTML = GEN_LABEL;
       if (isResend && r.d.resend_in) {
         startResendCountdown(r.d.resend_in);
       } else if (resendBtn) {
         resendBtn.disabled = false;
-        resendBtn.textContent = 'Resend OTP';
+        resendBtn.textContent = RESEND_LABEL;
       }
       return;
     }
 
-    if (r.d.message) {
-      $('#gerr').style.color = 'var(--slm)';
-      $('#gerr').textContent = r.d.message;
-    }
+    if (r.d.message) gateMessage(r.d.message, true);
 
     const targetEl = $('#target-email');
     if (targetEl) targetEl.textContent = email;
@@ -347,17 +595,16 @@ async function requestOtp(isResend = false) {
     $('#otp').focus();
 
     genBtn.disabled = false;
-    genBtn.innerHTML = 'Generate OTP';
+    genBtn.innerHTML = GEN_LABEL;
 
     startResendCountdown(r.d.resend_in || 60);
   } catch (err) {
-    $('#gerr').style.color = 'crimson';
-    $('#gerr').textContent = 'Network error. Please try again.';
+    gateMessage('Network error. Please try again.');
     genBtn.disabled = false;
-    genBtn.innerHTML = 'Generate OTP';
+    genBtn.innerHTML = GEN_LABEL;
     if (resendBtn) {
       resendBtn.disabled = false;
-      resendBtn.textContent = 'Resend OTP';
+      resendBtn.textContent = RESEND_LABEL;
     }
   }
 }
@@ -375,8 +622,8 @@ if (changeEmEl) {
     const step1 = $('#step1');
     if (step1) step1.style.display = 'flex';
     $('#gen').disabled = false;
-    $('#gen').innerHTML = 'Generate OTP';
-    $('#gerr').textContent = '';
+    $('#gen').innerHTML = GEN_LABEL;
+    gateMessage('');
     $('#em').focus();
   };
 }
@@ -384,28 +631,26 @@ if (changeEmEl) {
 $('#ver').onclick = async () => {
   const code = $('#otp').value.trim();
   if (!code) {
-    $('#gerr').style.color = 'crimson';
-    $('#gerr').textContent = 'Please enter the 6-digit code.';
+    gateMessage('Please enter the 6-digit code.');
     return;
   }
-  $('#gerr').textContent = '';
-  $('#gerr').style.color = 'crimson';
+  gateMessage('');
   const verBtn = $('#ver');
   verBtn.disabled = true;
   verBtn.innerHTML = '<span class="spinner"></span> Verifying...';
   try {
     const r = await post('/auth/otp/verify', { email: $('#em').value, code });
     if (!r.ok) {
-      $('#gerr').textContent = r.d.error || 'Invalid or expired code';
+      gateMessage(r.d.error || 'Invalid or expired code');
       verBtn.disabled = false;
-      verBtn.innerHTML = 'Verify &amp; continue';
+      verBtn.innerHTML = VER_LABEL;
       return;
     }
     location.reload();
   } catch (err) {
-    $('#gerr').textContent = 'Verification error. Please try again.';
+    gateMessage('Verification error. Please try again.');
     verBtn.disabled = false;
-    verBtn.innerHTML = 'Verify &amp; continue';
+    verBtn.innerHTML = VER_LABEL;
   }
 };
 
@@ -419,19 +664,25 @@ $('#em').addEventListener('keydown', e => {
 fetch('/me').then(r => r.json()).then(m => {
   DEBUG = Boolean(m.debug_enabled);
   window.__csrf_token = m.csrf_token || '';
-  if (m.backend === 'gateway') {
-    $('#thesis').parentElement.style.display = 'none';
-    $('#force').parentElement.style.display = 'none';
+  if (m.backend !== 'gateway') {   // thesis filter and model override exist only on the standalone app
+    $('#lbl-thesis').hidden = false;
+    $('#lbl-force').hidden = false;
   }
   if (m.login_required && !m.email) {
     showGate(true);
     $('#who').textContent = 'Sign-in required';
-  } else {
-    showGate(false);
-    $('#who').innerHTML = m.email ? `Signed in: ${escapeHTML(m.email)} · <a href="#" id="lo">sign out</a>` : 'Open access';
-    const lo = $('#lo');
-    if (lo) lo.onclick = async e => {
-      e.preventDefault();
+    return;
+  }
+  showGate(false);
+  me.email = m.email || null;
+  $('#who').textContent = m.email || 'Open access';
+  $('#who').title = m.email || '';
+  $('#me-avatar').textContent = (m.email || '?').charAt(0);
+  if (m.email) {
+    const lo = $('#signout');
+    lo.hidden = false;
+    lo.onclick = async () => {
+      forgetChats();   // shared lab machines: the next person must not see this user's chats
       const csrf = getCsrfToken();
       const headers = {};
       if (csrf) headers['X-CSRF-Token'] = csrf;
@@ -439,6 +690,9 @@ fetch('/me').then(r => r.json()).then(m => {
       location.reload();
     };
   }
+  loadChats();
+  renderHistory();
+  $('#q').focus();
 }).catch(() => { showGate(true); });
 
 fetch('/theses').then(r => r.json()).then(a => a.forEach(t => {
@@ -446,15 +700,45 @@ fetch('/theses').then(r => r.json()).then(a => a.forEach(t => {
   $('#thesis').add(o);
 })).catch(() => {});
 
-$('#clear').onclick = () => {
-  history = [];
-  log.innerHTML = '';
-};
+// -------------------------------------------------------------------------
+// Layout controls
+// -------------------------------------------------------------------------
+function toggleSide() {
+  if (mobile()) document.body.classList.toggle('side-open');
+  else document.body.classList.toggle('side-closed');
+}
+$('#menu').onclick = toggleSide;
+$('#menu-close').onclick = toggleSide;
+$('#scrim').onclick = closeSideOnMobile;
+$('#new').onclick = newChat;
+$('#new-top').onclick = newChat;
+document.querySelectorAll('.chip').forEach(c => {
+  c.onclick = () => ask(c.dataset.q);
+});
 
+function grow() {
+  const q = $('#q');
+  q.style.height = 'auto';
+  q.style.height = Math.min(q.scrollHeight, 200) + 'px';
+}
+function syncSend() {
+  $('#go').disabled = !busy && !$('#q').value.trim();
+}
+function setBusy(on) {
+  busy = on;
+  const go = $('#go');
+  go.replaceChildren(icon(on ? 'stop' : 'send'));
+  go.title = on ? 'Stop' : 'Send';
+  go.setAttribute('aria-label', on ? 'Stop answering' : 'Send');
+  syncSend();
+}
+setBusy(false);
+
+$('#q').addEventListener('input', () => { grow(); syncSend(); });
 $('#q').addEventListener('keydown', e => {
-  if (e.key === 'Enter' && !e.shiftKey) {
+  if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
     e.preventDefault();
-    $('#f').requestSubmit();
+    if (!busy) $('#f').requestSubmit();   // Enter never stops a running answer; only the button does
   }
 });
 
@@ -463,9 +747,14 @@ $('#q').addEventListener('keydown', e => {
 // -------------------------------------------------------------------------
 $('#f').onsubmit = async e => {
   e.preventDefault();
+  if (busy) {
+    if (controller) controller.abort();
+    return;
+  }
   const q = $('#q').value.trim();
   if (!q) return;
   $('#q').value = '';
+  grow();
   await ask(q);
 };
 
@@ -474,13 +763,14 @@ function showCacheNote(head, d) {
   const n = document.createElement('div');
   n.className = 'note cache-note';
   if (d.kind === 'semantic') {
-    n.textContent = 'Reused answer from your earlier question: \u201c' + (d.matched_prompt || '') + '\u201d';
+    n.textContent = 'Reused answer from your earlier question: “' + (d.matched_prompt || '') + '”';
   } else if (d.kind === 'override') {
     n.textContent = 'Your previously regenerated answer to this question.';
   } else {
     n.textContent = 'Reused answer to an identical earlier question.';
   }
   head.after(n);
+  return n.textContent;
 }
 
 // Offered ONLY on answers served from the cache: the gateway attaches a single-use token to cached answers.
@@ -488,33 +778,35 @@ function addRegenerateButton(foot, q, token) {
   const b = document.createElement('button');
   b.type = 'button';
   b.className = 'regen-btn';
-  b.textContent = '\u21bb Generate a fresh answer';
+  b.textContent = '↻ Generate a fresh answer';
   b.title = 'This answer came from the cache. Ask the model again if it does not fit your question.';
   b.onclick = async () => {
-    if ($('#go').disabled) return;
+    if (busy) return;
     b.disabled = true;
-    b.textContent = 'Generating a fresh answer\u2026';
+    b.textContent = 'Generating a fresh answer…';
     await ask(q, { regenerateToken: token });
     b.remove();
   };
-  foot.after(b);
+  foot.nextElementSibling.append(b);   // the answer's action row
 }
 
 // Ask a question. opts.regenerateToken: request a fresh answer for a cached one.
 async function ask(q, opts = {}) {
-  if ($('#go').disabled) return;
-  $('#go').disabled = true;
+  if (busy || !q) return;
+  setBusy(true);
 
-  if (!opts.regenerateToken) el('msg user', q);
-  const box = el('msg');
-  const head = document.createElement('div');
-  const body = document.createElement('div');
-  const foot = document.createElement('div');
-  foot.className = 'note';
-  box.append(head, body, foot);
+  if (!opts.regenerateToken) addUserTurn(q);
+  const { head, body, foot, actions } = addBotTurn();
+  const dots = typingDots();
+  body.append(dots);
   let text = '';
   let dtEl = null;
+  let shown = [];          // the sources currently listed under the answer
   let cacheInfo = null;
+  let route = null;
+  let failed = false;
+  let stopped = false;
+  const notes = [];
 
   // Mirrors pipeline/sanitizer.py is_no_relevant_docs_answer: an answer IS a refusal only if it is the refusal
   // sentence on its own or a short text; a long answer that mentions a gap in passing keeps its sources.
@@ -563,50 +855,53 @@ async function ask(q, opts = {}) {
            low.includes('retrieval failed');
   };
 
-  const showSources = cs => {
+  const hideSources = () => {
     if (dtEl) dtEl.remove();
     dtEl = null;
+    shown = [];
+  };
+  const showSources = cs => {
+    hideSources();
     if (!cs || !cs.length || isNoDocsAnswer(text)) return;
 
     // Deduplicate repeated thesis titles using a Set so each source entry is shown only once
-    const seen = new Set();
+    const seen = new Map();
     const unique = [];
     cs.forEach(c => {
       const key = (c.title || c.thesis_id || '').trim();
       if (key) {
         if (!seen.has(key)) {
-          seen.add(key);
-          unique.push(c);
+          const first = { ...c, documents: docNumbers(c) };
+          seen.set(key, first);
+          unique.push(first);
+        } else {   // same thesis again: one source, all its [Document n] numbers
+          const docs = seen.get(key).documents;
+          docNumbers(c).forEach(n => { if (!docs.includes(n)) docs.push(n); });
         }
       } else {
         unique.push(c);
       }
     });
     if (!unique.length) return;
-
-    const dt = document.createElement('details');
-    dt.innerHTML = '<summary>' + unique.length + ' source document' + (unique.length > 1 ? 's' : '') + '</summary>';
-    unique.forEach((c, idx) => {
-      const x = document.createElement('div');
-      x.className = 'citation-card';
-      x.textContent = `[${idx + 1}] ${c.title || c.thesis_id || 'Untitled Document'}` +
-                      (c.chapter ? ` · ${c.chapter}` : '') +
-                      (c.version ? ` · v${c.version}` : '') +
-                      (DEBUG && c.distance ? ` (dist: ${Number(c.distance).toFixed(3)})` : '') +
-                      (c.text ? `\n${c.text}…` : '');
-      dt.append(x);
-    });
-    foot.before(dt);
-    dtEl = dt;
+    dtEl = sourcesEl(unique);
+    foot.before(dtEl);
+    shown = unique;
+  };
+  const fail = msg => {
+    failed = true;
+    body.textContent = msg;
+    body.classList.add('err');
   };
 
   try {
+    controller = new AbortController();
     const headers = { 'Content-Type': 'application/json' };
     const csrf = getCsrfToken();
     if (csrf) headers['X-CSRF-Token'] = csrf;
     const r = await fetch('/chat', {
       method: 'POST',
       headers: headers,
+      signal: controller.signal,
       body: JSON.stringify({
         message: q,
         history,
@@ -619,126 +914,133 @@ async function ask(q, opts = {}) {
     if (!r.ok) {
       let errData = {};
       try { errData = await r.json(); } catch (_) {}
-      const errMsg = errData.detail || errData.error || errData.msg || `Server error (HTTP ${r.status})`;
-      body.textContent = errMsg;
-      body.style.color = 'crimson';
+      fail(errData.detail || errData.error || errData.msg || `Server error (HTTP ${r.status})`);
       if (r.status === 401) {
         showGate(true);
       }
-      $('#go').disabled = false;
-      return;
-    }
+    } else {
+      const rd = r.body.getReader();
+      const dec = new TextDecoder('utf-8');
+      let buf = '';
 
-    const rd = r.body.getReader();
-    const dec = new TextDecoder('utf-8');
-    let buf = '';
+      while (true) {
+        const { value, done } = await rd.read();
+        if (done) break;
+        buf += dec.decode(value, { stream: true });
 
-    while (true) {
-      const { value, done } = await rd.read();
-      if (done) break;
-      buf += dec.decode(value, { stream: true });
+        let i;
+        while ((i = buf.indexOf('\n\n')) >= 0) {
+          const blk = buf.slice(0, i);
+          buf = buf.slice(i + 2);
 
-      let i;
-      while ((i = buf.indexOf('\n\n')) >= 0) {
-        const blk = buf.slice(0, i);
-        buf = buf.slice(i + 2);
+          const evObj = parseSSEBlock(blk);
+          if (!evObj) continue;
+          const { event: ev, data: d } = evObj;
 
-        const evObj = parseSSEBlock(blk);
-        if (!evObj) continue;
-        const { event: ev, data: d } = evObj;
-
-        if (ev === 'meta') {
-          head.innerHTML = d.route ? `<span class="badge ${escapeHTML(d.route)}">${d.route === 'slm' ? 'SLM' : d.route === 'cache' ? 'Cached answer' : 'LLM'}</span>` : '';
-          if (opts.regenerateToken) head.innerHTML += '<span class="badge regen">Fresh answer</span>';
-          if (DEBUG && d.s != null) head.innerHTML += `<span class="badge" style="color:var(--mut)">P(hard)=${d.s} / α=${d.alpha}</span>`;
-          if (d.citations) showSources(d.citations);
-        }
-        else if (ev === 'cache') {
-          cacheInfo = d;
-          showCacheNote(head, d);
-        }
-        else if (ev === 'correction') {   // the question was spell-corrected before searching
-          const n = document.createElement('div');
-          n.className = 'note';
-          n.textContent = 'Showing results for: \u201c' + (d.q || '') + '\u201d';
-          head.after(n);
-        }
-        else if (ev === 'sources' || ev === 'chunks') {
-          if (d.citations) showSources(d.citations);
-          else if (d.chunks) showSources(d.chunks);
-          else showSources([]);
-        }
-        else if (ev === 'token') {
-          const delta = d.t !== undefined ? d.t : (d.delta !== undefined ? d.delta : (d.content || d.token || ''));
-          if (delta) {
-            text += delta;
-            body.replaceChildren(renderMathAndMarkdown(text));
-            if (dtEl && startsWithRefusal(text)) {
-              dtEl.remove();
-              dtEl = null;
+          if (ev === 'meta') {
+            route = d.route || null;
+            head.replaceChildren();
+            if (d.route) head.append(routeBadge(d.route));
+            if (opts.regenerateToken) head.append(badge('Fresh answer', 'regen'));
+            if (DEBUG && d.s != null) head.append(badge(`P(hard)=${d.s} / α=${d.alpha}`, 'dbg'));
+            if (d.citations) showSources(d.citations);
+          }
+          else if (ev === 'cache') {
+            cacheInfo = d;
+            notes.push(showCacheNote(head, d));
+          }
+          else if (ev === 'correction') {   // the question was spell-corrected before searching
+            const n = div('note fix-note', 'Showing results for: “' + (d.q || '') + '”');
+            head.after(n);
+            notes.push(n.textContent);
+          }
+          else if (ev === 'sources' || ev === 'chunks') {
+            if (d.citations) showSources(d.citations);
+            else if (d.chunks) showSources(d.chunks);
+            else showSources([]);
+          }
+          else if (ev === 'token') {
+            const delta = d.t !== undefined ? d.t : (d.delta !== undefined ? d.delta : (d.content || d.token || ''));
+            if (delta) {
+              text += delta;
+              body.replaceChildren(renderMathAndMarkdown(text));
+              if (dtEl && startsWithRefusal(text)) hideSources();
             }
           }
-        }
-        else if (ev === 'escalate') {
-          foot.textContent = `SLM confidence ${d.conf} < ${d.threshold}; escalating to 7B…`;
-        }
-        else if (ev === 'fallback') {
-          foot.textContent = `${d.from} unavailable → falling back to ${d.to}`;
-        }
-        else if (ev === 'refused') {
-          body.replaceChildren(renderMathAndMarkdown(d.msg || 'Query refused.'), ' ');
-          const a = document.createElement('a');
-          a.href = d.login || '/';
-          a.textContent = 'Sign in';
-          body.append(a);
-        }
-        else if (ev === 'warning') {
-          foot.textContent = d.msg || '';
-        }
-        else if (ev === 'error') {
-          body.textContent = d.msg || 'The answering service reported an error.';
-          body.style.color = 'crimson';
-        }
-        else if (ev === 'done') {
-          if (dtEl && isNoDocsAnswer(text)) {
-            dtEl.remove();
-            dtEl = null;
+          else if (ev === 'escalate') {
+            foot.textContent = `SLM confidence ${d.conf} < ${d.threshold}; escalating to 7B…`;
           }
-          if (d.refused) {
-            foot.textContent = 'No models were called';
-            continue;
+          else if (ev === 'fallback') {
+            foot.textContent = `${d.from} unavailable → falling back to ${d.to}`;
           }
-          if (DEBUG && d.timings) {
-            foot.textContent = `Answered by ${d.model || 'model'}${d.escalated ? ' (escalated)' : ''} · total ${d.timings.total_ms || 0}ms`;
+          else if (ev === 'refused') {
+            body.replaceChildren(renderMathAndMarkdown(d.msg || 'Query refused.'), ' ');
+            const a = document.createElement('a');
+            a.href = d.login || '/';
+            a.textContent = 'Sign in';
+            body.append(a);
           }
+          else if (ev === 'warning') {
+            foot.textContent = d.msg || '';
+          }
+          else if (ev === 'error') {
+            fail(d.msg || 'The answering service reported an error.');
+          }
+          else if (ev === 'done') {
+            if (dtEl && isNoDocsAnswer(text)) hideSources();
+            if (d.refused) {
+              foot.textContent = 'No models were called';
+              continue;
+            }
+            if (DEBUG && d.timings) {
+              foot.textContent = `Answered by ${d.model || 'model'}${d.escalated ? ' (escalated)' : ''} · total ${d.timings.total_ms || 0}ms`;
+            }
+          }
+          toBottom();
         }
-        log.scrollTop = log.scrollHeight;
       }
-    }
 
-    // Flush any remaining tokens in buffer
-    if (buf.trim()) {
-      const finalEv = parseSSEBlock(buf.trim());
-      if (finalEv && finalEv.event === 'token') {
-        const delta = finalEv.data.t || finalEv.data.delta || '';
-        text += delta;
-      }
-    }
-
-    // Final full markdown + LaTeX rendering pass
-    if (text) {
-      body.replaceChildren(renderMathAndMarkdown(text));
-      history.push({ role: 'user', content: q }, { role: 'assistant', content: text });
-      if (history.length > 20) {
-        history = history.slice(-20);
+      // Flush any remaining tokens in buffer
+      if (buf.trim()) {
+        const finalEv = parseSSEBlock(buf.trim());
+        if (finalEv && finalEv.event === 'token') {
+          const delta = finalEv.data.t || finalEv.data.delta || '';
+          text += delta;
+        }
       }
     }
   } catch (err) {
-    body.textContent = 'Network connection error: ' + err;
-    body.style.color = 'crimson';
+    if (err && err.name === 'AbortError') stopped = true;
+    else fail('Network connection error: ' + err);
+  }
+  controller = null;
+  dots.remove();
+
+  // Final full markdown + LaTeX rendering pass
+  if (text && !failed) {
+    body.replaceChildren(renderMathAndMarkdown(text));
+    if (stopped) foot.textContent = 'Stopped.';
+    history.push({ role: 'user', content: q }, { role: 'assistant', content: text });
+    if (history.length > 20) {
+      history = history.slice(-20);
+    }
+    addCopyButton(actions, text);
+    record(q, {
+      role: 'assistant',
+      text,
+      route,
+      notes,
+      sources: shown.map(c => ({
+        title: c.title || '', thesis_id: c.thesis_id || '', chapter: c.chapter || '', version: c.version || '',
+        text: String(c.text || '').slice(0, 300), documents: docNumbers(c)
+      }))
+    }, Boolean(opts.regenerateToken));
+  } else if (stopped) {
+    foot.textContent = 'Stopped.';
   }
 
   if (cacheInfo && cacheInfo.regenerate_token && text) addRegenerateButton(foot, q, cacheInfo.regenerate_token);
-  $('#go').disabled = false;
+  setBusy(false);
+  toBottom();
   $('#q').focus();
 }

@@ -5,6 +5,7 @@ Implements defense-in-depth against:
 2. Indirect Prompt Injection: Malicious text inside indexed documents attempting delimiter breakout.
 """
 
+import os
 import re
 from typing import Any, Dict, List, Optional
 
@@ -449,6 +450,86 @@ REFUSAL_RULE = (
     "ONLY when none of the provided documents is about the topic of the question. Never guess or give an ungrounded "
     "answer.\n"
 )
+
+# Rule 3 in explain mode (see GROUNDING_RULES): a document that uses the question's key term counts.
+REFUSAL_RULE_EXPLAIN = (
+    "3. Relevance and Refusal: If the provided documents contain information relevant to the question, or mention or "
+    "use its key term, answer directly from them with citations, without opening disclaimers; if they do not cover "
+    "some specific part of the question, mention that briefly after your answer. Reply with exactly '"
+    + REFUSAL_SENTENCE + "' and nothing else ONLY when none of the provided documents is about the topic of the "
+    "question or mentions its key term. Never guess or give an ungrounded answer.\n"
+)
+
+# Rules 1-2 of both RAG prompts (2026-11-27). The earlier rules ("strictly and exclusively", "no general knowledge")
+# made the models copy whatever an excerpt happened to say: "What is a Kalman filter?" was answered "an optimization
+# problem ...", an excerpt that used MIMO without defining it gave "the documents do not provide ...", "What is the
+# Reynolds number?" was refused on low-Reynolds-number aerodynamics theses, and "Which theses discuss X?" was answered
+# "[Document 1] and [Document 2]". Now: a term the documents mention or use gets a short, clearly separate textbook
+# explanation, followed by what the theses do with it, citing them by title. Background never stands alone (rule 3
+# still refuses when no document is about the topic) and is never attributed to a document.
+GROUNDING_RULES = (
+    "1. Repository Grounding: Answer from the provided institutional repository documents. Cite every document you "
+    "use by its thesis title in quotation marks followed by its number in brackets, such as [Document 2]. Never refer "
+    "to a document only by its number.\n"
+    "2. Explaining Terms: If the documents mention or use the term or topic of the question with the same meaning "
+    "but do not fully define or explain it, start with a brief standard explanation of it (at most three sentences of well-established "
+    "textbook knowledge, without citations), then explain what the theses say about it, how they use it or what they "
+    "found. Never attribute background knowledge to a document, and never invent results, numbers, names or claims. "
+    "A document that uses the same word or abbreviation for something different (another field, method, dataset or "
+    "acronym) does not count, and you must not link the two meanings. Background knowledge alone is never an "
+    "answer: if no document is about the topic or uses the term with the same meaning, follow rule 3.\n"
+)
+
+# Rule 2 alone did not change the 3B model's definitions (measured 2026-11-27: "What is a Kalman filter?" was still
+# "an optimization problem ...", "What is a semiconductor?" still "a material that can be incorporated into every
+# aspect of daily life"); a small model weighs instructions after the documents more (as DOCUMENT_REMINDER). So a
+# definition question gets this hint in the user turn, after the question; other questions are unchanged.
+_DEFINITION_Q = re.compile(
+    r"^\W*(?:(?:please|kindly)\s+|(?:can|could|would)\s+you\s+(?:please\s+)?)*"
+    r"(?:what\s+(?:is|are|was|were|does\s+\S+\s+mean)|what's|define|explain|describe|meaning\s+of|"
+    r"tell\s+me\s+about|give\s+(?:me\s+)?an?\s+overview\s+of|introduction\s+to)\b",
+    re.IGNORECASE,
+)
+DEFINITION_HINT = (
+    "(This question asks what something is. Begin with one or two plain sentences giving its standard definition. "
+    "Then say what the theses study, use or found about it, naming each thesis by its title. Use only documents in "
+    "which the term has the same meaning as in the question; the same word used for something else does not count.)"
+)
+# The hint once ended "If no document mentions it, reply with the refusal sentence only": the 3B model then appended
+# the refusal sentence to good answers (2 of 35). Off-topic questions are covered by rules 2-3 in the system prompt.
+# Same meaning (2026-11-27): without it, 'What is Bitcoin halving?' was tied to interval halving (a root-finding
+# method) and 'What is the GST rate on gold?' to a dataset named GST, 3 of 3 runs each; the old prompt refused both.
+
+
+# Explain mode only when retrieval is reasonably strong. Rules 1-2 and the hint made the 3B model tie a question to
+# a thesis that uses the same word for something else ("GST rate on gold" -> a dataset named GST, 3 of 3 runs even
+# with the same-meaning instruction); such matches are weak (top similarity 0.43-0.44), while every on-topic term
+# measured retrieved >= 0.486 (MIMO lowest). Below the bar the original strict rules apply unchanged; they refused
+# both homonym questions 3 of 3. Chunks without a similarity (other callers) also get the strict rules.
+EXPLAIN_MIN_SIMILARITY = float(os.getenv("EXPLAIN_MIN_SIMILARITY", "0.47"))
+
+
+def explain_allowed(chunks: Optional[List[Dict[str, Any]]]) -> bool:
+    """True when the best retrieved chunk is similar enough for the explain-the-term rules."""
+    best = 0.0
+    for c in chunks or []:
+        try:
+            best = max(best, float(c.get("similarity") or 0.0))
+        except (TypeError, ValueError):
+            continue
+    return best >= EXPLAIN_MIN_SIMILARITY
+
+
+def rules_1_to_3(chunks: Optional[List[Dict[str, Any]]], strict_rules_1_2: str) -> str:
+    """Rules 1-3 of a RAG system prompt: explain mode on strong retrieval, else the engine's original strict rules."""
+    if explain_allowed(chunks):
+        return GROUNDING_RULES + REFUSAL_RULE_EXPLAIN
+    return strict_rules_1_2 + REFUSAL_RULE
+
+
+def answer_hint(question: str, chunks: Optional[List[Dict[str, Any]]] = None) -> str:
+    """Extra user-turn instruction for definition questions ("What is X?", "Explain X") in explain mode, else ''."""
+    return DEFINITION_HINT if _DEFINITION_Q.match(question or "") and explain_allowed(chunks) else ""
 
 PREMISE_RULES = (
     "4. Check the Question's Premise: Some questions contain a built-in claim (for example 'Why does X always...', "

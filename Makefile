@@ -1,4 +1,4 @@
-.PHONY: help setup install-serving download-models dev prod-up prod-down prod-status prod-restart prod-restart-vllm prod-down-vllm vllm-check chat-up chat-down chat-restart chat-status chat-logs chat-code test-smtp cache-stats cache-clear otp-clear queue-stats redis-up redis-down redis-status redis-watch up down logs ingest-pdfs query ask rag-answer serve-slm serve-gpu serve-router generate-dataset eval load-test load-test-cold load-test-cache cache-check export-onnx test test-intensive injection-eval clean
+.PHONY: help setup install-serving download-models dev prod-up prod-down prod-status prod-restart prod-restart-vllm prod-down-vllm vllm-check demo-vllm-stats chat-up chat-down chat-restart chat-status chat-logs chat-code test-smtp cache-stats cache-clear otp-clear queue-stats redis-up redis-down redis-status redis-watch up down logs ingest-pdfs query ask rag-answer serve-slm serve-gpu serve-router generate-dataset eval load-test load-test-cold load-test-cache cache-check export-onnx test test-intensive injection-eval clean
 
 -include .env
 # Machine-specific settings (ignored by Git), e.g. PYTHON := /path/to/env/bin/python
@@ -103,6 +103,10 @@ prod-restart-vllm:
 # Red-team fix check: loopback-only bind + API key enforced on /v1/*.
 vllm-check:
 	@bash scripts/check_vllm_security.sh
+
+# Read-only demo: plain vLLM would send usage statistics; our launcher switches them off (fixes.md 2026-11-28).
+demo-vllm-stats:
+	@$(PYTHON) scripts/demo_vllm_usage_stats.py
 
 chat-up:
 	$(PYTHON) scripts/prod_stack.py start
@@ -228,7 +232,7 @@ test: export TRANSFORMERS_OFFLINE ?= $(HF_HUB_OFFLINE)
 test:
 	PYTHONPATH=. $(PYTHON) tests/test_admission_queue.py
 	PYTHONPATH=. $(PYTHON) -m pytest tests/test_single_port_security.py
-	PYTHONPATH=. $(PYTHON) -m pytest tests/test_vllm_launcher.py tests/test_dispatcher_threshold.py tests/test_cache_owner_scoping.py tests/test_cache_regenerate.py tests/test_premise_rules.py tests/test_premise_routing.py tests/test_topic_retrieval.py tests/test_topic_speller.py tests/test_rare_terms.py tests/test_ungrounded_and_admin_guard.py tests/test_standalone_app_identity.py tests/test_gpu_fallback.py tests/test_event_loop_not_blocked.py tests/test_per_user_cap.py tests/test_admission_cancellation.py tests/test_otp_isolation.py tests/test_failure_not_cached.py tests/test_context_escaping.py tests/test_mail_error_disclosure.py tests/test_cache_overwrite.py tests/test_typo_protection.py tests/test_readiness.py tests/test_requirements.py tests/test_hardening_round2.py tests/test_language_gate.py tests/test_hidden_routes.py tests/test_frontend_xss.py tests/test_security_headers.py tests/test_repeat_offenders.py tests/test_retrieval_outage.py tests/test_internal_identity.py tests/test_injection_all_messages.py tests/test_injection_detection.py tests/test_metadata_queries.py tests/test_slm_slots.py tests/test_retrieval_warmup.py tests/test_embedder_onnx.py tests/test_cache_index_alter.py
+	PYTHONPATH=. $(PYTHON) -m pytest tests/test_vllm_launcher.py tests/test_dispatcher_threshold.py tests/test_cache_owner_scoping.py tests/test_cache_regenerate.py tests/test_premise_rules.py tests/test_grounding_rules.py tests/test_source_numbers.py tests/test_premise_routing.py tests/test_topic_retrieval.py tests/test_topic_speller.py tests/test_rare_terms.py tests/test_ungrounded_and_admin_guard.py tests/test_standalone_app_identity.py tests/test_gpu_fallback.py tests/test_event_loop_not_blocked.py tests/test_per_user_cap.py tests/test_admission_cancellation.py tests/test_otp_isolation.py tests/test_failure_not_cached.py tests/test_context_escaping.py tests/test_mail_error_disclosure.py tests/test_cache_overwrite.py tests/test_typo_protection.py tests/test_readiness.py tests/test_requirements.py tests/test_hardening_round2.py tests/test_language_gate.py tests/test_hidden_routes.py tests/test_frontend_xss.py tests/test_security_headers.py tests/test_repeat_offenders.py tests/test_retrieval_outage.py tests/test_internal_identity.py tests/test_injection_all_messages.py tests/test_injection_detection.py tests/test_metadata_queries.py tests/test_slm_slots.py tests/test_retrieval_warmup.py tests/test_embedder_onnx.py tests/test_cache_index_alter.py
 	PYTHONPATH=. $(PYTHON) -m pytest tests/test_break_hardening.py tests/test_cache_purge_and_ttl.py tests/test_constant_time_and_cookie_security.py tests/test_dos_boundary_validation.py tests/test_otp_concurrency.py tests/test_refusal_chunks.py tests/test_typo_normalizer.py
 	@present="$(wildcard $(PRIVATE_TESTS))"; \
 	if [ -n "$$present" ]; then PYTHONPATH=. $(PYTHON) -m pytest $$present; \

@@ -105,19 +105,33 @@ def is_retrieval_outage(exc: BaseException) -> bool:
 
 
 def sanitize_chunks(chunks: List[Any]) -> List[Dict[str, Any]]:
-    """Sanitize a list of chunks for response by keeping only unique document titles."""
+    """Sanitize a list of chunks for response by keeping only unique document titles.
+
+    Each entry lists in "documents" the 1-based positions of all its chunks in `chunks`, i.e. the
+    [Document n] numbers the model saw (the prompt numbers the context in the same order, see
+    fence_context_chunks). Several passages of one thesis are one source, so without this an answer
+    citing [Document 2] showed a single source and the reader could not tell where Document 2 was."""
     if not isinstance(chunks, list):
         return chunks
-    seen_titles = set()
+    by_title: Dict[str, Dict[str, Any]] = {}
     unique_chunks = []
-    for c in chunks:
+    for pos, c in enumerate(chunks, 1):
         if not isinstance(c, dict):
             continue
         sc = sanitize_chunk(c)
+        kept = c.get("documents")
+        if isinstance(kept, list):   # already sanitized (a cached answer): keep its numbers, do not renumber
+            sc["documents"] = [n for n in kept if isinstance(n, int) and not isinstance(n, bool) and 0 < n <= 50]
+        elif "content" in c:         # a retrieved passage: its position is its [Document n] number
+            sc["documents"] = [pos]
+        else:                        # sanitized before numbers existed (older cache entry): unknown
+            sc["documents"] = []
         title = (sc.get("title") or "").strip()
         if title:
-            if title not in seen_titles:
-                seen_titles.add(title)
+            if title in by_title:
+                by_title[title]["documents"].append(pos)
+            else:
+                by_title[title] = sc
                 unique_chunks.append(sc)
         else:
             unique_chunks.append(sc)
@@ -276,6 +290,33 @@ class RedisChunkRetriever:
             clauses.append(f"(@title:({alts}) | @content:({alts}))")
         return " ".join(clauses)
 
+    # Spread the top positions across theses (2026-11-27). The CPU tier reads only the first 3 chunks, and the
+    # keyword path ranks every title-matched chunk first: "what is Markov chain" gave chunks 1-10 from one thesis,
+    # "what is hidden markov model" 3 rainfall-thesis chunks (similarity 0.45-0.53) ahead of protein-sequence HMM
+    # theses (0.72), so answers cited a single source. Round-robin keeps each thesis's own order and the order of
+    # theses (by their best-ranked chunk); it only reorders the already accepted chunks, no floor changes.
+    DIVERSIFY: bool = os.getenv("RETRIEVAL_DIVERSIFY", "true").lower() in ("true", "1", "yes")
+    TITLE_PER_THESIS: int = 2   # keyword path: title-matched chunks per thesis before content matches
+
+    @classmethod
+    def diversify(cls, chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Round-robin by thesis: each thesis's best chunk first, then second-best chunks, and so on."""
+        if not cls.DIVERSIFY or len(chunks) < 2:
+            return chunks
+        groups: Dict[Any, List[Dict[str, Any]]] = {}
+        for c in chunks:
+            key = c.get("doc_id") or str(c.get("title") or "").strip() or id(c)
+            groups.setdefault(key, []).append(c)
+        if len(groups) < 2:
+            return chunks
+        out, rnd = [], 0
+        while len(out) < len(chunks):
+            for g in groups.values():
+                if rnd < len(g):
+                    out.append(g[rnd])
+            rnd += 1
+        return out
+
     def _rank_keyword_hits(self, hits: List[Dict[str, Any]], terms: List[str], max_k: int,
                            specific: bool = False) -> List[Dict[str, Any]]:
         words = {v for t in terms for v in self._term_variants(t)}
@@ -291,7 +332,19 @@ class RedisChunkRetriever:
             c["retrieval_mode"] = "keyword_assisted"
             kept.append(c)
         kept.sort(key=lambda c: (c["keyword_title_match"], float(c.get("similarity", 0))), reverse=True)
-        return kept[:max_k]
+        # Title-matched theses first, at most TITLE_PER_THESIS chunks each (round-robin), then the content
+        # matches, then the remaining title chunks. Before the cut, or one thesis fills all max_k places.
+        title = self.diversify([c for c in kept if c["keyword_title_match"]])
+        content = self.diversify([c for c in kept if not c["keyword_title_match"]])
+        if not self.DIVERSIFY:
+            return (title + content)[:max_k]
+        per: Dict[Any, int] = {}
+        first, rest = [], []
+        for c in title:
+            key = c.get("doc_id") or str(c.get("title") or "").strip()
+            per[key] = per.get(key, 0) + 1
+            (first if per[key] <= self.TITLE_PER_THESIS else rest).append(c)
+        return (first + content + rest)[:max_k]
 
     def _execute_keyword_knn(self, r: Any, text: str, terms: List[str], k: int):
         """Returns (hits, specific, resolved_terms, corrections)."""
@@ -696,6 +749,8 @@ class RedisChunkRetriever:
             )
         if rare_chunks:
             final_chunks = self._merge_rare(rare_chunks, final_chunks, top_k)
+        if not keyword_chunks:   # the keyword path is spread in _rank_keyword_hits (title matches first)
+            final_chunks = self.diversify(final_chunks)   # spread the first places across theses
 
         # Annotate chunks with metadata tracking
         for c in final_chunks:
@@ -796,6 +851,8 @@ class RedisChunkRetriever:
             )
         if rare_chunks:
             final_chunks = self._merge_rare(rare_chunks, final_chunks, top_k)
+        if not keyword_chunks:   # the keyword path is spread in _rank_keyword_hits (title matches first)
+            final_chunks = self.diversify(final_chunks)   # spread the first places across theses
 
         for c in final_chunks:
             if extracted_meta and extracted_meta.has_filters:

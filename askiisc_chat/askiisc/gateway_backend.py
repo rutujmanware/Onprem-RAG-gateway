@@ -56,9 +56,12 @@ def cite(i: int, c: dict) -> dict:
     m = _meta(c)
     try: dist = float(c.get("score", 0))
     except (TypeError, ValueError): dist = 0.0
+    docs = c.get("documents")   # [Document n] numbers this source covers (pipeline.retriever.sanitize_chunks)
+    docs = [int(x) for x in docs if isinstance(x, int) and not isinstance(x, bool) and 0 < x <= 50][:50] \
+        if isinstance(docs, list) else []
     return {"n": i, "thesis_id": str(c.get("doc_id") or c.get("handle_id") or ""), "title": str(m.get("title") or c.get("title") or ""),
             "chapter": "", "version": "", "distance": dist,
-            "text": ""}
+            "text": "", "documents": docs}
 
 def token_text(d: dict) -> str:
     for k in ("token", "delta", "content", "text"):
@@ -101,7 +104,7 @@ async def stream_via_gateway(query: str, tier: str, user_email: str = "", regene
             if raw_chunks is not None and len(raw_chunks) == 0:
                 out.append(sse("sources", {"citations": []}))
             else:
-                seen_titles = set()
+                seen_titles = {}
                 cs = []
                 for c in (raw_chunks or []):
                     if not isinstance(c, dict):
@@ -110,8 +113,11 @@ async def stream_via_gateway(query: str, tier: str, user_email: str = "", regene
                     key = (c_item.get("title") or c_item.get("thesis_id") or "").strip()
                     if key:
                         if key not in seen_titles:
-                            seen_titles.add(key)
+                            seen_titles[key] = c_item
                             cs.append(c_item)
+                        else:   # same thesis again: keep one source, with all its [Document n] numbers
+                            docs = seen_titles[key]["documents"]
+                            docs.extend(d for d in c_item["documents"] if d not in docs)
                     else:
                         cs.append(c_item)
                 if cs and not is_no_relevant_docs_answer("".join(st["tokens_text"])):

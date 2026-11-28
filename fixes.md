@@ -1894,5 +1894,74 @@ New scripts. Each runs on an isolated measurement gateway ([`scripts/eval_gatewa
 
 The first NFR-4 run was invalid: victim questions contained an ID, so the intent guard's number rule blocked every semantic hit regardless of user. It was redesigned and re-run; only the second run is reported.
 
+## Web Chat Redesign (2026-11-27)
+
+**Change:** the web chat ([`askiisc_chat/static/index.html`](askiisc_chat/static/index.html), [`app.js`](askiisc_chat/static/app.js)) now uses a familiar chat-assistant layout: a sidebar with **New chat** and the list of recent chats, a centred welcome screen with four example questions, a rounded composer that grows with the text (placeholder "Ask about IISc theses"), a **Stop** button while an answer streams, a **Copy** button under each answer, sources as a collapsible "N sources" pill, light and dark themes, and a slide-in sidebar on phones. The sign-in screen has the same look ("Send code" instead of "Generate OTP"). Sign-in, CSRF, streaming events, cache notes, the regenerate button and answer rendering work as before.
+
+**Security notes:**
+- The renderer (`renderMathAndMarkdown`, DEFECT-53/57/58) is unchanged byte for byte; a chat reopened from the sidebar is rendered by the same function, and user questions, chat titles and source cards are set as text only. The page still has no inline script or handler (CSP `script-src 'self'`); icons are constant markup in the page and in `app.js`.
+- The chat list is kept **only in the browser** (`localStorage`, one key per signed-in e-mail, at most 30 chats of 40 messages, source snippets cut to 300 characters). Nothing new is sent to or stored on the server. **Sign out** deletes the list, so the next person on a shared lab machine does not see it; regenerate tokens are never stored.
+- Stop aborts the request; the server already ends the stream when the browser disconnects.
+- Copy uses `navigator.clipboard` where the browser allows it (HTTPS or localhost) and falls back to `execCommand('copy')` on the campus HTTP address.
+
+**Verified:** `tests/test_security_headers.py`, `tests/test_frontend_xss.py` (headless Firefox, attack and normal answers), `tests/test_cache_regenerate.py`, `tests/test_single_port_security.py`: 46 passed. `test_page_uses_the_fragment_api` previously counted exactly three `replaceChildren(renderMathAndMarkdown(` calls; reopening a saved chat adds a fourth, so it now checks that every call inserts the fragment with `replaceChildren` (none through `innerHTML`). Screenshots in headless Firefox against a mock server: sign-in, welcome screen, a streamed answer with math, sources and a cached answer with regenerate, dark theme, phone layout with the sidebar open, and the Stop state.
+
+## Answering Terms the Theses Use: Explain Mode (2026-11-27)
+
+**Problem:** both RAG prompts said "base your answer strictly and exclusively on the provided documents" and "do NOT use outside general knowledge". Retrieval was not the limit: a read-only probe of 40 panel-style questions (definitions such as *What is a Kalman filter?*, applied questions, *Which theses discuss …?*) retrieved thesis chunks for all 40, including words found only in thesis body text (keyword and rare-word paths), and none for 5 of 6 off-topic controls. The models then answered too literally from whatever excerpt came back:
+- "What is a Kalman filter?" → "an optimization problem aimed at minimizing the Cost Function J …" (3 of 3 runs);
+- "What is the Reynolds number?" → refused (3 of 3) although low-Reynolds-number aerodynamics theses were retrieved;
+- "How does MIMO improve wireless capacity?" → refused or "the documents do not provide …" when an excerpt used MIMO without defining it;
+- "Which theses discuss solar energy forecasting?" → "[Document 1] and [Document 2] discuss …".
+
+**Fix** ([`pipeline/sanitizer.py`](pipeline/sanitizer.py), [`pipeline/slm_runner.py`](pipeline/slm_runner.py), [`pipeline/gpu_llm_runner.py`](pipeline/gpu_llm_runner.py)): an **explain mode** for both tiers, used when retrieval is reasonably strong (best chunk similarity ≥ `EXPLAIN_MIN_SIMILARITY`, default 0.47):
+- Rule 1 cites theses by title; rule 2 allows a short, clearly separate textbook explanation of a term the documents mention or use **with the same meaning**, followed by what the theses study, use or found. Background knowledge is never attributed to a document and never stands alone. Rule 3 counts a document that uses the key term.
+- Definition questions (*what is / what are / explain / define / describe / tell me about …*) get a one-line hint after the question and before the document reminder, where the 3B model follows instructions (as DOCUMENT_REMINDER, DEFECT-58). Rule 2 alone did not change the 3B model's definitions.
+- **Strict mode is unchanged:** below the bar, or for chunks without a similarity, both prompts are byte-identical to the previous ones (checked against `git HEAD` for both engines).
+
+**Why the similarity bar:** with explain mode for every question, the 3B model tied *What is Bitcoin halving?* to interval halving (a root-finding method) and *What is the GST rate on gold?* to a dataset named GST, 3 of 3 runs each, even with the same-meaning instruction; the old prompt refused both 3 of 3. Those matches are weak (top similarity 0.43–0.44), while every on-topic term measured retrieved ≥ 0.486 (MIMO lowest). Two intermediate versions were also rejected: a hint ending "if no document mentions it, reply with the refusal sentence" made the 3B append the refusal sentence to good answers (2 of 35), and a `"<title>"` example in rule 1 was copied with its angle brackets.
+
+**Measured** (end-to-end through `RAGQAPipeline.answer_query`, production model servers, no gateway cache; `temperature 0.2`):
+
+| | Before | After |
+|---|---|---|
+| Reasonable questions refused | 1 / 40 | **0 / 46** |
+| Off-topic questions refused | 6 / 6 | **11 / 11** (incl. "answer using the theses", joke, cover letter) |
+| Homonym traps refused (Bitcoin halving, GST on gold) | 2 / 2 (old prompt) | **2 / 2** |
+| Loaded "why … always" questions challenged | – | **2 / 2** |
+| Word that appears in thesis text (sonnet, yoga, Diwali) | – | definition + the thesis mention |
+
+Definitions now open correctly (Kalman: "an algorithm used for estimating the state of a system from a series of measurements …", Reynolds: "a dimensionless quantity used to predict flow patterns …") and then say what the theses do. **Remaining:** the 3B names thesis titles in the text in only 6 of 46 answers (the sources list under each answer shows them); *How does MIMO improve wireless capacity?* still opens with "The documents do not directly address …" before explaining.
+
+**Tests:** new [`tests/test_grounding_rules.py`](tests/test_grounding_rules.py) (mode threshold, explain vs strict prompts per engine, which questions get the hint, hint placement after the documents); added to `make test`.
+
+## Sources Show Which [Document n] They Cover (2026-11-27)
+
+**Problem:** "what is Markov chain" retrieved 5 passages, all from one thesis (*Structural Reliability Estimation Using Markov Chain Splitting …*). The answer cited "[Document 1]" and "[Document 2]" (two passages of that thesis), but the sources list showed one source: `sanitize_chunks` and the web chat merge passages by thesis title, and the numbers were lost, so the reader could not tell where Document 2 was.
+
+**Fix:** [`pipeline/retriever.py`](pipeline/retriever.py) `sanitize_chunks` keeps, for each merged source, the 1-based positions of its passages (`documents`). These are the `[Document n]` numbers the model saw: every `chunks` event is the exact context in prompt order (CPU 3, GPU up to 8, and the CPU retry context re-emitted). The web chat bridge ([`askiisc_chat/askiisc/gateway_backend.py`](askiisc_chat/askiisc/gateway_backend.py)) passes them on (plausible integers only) and merges them if a title repeats. The page shows them on each source card ("[1] … · Documents 1, 2") and keeps them in saved chats. The API response gains the same `documents` field (additive); still no chunk text or internal keys. A cache hit keeps the stored numbers instead of renumbering (cached sources are sanitized again when served); entries cached before this change show no numbers rather than wrong ones (they expire with the 4 h TTL).
+
+**Verified:** [`tests/test_source_numbers.py`](tests/test_source_numbers.py) (merge, numbers match the prompt's `<document id>`, bridge filtering, page) added to `make test`; screenshot of the sources list against the mock server.
+
+## Answers Drew on One Thesis Only: Spread the First Places Across Theses (2026-11-27)
+
+**Problem:** "what is hidden markov model" showed one source. The keyword path (short "what is / explain X" questions) ranked every chunk of a thesis with the term in its title first: the CPU tier, which reads the first 3 chunks, got 3 chunks of one rainfall thesis (similarity 0.45–0.53), while protein-sequence HMM theses matched better (0.72) and were never shown. "what is Markov chain": chunks 1–10 from one thesis.
+
+**Fix** ([`pipeline/retriever.py`](pipeline/retriever.py)): `diversify` orders accepted chunks round-robin by thesis (each thesis's best chunk, then second-best, …), keeping each thesis's own order and the order of theses. The keyword path keeps title matches first but takes at most 2 chunks per title-matched thesis before the content matches, then the rest; this happens before the cut to `top_k`. The dense and rare-word paths are spread after filtering. No chunk is added and no floor changes; `RETRIEVAL_DIVERSIFY=false` restores the old order. A plain round-robin on the keyword path was rejected: it put content-only matches ("Design support system …" for "what is transformers") ahead of the second title-matched chunk (`tests/test_topic_retrieval.py`).
+
+**Measured** (`scripts/eval_retrieval.py`, frozen sets, production retriever): main set (204 answerable) hit@1 0.657 → 0.657, **hit@3 0.711 → 0.745**, hit@5 0.745 → 0.755, MRR@8 0.689 → 0.698; off-corpus accept rate unchanged (0.200); rare-word set unchanged (hit@3 0.758). First 3 chunks now: hidden Markov model → rainfall thesis ×2 + protein HMM thesis; Markov chain → 2 theses; Kalman filter → 2 theses; transformers → title matches only, as before.
+
+**Tests:** `tests/test_source_numbers.py` (round-robin order, title cap before content matches); retrieval suites pass (75).
+
+## vLLM Usage Statistics Sent to stats.vllm.ai (2026-11-28)
+
+**Problem:** vLLM reports anonymous usage statistics by default. The production model server (started by `scripts/serve_vllm.py` without an opt-out) had sent its hardware and model description (GPU type, model architecture, vLLM version, CPU count, memory size: 19 reports from 4 to 26 November and 1,576 heartbeats in `~/.config/vllm/usage_stats.json`, vLLM's local copy of what it sent; that file is shared by every vLLM run of the account, and its 93 other reports come from offline vLLM jobs, not from AskIISc) and heartbeats every 10 minutes to `stats.vllm.ai`, which the server can reach. No question, answer or user data was included, but the model server is meant to make no outside connections.
+
+**Fix:** [`scripts/serve_vllm.py`](scripts/serve_vllm.py) sets `VLLM_NO_USAGE_STATS=1`, `VLLM_DO_NOT_TRACK=1` and `DO_NOT_TRACK=1` before vLLM is imported, overriding `.env` and the shell. It takes effect when vLLM is restarted (`make prod-restart-vllm`; the model reload takes several minutes, then `make vllm-check`).
+
+**Verified:** `tests/test_vllm_launcher.py`: the variables are forced to 1 even when set to 0, they are set before `import vllm`, and the installed vLLM's own `is_usage_stats_enabled()` returns False.
+
+**After the restart (2026-11-28 09:25):** the model server's engine processes carry the three variables, and no new AskIISc report or heartbeat has been written since (the last is from 09:17, the old process). `make demo-vllm-stats` ([`scripts/demo_vllm_usage_stats.py`](scripts/demo_vllm_usage_stats.py), read-only) shows this live: a plain vLLM answers True to its own `is_usage_stats_enabled()`, the same vLLM through our launcher answers False, and the running server's settings and report count. Other vLLM jobs started outside this launcher are not covered.
+
 ## Remediation Complete
 All security vulnerabilities, cache qualification defects, frontend/backend break vectors, and redundant code have been fully resolved, hardened, and verified with passing regression tests. All changes are cleanly staged. Per instructions, `git commit` has not been run.

@@ -84,3 +84,28 @@ def test_removed_override_env_var_blocks_startup(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["serve_vllm.py", "--model", "m", "--host", "127.0.0.1", "--port", "18999"])
     with pytest.raises(SystemExit, match="no longer supported"):
         serve_vllm.main()
+
+
+# ------------------------------------------------------------------ no usage statistics (2026-11-28)
+def test_usage_statistics_are_switched_off(monkeypatch):
+    from scripts.serve_vllm import disable_usage_stats
+    for var in ("VLLM_NO_USAGE_STATS", "VLLM_DO_NOT_TRACK", "DO_NOT_TRACK"):
+        monkeypatch.setenv(var, "0")   # .env or the shell cannot switch reporting back on
+    disable_usage_stats()
+    import os
+    assert all(os.environ[v] == "1" for v in ("VLLM_NO_USAGE_STATS", "VLLM_DO_NOT_TRACK", "DO_NOT_TRACK"))
+
+
+def test_switched_off_before_vllm_is_imported():
+    from pathlib import Path
+    src = (Path(__file__).resolve().parent.parent / "scripts" / "serve_vllm.py").read_text()
+    main = src[src.index("def main() -> None:"):]
+    assert main.index("disable_usage_stats()") < main.index("import vllm")
+
+
+def test_installed_vllm_honours_the_switch(monkeypatch):
+    usage_lib = pytest.importorskip("vllm.usage.usage_lib")
+    from scripts.serve_vllm import disable_usage_stats
+    monkeypatch.setattr(usage_lib, "_USAGE_STATS_ENABLED", None, raising=False)
+    disable_usage_stats()
+    assert usage_lib.is_usage_stats_enabled() is False

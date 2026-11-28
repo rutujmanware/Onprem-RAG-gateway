@@ -219,7 +219,7 @@ curl -s http://localhost:8080/ready    # -> {"status":"ready","checks":{...all t
 Service logs are in `logs/` (`gateway.log`, `slm.log`, `vllm.log`, `redis.log`).
 
 ### Step 8: Use it
-Open **`http://<server-address>:8080/`** in a browser (on the server itself: `http://localhost:8080/`), enter an e-mail address from `ALLOWED_EMAIL_DOMAINS`, type the code you receive, and ask a question about the theses.
+Open **`http://<server-address>:8080/`** in a browser (on the server itself: `http://localhost:8080/`), enter an e-mail address from `ALLOWED_EMAIL_DOMAINS`, type the code you receive, and ask a question about the theses. The left sidebar starts a **New chat** and lists your recent chats (kept only in this browser and deleted when you sign out); **Stop** ends an answer early, and each answer has **Copy** and a list of its sources.
 
 For API clients and admin endpoints, see [§5.4](#54-gateway-port-8080).
 
@@ -461,6 +461,7 @@ RETRIEVAL_MIN_SIMILARITY=0.52
 RETRIEVAL_SCORE_MARGIN=0.10
 RETRIEVAL_MAX_KNEE_DROP=0.06
 RETRIEVAL_EF_RUNTIME=64
+EXPLAIN_MIN_SIMILARITY=0.47   # explain a term the theses use (short definition + what the theses say)
 ```
 After changing `.env`, apply it with `make prod-restart` (or `make prod-restart-vllm` for vLLM settings).
 

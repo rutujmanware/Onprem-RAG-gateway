@@ -186,4 +186,6 @@ def test_ordinary_answers_still_render_math_and_markdown(rendered):
 def test_page_uses_the_fragment_api():
     page = (STATIC / "app.js").read_text()
     assert "MATH_BLOCK" not in page and "innerHTML = renderMathAndMarkdown" not in page
-    assert len(re.findall(r"replaceChildren\(renderMathAndMarkdown\(", page)) == 3
+    # every render (live tokens, final pass, refusal, a chat reopened from the sidebar) inserts the fragment
+    calls = re.findall(r"(\w+)\(renderMathAndMarkdown\(", page)
+    assert len(calls) >= 4 and set(calls) == {"replaceChildren"}, calls

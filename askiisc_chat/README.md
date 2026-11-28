@@ -18,7 +18,7 @@ python -m askiisc.app          # open http://<intranet-ip>:9000 (or use unified 
 Model servers: any OpenAI-compatible endpoint. 7B: `vllm serve Qwen/Qwen2.5-7B-Instruct --quantization fp8 --kv-cache-dtype fp8 --max-model-len 32768 --gpu-memory-utilization 0.92 --max-num-seqs 32 --enable-prefix-caching`. SLM: vLLM, or `llama-server -m qwen2.5-3b-instruct-q4_k_m.gguf --port 8082` on CPU.
 
 ## Sign-in: email one-time code (default, `AUTH_MODE=otp`) and `REQUIRE_LOGIN=1`
-No chat, no thesis list, nothing without a session: `/chat` and `/theses` return 401. Flow: user enters IISc email -> "Generate OTP" -> 6-digit code emailed -> verify -> 8h session cookie.
+No chat, no thesis list, nothing without a session: `/chat` and `/theses` return 401. Flow: user enters IISc email -> "Send code" -> 6-digit code emailed -> verify -> 8h session cookie.
 Protections: code stored only as an HMAC hash, valid 3 min (180s), single use, destroyed after 5 wrong tries, 60 s resend gap, 10 codes/hour per mailbox, 1000/hour per client IP, `+tag`/case aliases normalised, mail sent ONLY to allowed domains, identical error for wrong/expired/locked codes, CR/LF header injection blocked, SMTP failure leaves no live code.
 
 **You must set (server):**
